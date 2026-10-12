@@ -1,0 +1,540 @@
+#include "NoteView.h"
+
+#include "Editor.h"
+#include "Markdown.h"
+#include "Reader.h"
+#include "Vault.h"
+
+#include <QApplication>
+#include <QClipboard>
+#include <QDesktopServices>
+#include <QHBoxLayout>
+#include <QKeyEvent>
+#include <QLabel>
+#include <QLineEdit>
+#include <QRegularExpression>
+#include <QScrollArea>
+#include <QScrollBar>
+#include <QShortcut>
+#include <QStackedWidget>
+#include <QStyle>
+#include <QTextBlock>
+#include <QToolButton>
+#include <QToolTip>
+#include <QUrl>
+
+using namespace Qt::StringLiterals;
+
+namespace {
+
+double scrollRatio(const QScrollBar *bar)
+{
+    return bar->maximum() > 0 ? double(bar->value()) / bar->maximum() : 0.0;
+}
+
+void applyRatio(QScrollBar *bar, double ratio)
+{
+    bar->setValue(int(ratio * bar->maximum()));
+}
+
+} // namespace
+
+NoteView::NoteView(Vault *vault, QWidget *parent)
+    : QWidget(parent)
+    , m_vault(vault)
+{
+    setBackgroundRole(QPalette::Base);
+    setAutoFillBackground(true);
+
+    m_titleBar = new QWidget(this);
+    m_title = new QLineEdit(m_titleBar);
+    m_title->setFrame(false);
+    m_title->setStyleSheet(u"QLineEdit { background: transparent; border: none; }"_s);
+    auto *titleLayout = new QHBoxLayout(m_titleBar);
+    titleLayout->addWidget(m_title);
+
+    m_editor = new Editor(this);
+    m_editor->setVault(vault);
+    m_reader = new Reader(this);
+    m_image = new QLabel;
+    m_image->setAlignment(Qt::AlignHCenter | Qt::AlignTop);
+    m_imageArea = new QScrollArea(this);
+    m_imageArea->setFrameShape(QFrame::NoFrame);
+    m_imageArea->setWidgetResizable(true);
+    m_imageArea->setWidget(m_image);
+    m_imageArea->setBackgroundRole(QPalette::Base);
+
+    m_stack = new QStackedWidget(this);
+    m_stack->addWidget(m_editor);
+    m_stack->addWidget(m_reader);
+    m_stack->addWidget(m_imageArea);
+
+    m_findBar = new QWidget(this);
+    m_findEdit = new QLineEdit(m_findBar);
+    m_findEdit->setPlaceholderText(tr("Find in note"));
+    m_findEdit->setClearButtonEnabled(true);
+    auto *prev = new QToolButton(m_findBar);
+    prev->setArrowType(Qt::UpArrow);
+    prev->setToolTip(tr("Previous match (Shift+Enter)"));
+    auto *next = new QToolButton(m_findBar);
+    next->setArrowType(Qt::DownArrow);
+    next->setToolTip(tr("Next match (Enter)"));
+    auto *close = new QToolButton(m_findBar);
+    close->setText(u"✕"_s);
+    close->setAutoRaise(true);
+    auto *findLayout = new QHBoxLayout(m_findBar);
+    findLayout->setContentsMargins(8, 4, 8, 4);
+    findLayout->addWidget(m_findEdit, 1);
+    findLayout->addWidget(prev);
+    findLayout->addWidget(next);
+    findLayout->addWidget(close);
+    m_findBar->hide();
+
+    auto *layout = new QVBoxLayout(this);
+    layout->setContentsMargins(0, 0, 0, 0);
+    layout->setSpacing(0);
+    layout->addWidget(m_titleBar);
+    layout->addWidget(m_stack, 1);
+    layout->addWidget(m_findBar);
+
+    m_saveTimer.setSingleShot(true);
+    m_saveTimer.setInterval(700);
+    connect(&m_saveTimer, &QTimer::timeout, this, [this] {
+        save();
+        Q_EMIT statsChanged();
+    });
+    m_renderTimer.setSingleShot(true);
+    m_renderTimer.setInterval(120);
+    connect(&m_renderTimer, &QTimer::timeout, this, [this] {
+        if (m_mode == Read && isNote())
+            render();
+    });
+
+    connect(m_editor, &QPlainTextEdit::textChanged, this, [this] {
+        if (!m_loading)
+            m_saveTimer.start();
+    });
+    connect(m_editor, &Editor::linkActivated, this, &NoteView::handleHref);
+    connect(m_reader, &QTextBrowser::anchorClicked, this, [this](const QUrl &url) {
+        handleHref(url.toString(QUrl::FullyEncoded), QApplication::keyboardModifiers() & Qt::ControlModifier);
+    });
+    connect(m_reader, &Reader::contentWidthChanged, this, [this] {
+        if (m_reader->toHtml().contains(u"<img"_s))
+            m_renderTimer.start();
+    });
+
+    connect(m_title, &QLineEdit::returnPressed, this, &NoteView::focusContent);
+    connect(m_title, &QLineEdit::editingFinished, this, [this] {
+        const QString name = m_title->text().trimmed();
+        if (m_path.isEmpty() || name == Vault::baseName(m_path))
+            return;
+        if (name.isEmpty()) {
+            resetTitle();
+            return;
+        }
+        Q_EMIT renameRequested(m_path, name);
+    });
+
+    connect(m_findEdit, &QLineEdit::returnPressed, this, [this] {
+        find(QApplication::keyboardModifiers() & Qt::ShiftModifier);
+    });
+    connect(prev, &QToolButton::clicked, this, [this] { find(true); });
+    connect(next, &QToolButton::clicked, this, [this] { find(false); });
+    connect(close, &QToolButton::clicked, this, [this] {
+        m_findBar->hide();
+        focusContent();
+    });
+    auto *esc = new QShortcut(QKeySequence(Qt::Key_Escape), m_findBar, nullptr, nullptr, Qt::WidgetWithChildrenShortcut);
+    connect(esc, &QShortcut::activated, close, &QToolButton::click);
+}
+
+bool NoteView::isNote() const
+{
+    return Vault::isNote(m_path);
+}
+
+QString NoteView::editorText() const
+{
+    // toPlainText() would turn non-breaking spaces into plain spaces.
+    QString t = m_editor->document()->toRawText();
+    t.replace(QChar::ParagraphSeparator, u'\n');
+    return t;
+}
+
+void NoteView::open(const QString &path, bool pushHistory)
+{
+    if (path == m_path)
+        return;
+    save();
+    if (pushHistory && !m_path.isEmpty()) {
+        m_back << m_path;
+        m_forward.clear();
+    }
+    load(path);
+}
+
+void NoteView::load(const QString &path)
+{
+    m_path = path;
+    m_editor->setNotePath(path);
+    resetTitle();
+    m_findBar->hide();
+
+    if (isNote()) {
+        m_diskText = m_vault->readText(path);
+        m_crlf = m_diskText.contains(u"\r\n"_s);
+        m_loading = true;
+        m_editor->setPlainText(m_crlf ? QString(m_diskText).replace(u"\r\n"_s, u"\n"_s) : m_diskText);
+        m_loading = false;
+        m_title->setReadOnly(false);
+        if (m_mode == Read) {
+            render();
+            m_stack->setCurrentWidget(m_reader);
+        } else {
+            m_stack->setCurrentWidget(m_editor);
+        }
+    } else {
+        m_diskText.clear();
+        m_pixmap = QPixmap(m_vault->absolutePath(path));
+        scaleImage();
+        m_stack->setCurrentWidget(m_imageArea);
+    }
+    Q_EMIT pathChanged();
+    Q_EMIT statsChanged();
+}
+
+void NoteView::resetTitle()
+{
+    const QSignalBlocker block(m_title);
+    m_title->setText(m_path.isEmpty() ? QString() : (isNote() ? Vault::baseName(m_path) : m_path.section(u'/', -1)));
+    m_title->setCursorPosition(0);
+}
+
+bool NoteView::save()
+{
+    if (!isNote())
+        return true;
+    m_saveTimer.stop();
+    QString t = editorText();
+    if (m_crlf)
+        t.replace(u'\n', u"\r\n"_s);
+    if (t == m_diskText)
+        return true;
+    if (!m_vault->writeNote(m_path, t))
+        return false;
+    m_diskText = t;
+    return true;
+}
+
+void NoteView::reloadFromDisk()
+{
+    if (!isNote()) {
+        if (!m_path.isEmpty()) {
+            m_pixmap = QPixmap(m_vault->absolutePath(m_path));
+            scaleImage();
+        }
+        return;
+    }
+    const QString text = m_vault->readText(m_path);
+    if (text == m_diskText)
+        return;
+    QString current = editorText();
+    if (m_crlf)
+        current.replace(u'\n', u"\r\n"_s);
+    if (current != m_diskText)
+        return; // unsaved local edits win; they are written on the next save
+
+    m_diskText = text;
+    m_crlf = text.contains(u"\r\n"_s);
+    const int pos = m_editor->textCursor().position();
+    const int scroll = m_editor->verticalScrollBar()->value();
+    m_loading = true;
+    QTextCursor c(m_editor->document());
+    c.select(QTextCursor::Document);
+    c.insertText(m_crlf ? QString(text).replace(u"\r\n"_s, u"\n"_s) : text);
+    m_loading = false;
+    c.setPosition(qMin(pos, m_editor->document()->characterCount() - 1));
+    m_editor->setTextCursor(c);
+    m_editor->verticalScrollBar()->setValue(scroll);
+    if (m_mode == Read)
+        render();
+    Q_EMIT statsChanged();
+}
+
+void NoteView::pathRenamed(const QString &from, const QString &to)
+{
+    for (QString &p : m_back)
+        if (p == from)
+            p = to;
+    for (QString &p : m_forward)
+        if (p == from)
+            p = to;
+    if (m_path != from)
+        return;
+    m_path = to;
+    m_editor->setNotePath(to);
+    resetTitle();
+    Q_EMIT pathChanged();
+}
+
+void NoteView::setMode(Mode mode)
+{
+    if (mode == m_mode)
+        return;
+    m_mode = mode;
+    if (isNote()) {
+        if (mode == Read) {
+            const double ratio = scrollRatio(m_editor->verticalScrollBar());
+            save();
+            render();
+            m_stack->setCurrentWidget(m_reader);
+            QTimer::singleShot(0, this, [this, ratio] { applyRatio(m_reader->verticalScrollBar(), ratio); });
+        } else {
+            const double ratio = scrollRatio(m_reader->verticalScrollBar());
+            m_stack->setCurrentWidget(m_editor);
+            QTimer::singleShot(0, this, [this, ratio] { applyRatio(m_editor->verticalScrollBar(), ratio); });
+        }
+        focusContent();
+    }
+    Q_EMIT modeChanged();
+}
+
+void NoteView::goBack()
+{
+    if (m_back.isEmpty())
+        return;
+    save();
+    m_forward.prepend(m_path);
+    load(m_back.takeLast());
+}
+
+void NoteView::goForward()
+{
+    if (m_forward.isEmpty())
+        return;
+    save();
+    m_back << m_path;
+    load(m_forward.takeFirst());
+}
+
+void NoteView::render()
+{
+    RenderOptions opt;
+    opt.vault = m_vault;
+    opt.notePath = m_path;
+    opt.contentWidth = qMax(200, m_reader->contentWidth());
+    opt.palette = palette();
+    opt.dark = palette().color(QPalette::Base).lightness() < 128;
+    const RenderResult result = renderMarkdown(editorText(), opt);
+    m_codeBlocks = result.codeBlocks;
+
+    const int scroll = m_reader->verticalScrollBar()->value();
+    m_reader->document()->setDefaultFont(m_font);
+    m_reader->document()->setDefaultStyleSheet(markdownStyleSheet(palette(), m_font.pointSizeF()));
+    m_reader->setHtml(result.html);
+    m_reader->verticalScrollBar()->setValue(scroll);
+}
+
+void NoteView::refreshRender()
+{
+    if (m_mode == Read && isNote())
+        m_renderTimer.start();
+}
+
+void NoteView::handleHref(const QString &href, bool newTab)
+{
+    const QString scheme = href.section(u':', 0, 0);
+    if (scheme == u"wiki") {
+        const QString target = QUrl::fromPercentEncoding(href.mid(5).toUtf8());
+        if (target.startsWith(u'#'))
+            jumpToHeading(target.mid(1));
+        else
+            Q_EMIT linkRequested(target, newTab);
+        return;
+    }
+    if (scheme == u"task") {
+        toggleTask(href.mid(5).toInt());
+        return;
+    }
+    if (scheme == u"copy") {
+        const int i = href.mid(5).toInt();
+        if (i >= 0 && i < m_codeBlocks.size()) {
+            QApplication::clipboard()->setText(m_codeBlocks.at(i));
+            QToolTip::showText(QCursor::pos(), tr("Copied"), this);
+        }
+        return;
+    }
+    if (href.startsWith(u'#')) {
+        m_reader->scrollToAnchor(href.mid(1));
+        return;
+    }
+    const QUrl url(href);
+    if (url.scheme().isEmpty()) {
+        if (href.startsWith(u"www."))
+            QDesktopServices::openUrl(QUrl(u"https://"_s + href));
+        else
+            Q_EMIT linkRequested(QUrl::fromPercentEncoding(href.toUtf8()), newTab);
+        return;
+    }
+    QDesktopServices::openUrl(url);
+}
+
+void NoteView::toggleTask(int offset)
+{
+    const QByteArray utf8 = editorText().toUtf8();
+    if (offset < 0 || offset >= utf8.size())
+        return;
+    const QChar mark = utf8.at(offset) == ' ' ? u'x' : u' ';
+    const int pos = int(QString::fromUtf8(utf8.left(offset)).size());
+    QTextCursor c(m_editor->document());
+    c.setPosition(pos);
+    c.setPosition(pos + 1, QTextCursor::KeepAnchor);
+    c.insertText(QString(mark));
+    render();
+}
+
+void NoteView::jumpToHeading(const QString &heading)
+{
+    const QString want = headingAnchor(heading);
+    if (m_mode == Read && isNote()) {
+        m_reader->scrollToAnchor(want);
+        return;
+    }
+    static const QRegularExpression h(u"^#{1,6}\\s+(.*?)\\s*#*\\s*$"_s);
+    for (QTextBlock b = m_editor->document()->begin(); b.isValid(); b = b.next()) {
+        const auto m = h.match(b.text());
+        if (m.hasMatch() && headingAnchor(m.captured(1)) == want) {
+            m_editor->goToLine(b.blockNumber());
+            return;
+        }
+    }
+}
+
+void NoteView::jumpToLine(int line)
+{
+    if (!isNote() || line < 0)
+        return;
+    if (m_mode == Edit) {
+        m_editor->goToLine(line);
+        return;
+    }
+    // Reading view: find the rendered text of that line.
+    static const QRegularExpression prefix(u"^\\s*(#{1,6}\\s+|>\\s*|[-*+]\\s+(\\[[ xX]\\]\\s+)?|\\d+[.)]\\s+)*"_s);
+    static const QRegularExpression markup(u"[*_`~=\\[\\]]"_s);
+    QString snippet = m_editor->document()->findBlockByNumber(line).text();
+    snippet.remove(prefix);
+    snippet.remove(markup);
+    snippet = snippet.trimmed().left(40);
+    QTextCursor start(m_reader->document());
+    m_reader->setTextCursor(start);
+    if (snippet.isEmpty() || !m_reader->find(snippet))
+        applyRatio(m_reader->verticalScrollBar(), double(line) / qMax(1, m_editor->blockCount()));
+}
+
+void NoteView::showFind()
+{
+    if (!isNote())
+        return;
+    const QString selected = m_mode == Edit ? m_editor->textCursor().selectedText() : m_reader->textCursor().selectedText();
+    if (!selected.isEmpty() && !selected.contains(QChar::ParagraphSeparator))
+        m_findEdit->setText(selected);
+    m_findBar->show();
+    m_findEdit->setFocus();
+    m_findEdit->selectAll();
+}
+
+void NoteView::find(bool backward)
+{
+    const QString q = m_findEdit->text();
+    if (q.isEmpty())
+        return;
+    const QTextDocument::FindFlags flags = backward ? QTextDocument::FindBackward : QTextDocument::FindFlags();
+    auto run = [&](auto *view) {
+        if (view->find(q, flags))
+            return true;
+        QTextCursor c = view->textCursor();
+        c.movePosition(backward ? QTextCursor::End : QTextCursor::Start);
+        view->setTextCursor(c);
+        return view->find(q, flags);
+    };
+    const bool found = m_mode == Edit ? run(m_editor) : run(static_cast<QTextBrowser *>(m_reader));
+    QPalette pal = m_findEdit->palette();
+    pal.setColor(QPalette::Base, found ? palette().color(QPalette::Base) : mix(palette().color(QPalette::Base), Qt::red, 0.25));
+    m_findEdit->setPalette(pal);
+}
+
+void NoteView::focusTitle()
+{
+    m_title->setFocus();
+    m_title->selectAll();
+}
+
+void NoteView::focusContent()
+{
+    if (!isNote())
+        return;
+    if (m_mode == Edit)
+        m_editor->setFocus();
+    else
+        m_reader->setFocus();
+}
+
+void NoteView::applyFont(const QFont &font)
+{
+    m_font = font;
+    m_editor->applyFont(font);
+    QFont title = font;
+    title.setPointSizeF(font.pointSizeF() * 1.8);
+    title.setBold(true);
+    m_title->setFont(title);
+    if (m_mode == Read && isNote())
+        render();
+}
+
+void NoteView::setLinkCandidates(const QStringList &names)
+{
+    m_editor->setLinkCandidates(names);
+}
+
+QString NoteView::statsText() const
+{
+    if (!isNote())
+        return {};
+    const QString text = editorText();
+    static const QRegularExpression word(u"\\S+"_s);
+    qsizetype words = 0;
+    for (auto it = word.globalMatch(text); it.hasNext(); it.next())
+        ++words;
+    return tr("%Ln word(s)", nullptr, int(words)) + u"   "_s + tr("%Ln character(s)", nullptr, int(text.size()));
+}
+
+void NoteView::resizeEvent(QResizeEvent *e)
+{
+    QWidget::resizeEvent(e);
+    updateMargins();
+    scaleImage();
+}
+
+void NoteView::updateMargins()
+{
+    const int scroll = style()->pixelMetric(QStyle::PM_ScrollBarExtent);
+    const int margin = readableMargin(width() - scroll);
+    m_titleBar->layout()->setContentsMargins(margin, 20, margin + scroll, 4);
+}
+
+void NoteView::changeEvent(QEvent *e)
+{
+    QWidget::changeEvent(e);
+    if (e->type() == QEvent::PaletteChange)
+        refreshRender();
+}
+
+void NoteView::scaleImage()
+{
+    if (m_pixmap.isNull() || isNote()) {
+        m_image->clear();
+        return;
+    }
+    const int w = m_imageArea->viewport()->width() - 48;
+    m_image->setPixmap(m_pixmap.width() > w && w > 0 ? m_pixmap.scaledToWidth(w, Qt::SmoothTransformation) : m_pixmap);
+}

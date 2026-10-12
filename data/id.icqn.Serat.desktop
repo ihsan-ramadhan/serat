@@ -1,0 +1,12 @@
+[Desktop Entry]
+Type=Application
+Name=Serat
+GenericName=Markdown Notes
+Comment=Native Markdown notes, compatible with Obsidian vaults
+Exec=serat %f
+Icon=id.icqn.Serat
+Terminal=false
+Categories=Office;TextEditor;Qt;
+MimeType=inode/directory;
+StartupWMClass=serat
+Keywords=notes;markdown;obsidian;wiki;
