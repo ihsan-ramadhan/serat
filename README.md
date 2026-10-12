@@ -28,6 +28,31 @@ by KSyntaxHighlighting when it is available.
 Not there yet: graph view, canvas, live preview that hides markup while editing, tags
 pane, properties editor, community plugins.
 
+## Benchmark
+
+Same vault (38 notes, 5 images), both apps restoring their previous tabs, launched
+three times each and left idle. Medians shown.
+
+| | Obsidian 1.14.4 | Serat 0.1.0 |
+|---|---|---|
+| Window mapped | 0.54 s | 0.13 s |
+| Ready (whole app under 2% of one core for 1 s) | 2.15 s | 0.17 s |
+| CPU time spent starting up | 2.30 s | 0.12 s |
+| Memory, PSS summed over all processes | 461 MB | 43 MB |
+| Memory, private (USS) | 332 MB | 28 MB |
+| Processes / threads | 7 / ~100 | 1 / 11 |
+| CPU while idle, 15–35 s after launch | 3.4 % | < 0.1 % |
+| Installed size | 364 MiB (app + electron43) | 0.7 MiB + Qt 6 and KSyntaxHighlighting* |
+
+\* Qt 6 base is 69 MiB but usually already present; on the test machine 34 other
+packages depend on it. Counting it anyway, Serat totals about 80 MiB.
+
+Measured on 2026-10-13: Intel Core i5-13420H, 16 GB RAM, CachyOS (Linux 7.2.9), niri
+(Wayland), Qt 6.12.0, electron43 43.7.9. Memory comes from `/proc/<pid>/smaps_rollup`,
+CPU from `/proc/<pid>/stat`, and the window from niri's IPC. The comparison is not
+like for like: Obsidian also runs plugins, Sync and background indexing, which Serat
+does not have.
+
 ## Shortcuts
 
 | Key | Action |
