@@ -5,11 +5,10 @@ set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
-find_package(Qt6 6.5 REQUIRED COMPONENTS Widgets)
+find_package(Qt6 6.5 REQUIRED COMPONENTS Widgets Svg)
 qt_standard_project_setup()
 
-# md4c: use the system package when there is one, otherwise build the single
-# source file from upstream (Windows/macOS without a package manager).
+# md4c: the system package, or its single source file built from upstream.
 find_package(md4c CONFIG QUIET)
 if(NOT TARGET md4c::md4c)
     include(FetchContent)
@@ -32,6 +31,8 @@ qt_add_executable(serat
     src/Markdown.cpp src/Markdown.h
     src/CodeHighlight.cpp src/CodeHighlight.h
     src/MarkdownHighlighter.cpp src/MarkdownHighlighter.h
+    src/Theme.cpp src/Theme.h
+    src/TableEditor.cpp src/TableEditor.h
     src/Editor.cpp src/Editor.h
     src/Reader.cpp src/Reader.h
     src/NoteView.cpp src/NoteView.h
@@ -39,9 +40,10 @@ qt_add_executable(serat
     src/QuickSwitcher.cpp src/QuickSwitcher.h
     src/MainWindow.cpp src/MainWindow.h
 )
-qt_add_resources(serat "icons" PREFIX "/" BASE data FILES data/serat.svg)
+file(GLOB serat_icons RELATIVE ${CMAKE_CURRENT_SOURCE_DIR} CONFIGURE_DEPENDS data/icons/*.svg)
+qt_add_resources(serat "icons" PREFIX "/" BASE data FILES data/serat.svg ${serat_icons})
 
-target_link_libraries(serat PRIVATE Qt6::Widgets md4c::md4c)
+target_link_libraries(serat PRIVATE Qt6::Widgets Qt6::Svg md4c::md4c)
 target_compile_definitions(serat PRIVATE QT_NO_KEYWORDS SERAT_VERSION="${PROJECT_VERSION}")
 if(KF6SyntaxHighlighting_FOUND)
     target_link_libraries(serat PRIVATE KF6::SyntaxHighlighting)

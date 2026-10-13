@@ -19,10 +19,9 @@ struct RenderResult {
     QStringList codeBlocks; // referenced by "copy:<index>" links
 };
 
-// Markdown (Obsidian flavour) -> HTML subset understood by QTextDocument.
-// Link schemes produced: wiki:<target>[#heading], task:<utf8 offset>, copy:<n>,
-// plus regular URLs.
+// Links in the HTML: wiki:<target>[#heading], task:<utf8 offset>, copy:<n> and plain URLs.
 RenderResult renderMarkdown(const QString &text, const RenderOptions &opt);
+QString renderTableCell(const QString &cell, const RenderOptions &opt);
 QString markdownStyleSheet(const QPalette &pal, double basePointSize);
 QString headingAnchor(const QString &heading);
 QColor mix(const QColor &a, const QColor &b, double t);

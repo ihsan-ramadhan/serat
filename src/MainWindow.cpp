@@ -3,8 +3,10 @@
 #include "NoteView.h"
 #include "Panels.h"
 #include "QuickSwitcher.h"
+#include "Theme.h"
 #include "Vault.h"
 
+#include <QActionGroup>
 #include <QApplication>
 #include <QCloseEvent>
 #include <QCryptographicHash>
@@ -12,6 +14,7 @@
 #include <QDir>
 #include <QFileDialog>
 #include <QFileInfo>
+#include <QHBoxLayout>
 #include <QInputDialog>
 #include <QJsonDocument>
 #include <QJsonObject>
@@ -23,6 +26,7 @@
 #include <QSplitter>
 #include <QStackedWidget>
 #include <QStandardPaths>
+#include <QStylePainter>
 #include <QStatusBar>
 #include <QTabBar>
 #include <QTabWidget>
@@ -45,7 +49,6 @@ QString join(const QString &dir, const QString &name)
     return dir.isEmpty() ? name : dir + u'/' + name;
 }
 
-// Vaults registered in Obsidian's own config, so the first start can offer them.
 QStringList obsidianVaults()
 {
     QStringList configs;
@@ -72,6 +75,53 @@ QStringList obsidianVaults()
     return vaults;
 }
 
+// QTabBar left-aligns icons even when a tab has no text; draw them centred.
+class IconTabBar : public QTabBar
+{
+public:
+    using QTabBar::QTabBar;
+
+protected:
+    void paintEvent(QPaintEvent *) override
+    {
+        QStylePainter p(this);
+        for (int i = 0; i < count(); ++i) {
+            QStyleOptionTab opt;
+            initStyleOption(&opt, i);
+            p.drawControl(QStyle::CE_TabBarTabShape, opt);
+            QRect r(QPoint(), iconSize());
+            r.moveCenter(opt.rect.center());
+            const QIcon::Mode mode = (opt.state & QStyle::State_MouseOver) ? QIcon::Active : QIcon::Normal;
+            opt.icon.paint(&p, r, Qt::AlignCenter, mode, (opt.state & QStyle::State_Selected) ? QIcon::On : QIcon::Off);
+            if (m_keyboardFocus && hasFocus() && i == currentIndex()) {
+                p.setPen(QPen(palette().color(QPalette::Accent), 1));
+                p.setBrush(Qt::NoBrush);
+                p.drawRoundedRect(r.adjusted(-5, -4, 4, 3), 4, 4);
+            }
+        }
+    }
+
+    void focusInEvent(QFocusEvent *e) override
+    {
+        m_keyboardFocus = e->reason() == Qt::TabFocusReason || e->reason() == Qt::BacktabFocusReason;
+        QTabBar::focusInEvent(e);
+    }
+    void focusOutEvent(QFocusEvent *e) override
+    {
+        m_keyboardFocus = false;
+        QTabBar::focusOutEvent(e);
+    }
+
+private:
+    bool m_keyboardFocus = false;
+};
+
+class PanelTabs : public QTabWidget
+{
+public:
+    PanelTabs() { setTabBar(new IconTabBar); }
+};
+
 } // namespace
 
 MainWindow::MainWindow(QWidget *parent)
@@ -95,34 +145,49 @@ void MainWindow::buildUi()
 {
     m_tree = new FileTree;
     m_search = new SearchPanel;
-    m_left = new QTabWidget;
-    m_left->setDocumentMode(true);
-    m_left->addTab(m_tree, tr("Files"));
-    m_left->addTab(m_search, tr("Search"));
+    auto panelTabs = [](std::initializer_list<std::tuple<QWidget *, const char16_t *, QString>> pages) {
+        auto *w = new PanelTabs;
+        w->setDocumentMode(true);
+        w->tabBar()->setObjectName(u"panels"_s);
+        // Document mode turns expanding off.
+        w->tabBar()->setExpanding(true);
+        w->tabBar()->setDrawBase(false);
+        w->setIconSize(QSize(18, 18));
+        for (const auto &[page, icon, tip] : pages) {
+            const int i = w->addTab(page, Theme::icon(QString::fromUtf16(icon)), QString());
+            w->setTabToolTip(i, tip);
+        }
+        return w;
+    };
+    m_left = panelTabs({{m_tree, u"folder", tr("Files")}, {m_search, u"search", tr("Search (Ctrl+Shift+F)")}});
 
     m_tabs = new QTabWidget;
     m_tabs->setDocumentMode(true);
-    m_tabs->setTabsClosable(true);
+    m_tabs->tabBar()->setObjectName(u"notes"_s);
+    m_tabs->tabBar()->setDrawBase(false);
     m_tabs->setMovable(true);
     m_tabs->setElideMode(Qt::ElideRight);
     m_tabs->setUsesScrollButtons(true);
     m_tabs->tabBar()->setExpanding(false);
     m_tabs->tabBar()->installEventFilter(this);
     auto *plus = new QToolButton;
-    plus->setText(u"+"_s);
+    plus->setIcon(Theme::icon(u"file-plus"_s));
+    plus->setIconSize(QSize(18, 18));
     plus->setAutoRaise(true);
     plus->setToolTip(tr("New note (Ctrl+N)"));
-    m_tabs->setCornerWidget(plus, Qt::TopRightCorner);
+    auto *corner = new QWidget;
+    auto *cornerLayout = new QHBoxLayout(corner);
+    cornerLayout->setContentsMargins(0, 0, 6, 4); // aligns with the tab titles
+    cornerLayout->addWidget(plus, 0, Qt::AlignVCenter);
+    m_tabs->setCornerWidget(corner, Qt::TopRightCorner);
     connect(plus, &QToolButton::clicked, this, [this] { newNote({}); });
 
     m_backlinks = new BacklinksPanel;
     m_outgoing = new OutgoingPanel;
     m_outline = new OutlinePanel;
-    m_right = new QTabWidget;
-    m_right->setDocumentMode(true);
-    m_right->addTab(m_backlinks, tr("Backlinks"));
-    m_right->addTab(m_outgoing, tr("Outgoing"));
-    m_right->addTab(m_outline, tr("Outline"));
+    m_right = panelTabs({{m_backlinks, u"backlinks", tr("Backlinks")},
+                         {m_outgoing, u"outgoing", tr("Outgoing links")},
+                         {m_outline, u"outline", tr("Outline")}});
 
     m_split = new QSplitter;
     m_split->addWidget(m_left);
@@ -130,28 +195,38 @@ void MainWindow::buildUi()
     m_split->addWidget(m_right);
     m_split->setStretchFactor(1, 1);
     m_split->setChildrenCollapsible(false);
-    m_split->setSizes({220, 900, 240});
+    m_split->setHandleWidth(1);
+    m_split->setSizes({240, 900, 260});
 
     m_welcome = new QWidget;
     auto *welcomeOuter = new QVBoxLayout(m_welcome);
     auto *card = new QWidget;
-    card->setMaximumWidth(460);
+    card->setFixedWidth(440);
     auto *cardLayout = new QVBoxLayout(card);
+    cardLayout->setSpacing(6);
     auto *logo = new QLabel;
-    logo->setPixmap(QIcon(u":/serat.svg"_s).pixmap(72, 72));
-    auto *title = new QLabel(u"<h1>Serat</h1>"_s);
+    logo->setPixmap(QIcon(u":/serat.svg"_s).pixmap(56, 56));
+    auto *title = new QLabel(u"Serat"_s);
+    QFont titleFont = title->font();
+    titleFont.setPointSizeF(titleFont.pointSizeF() * 2.2);
+    titleFont.setWeight(QFont::DemiBold);
+    title->setFont(titleFont);
     auto *subtitle = new QLabel(tr("Plain Markdown notes in a folder. Opens Obsidian vaults as they are."));
     subtitle->setWordWrap(true);
+    subtitle->setForegroundRole(QPalette::PlaceholderText);
     auto *openButton = new QPushButton(tr("Open folder as vault…"));
+    openButton->setObjectName(u"primary"_s);
     openButton->setDefault(true);
     m_welcomeList = new QVBoxLayout;
+    m_welcomeList->setSpacing(2);
     cardLayout->addWidget(logo);
+    cardLayout->addSpacing(4);
     cardLayout->addWidget(title);
     cardLayout->addWidget(subtitle);
-    cardLayout->addSpacing(12);
+    cardLayout->addSpacing(18);
     cardLayout->addLayout(m_welcomeList);
-    cardLayout->addSpacing(8);
-    cardLayout->addWidget(openButton);
+    cardLayout->addSpacing(14);
+    cardLayout->addWidget(openButton, 0, Qt::AlignLeft);
     welcomeOuter->addStretch();
     welcomeOuter->addWidget(card, 0, Qt::AlignHCenter);
     welcomeOuter->addStretch(2);
@@ -168,19 +243,11 @@ void MainWindow::buildUi()
 
     m_vaultLabel = new QLabel;
     m_statsLabel = new QLabel;
-    m_modeButton = new QToolButton;
-    m_modeButton->setAutoRaise(true);
-    m_modeButton->setToolTip(tr("Toggle reading view (Ctrl+E)"));
+    statusBar()->setSizeGripEnabled(false);
     statusBar()->addWidget(m_vaultLabel);
     statusBar()->addPermanentWidget(m_statsLabel);
-    statusBar()->addPermanentWidget(m_modeButton);
 
     connect(m_tabs, &QTabWidget::currentChanged, this, &MainWindow::onCurrentChanged);
-    connect(m_tabs, &QTabWidget::tabCloseRequested, this, [this](int i) { closeTab(i); });
-    connect(m_modeButton, &QToolButton::clicked, this, [this] {
-        if (NoteView *v = currentView())
-            v->setMode(v->mode() == NoteView::Edit ? NoteView::Read : NoteView::Edit);
-    });
 
     connect(m_tree, &FileTree::openRequested, this, [this](const QString &p, bool newTab) { openPath(p, newTab); });
     connect(m_tree, &FileTree::newNoteRequested, this, &MainWindow::newNote);
@@ -249,9 +316,19 @@ void MainWindow::buildActions()
     add(go, tr("Search vault"), QKeySequence(u"Ctrl+Shift+F"_s), [this] { searchVault(); });
     go->addSeparator();
     QAction *back = add(go, tr("Back"), QKeySequence(u"Alt+Left"_s), withView([](NoteView *v) { v->goBack(); }));
-    back->setShortcuts({QKeySequence(u"Alt+Left"_s), QKeySequence(u"Ctrl+Alt+Left"_s), QKeySequence::Back});
+    // A key listed twice (QKeySequence::Back is Alt+Left) makes the shortcut ambiguous.
+    auto unique = [](QList<QKeySequence> keys) {
+        QList<QKeySequence> out;
+        for (const QKeySequence &k : keys)
+            if (!k.isEmpty() && !out.contains(k))
+                out << k;
+        return out;
+    };
+    back->setShortcuts(unique(QList<QKeySequence>{QKeySequence(u"Alt+Left"_s), QKeySequence(u"Ctrl+Alt+Left"_s)}
+                              + QKeySequence::keyBindings(QKeySequence::Back)));
     QAction *fwd = add(go, tr("Forward"), QKeySequence(u"Alt+Right"_s), withView([](NoteView *v) { v->goForward(); }));
-    fwd->setShortcuts({QKeySequence(u"Alt+Right"_s), QKeySequence(u"Ctrl+Alt+Right"_s), QKeySequence::Forward});
+    fwd->setShortcuts(unique(QList<QKeySequence>{QKeySequence(u"Alt+Right"_s), QKeySequence(u"Ctrl+Alt+Right"_s)}
+                             + QKeySequence::keyBindings(QKeySequence::Forward)));
     go->addSeparator();
     add(go, tr("Next tab"), QKeySequence(u"Ctrl+Tab"_s), [this] {
         if (m_tabs->count())
@@ -266,6 +343,16 @@ void MainWindow::buildActions()
     add(view, tr("Toggle reading view"), QKeySequence(u"Ctrl+E"_s), withView([](NoteView *v) {
         v->setMode(v->mode() == NoteView::Edit ? NoteView::Read : NoteView::Edit);
     }));
+    QAction *live = add(view, tr("Live preview"), QKeySequence(u"Ctrl+Shift+E"_s), [this](bool on) {
+        m_livePreview = on;
+        QSettings().setValue(u"livePreview"_s, on);
+        for (NoteView *v : views())
+            v->setLivePreview(on);
+    });
+    live->setCheckable(true);
+    m_livePreview = QSettings().value(u"livePreview"_s, true).toBool();
+    live->setChecked(m_livePreview);
+    live->setToolTip(tr("Hide Markdown markup except on the line being edited"));
     view->addSeparator();
     add(view, tr("Toggle left sidebar"), QKeySequence(u"Ctrl+\\"_s), [this] { m_left->setVisible(!m_left->isVisible()); });
     add(view, tr("Toggle right sidebar"), QKeySequence(u"Ctrl+Shift+\\"_s), [this] { m_right->setVisible(!m_right->isVisible()); });
@@ -273,6 +360,16 @@ void MainWindow::buildActions()
     add(view, tr("Zoom in"), QKeySequence::ZoomIn, [this] { zoom(1); })->setShortcuts({QKeySequence::ZoomIn, QKeySequence(u"Ctrl+="_s)});
     add(view, tr("Zoom out"), QKeySequence::ZoomOut, [this] { zoom(-1); });
     add(view, tr("Reset zoom"), QKeySequence(u"Ctrl+0"_s), [this] { zoom(-m_fontDelta); });
+    view->addSeparator();
+    QMenu *theme = view->addMenu(tr("Theme"));
+    auto *themes = new QActionGroup(theme);
+    const std::pair<QString, QString> modes[] = {{u"system"_s, tr("Follow system")}, {u"light"_s, tr("Light")}, {u"dark"_s, tr("Dark")}};
+    for (const auto &[mode, label] : modes) {
+        QAction *a = theme->addAction(label, this, [mode] { Theme::setPreference(mode); });
+        a->setCheckable(true);
+        a->setChecked(Theme::preference() == mode);
+        themes->addAction(a);
+    }
 
     QMenu *help = menuBar()->addMenu(tr("&Help"));
     add(help, tr("About Serat"), {}, [this] {
@@ -288,6 +385,8 @@ void MainWindow::buildActions()
 void MainWindow::showWelcome()
 {
     if (m_vault) {
+        for (NoteView *v : views())
+            v->discardIfUntouched();
         saveAll();
         saveSession();
         while (m_tabs->count())
@@ -302,7 +401,6 @@ void MainWindow::showWelcome()
     m_pages->setCurrentWidget(m_welcome);
     m_vaultLabel->clear();
     m_statsLabel->clear();
-    m_modeButton->hide();
     setWindowTitle(u"Serat"_s);
 }
 
@@ -318,9 +416,24 @@ void MainWindow::rebuildWelcome()
             vaults << v;
     vaults.removeIf([](const QString &v) { return !QFileInfo(v).isDir(); });
     for (const QString &v : std::as_const(vaults)) {
-        auto *b = new QPushButton(QFileInfo(v).fileName() + u"   —   "_s + QDir::toNativeSeparators(v));
-        b->setFlat(true);
-        b->setStyleSheet(u"text-align: left; padding: 6px;"_s);
+        auto *b = new QPushButton;
+        b->setObjectName(u"vaultRow"_s);
+        b->setToolTip(tr("Open %1").arg(QDir::toNativeSeparators(v)));
+        auto *name = new QLabel(QFileInfo(v).fileName());
+        QFont bold = name->font();
+        bold.setWeight(QFont::DemiBold);
+        name->setFont(bold);
+        auto *path = new QLabel;
+        path->setText(path->fontMetrics().elidedText(QDir::toNativeSeparators(v), Qt::ElideMiddle, 400));
+        path->setForegroundRole(QPalette::PlaceholderText);
+        for (QLabel *l : {name, path})
+            l->setAttribute(Qt::WA_TransparentForMouseEvents);
+        auto *rowLayout = new QVBoxLayout(b);
+        rowLayout->setContentsMargins(10, 7, 10, 7);
+        rowLayout->setSpacing(1);
+        rowLayout->addWidget(name);
+        rowLayout->addWidget(path);
+        b->setMinimumHeight(rowLayout->sizeHint().height());
         connect(b, &QPushButton::clicked, this, [this, v] { openVault(v); });
         m_welcomeList->addWidget(b);
     }
@@ -354,7 +467,6 @@ void MainWindow::openVault(const QString &path)
     m_tree->setVault(m_vault);
     m_search->setVault(m_vault);
     m_vaultLabel->setText(m_vault->name());
-    m_modeButton->show();
     m_pages->setCurrentWidget(m_split);
 
     QSettings s;
@@ -427,6 +539,8 @@ void MainWindow::restoreSession()
 
 void MainWindow::closeEvent(QCloseEvent *e)
 {
+    for (NoteView *v : views())
+        v->discardIfUntouched();
     saveAll();
     saveSession();
     e->accept();
@@ -434,7 +548,6 @@ void MainWindow::closeEvent(QCloseEvent *e)
 
 bool MainWindow::eventFilter(QObject *obj, QEvent *e)
 {
-    // Middle-click closes a tab.
     if (obj == m_tabs->tabBar() && e->type() == QEvent::MouseButtonRelease) {
         auto *me = static_cast<QMouseEvent *>(e);
         if (me->button() == Qt::MiddleButton) {
@@ -465,6 +578,7 @@ NoteView *MainWindow::createTab()
 {
     auto *v = new NoteView(m_vault);
     v->applyFont(noteFont());
+    v->setLivePreview(m_livePreview);
     v->setLinkCandidates(m_candidates);
     connect(v, &NoteView::linkRequested, this, [this, v](const QString &target, bool newTab) {
         openLink(target, v->path(), newTab);
@@ -491,11 +605,27 @@ NoteView *MainWindow::createTab()
         if (v == currentView())
             updateStatus();
     });
+    connect(v, &NoteView::hintChanged, this, [this, v](const QString &hint) {
+        if (v != currentView())
+            return;
+        if (hint.isEmpty())
+            statusBar()->clearMessage();
+        else
+            statusBar()->showMessage(hint);
+    });
     connect(v, &NoteView::modeChanged, this, [this, v] {
         if (v == currentView())
             updateStatus();
     });
-    m_tabs->addTab(v, QString());
+    const int index = m_tabs->addTab(v, QString());
+    auto *close = new QToolButton;
+    close->setIcon(Theme::icon(u"close"_s));
+    close->setIconSize(QSize(14, 14));
+    close->setAutoRaise(true);
+    close->setFocusPolicy(Qt::NoFocus);
+    close->setToolTip(tr("Close tab (Ctrl+W)"));
+    connect(close, &QToolButton::clicked, this, [this, v] { closeTab(m_tabs->indexOf(v)); });
+    m_tabs->tabBar()->setTabButton(index, QTabBar::RightSide, close);
     return v;
 }
 
@@ -504,7 +634,7 @@ void MainWindow::closeTab(int index, bool saveFirst)
     auto *v = qobject_cast<NoteView *>(m_tabs->widget(index));
     if (!v)
         return;
-    if (saveFirst)
+    if (saveFirst && !v->discardIfUntouched())
         v->save();
     m_tabs->removeTab(index);
     v->deleteLater();
@@ -590,6 +720,7 @@ void MainWindow::newNote(const QString &dir)
         return;
     openPath(path, false);
     if (NoteView *v = currentView()) {
+        v->markNew();
         v->setMode(NoteView::Edit);
         v->focusTitle();
     }
@@ -713,7 +844,6 @@ void MainWindow::onVaultChanged()
 {
     if (!m_vault)
         return;
-    // Files deleted outside the app close their tabs, like in Obsidian.
     for (int i = m_tabs->count() - 1; i >= 0; --i) {
         auto *v = qobject_cast<NoteView *>(m_tabs->widget(i));
         if (v && !m_vault->exists(v->path()))
@@ -743,9 +873,6 @@ void MainWindow::updateStatus()
 {
     NoteView *v = currentView();
     m_statsLabel->setText(v ? v->statsText() : QString());
-    m_modeButton->setVisible(v && v->isNote());
-    if (v)
-        m_modeButton->setText(v->mode() == NoteView::Edit ? tr("Editing") : tr("Reading"));
 }
 
 void MainWindow::updateTitle()
@@ -757,5 +884,5 @@ void MainWindow::updateTitle()
     if (m_vault)
         parts << m_vault->name();
     parts << u"Serat"_s;
-    setWindowTitle(parts.join(u" — "_s));
+    setWindowTitle(parts.join(u" - "_s));
 }

@@ -1,8 +1,12 @@
 #include "Reader.h"
 
 #include "Editor.h"
+#include "Theme.h"
 
 #include <QScrollBar>
+#include <QUrlQuery>
+
+using namespace Qt::StringLiterals;
 
 Reader::Reader(QWidget *parent)
     : QTextBrowser(parent)
@@ -31,4 +35,14 @@ void Reader::resizeEvent(QResizeEvent *e)
         m_lastWidth = contentWidth();
         Q_EMIT contentWidthChanged();
     }
+}
+
+QVariant Reader::loadResource(int type, const QUrl &name)
+{
+    // "icon:<name>?color=%23rrggbb" from the renderer (callout icons).
+    if (type == QTextDocument::ImageResource && name.scheme() == u"icon") {
+        const QColor color(QUrlQuery(name).queryItemValue(u"color"_s, QUrl::FullyDecoded));
+        return Theme::image(name.path(), color, 18, devicePixelRatioF());
+    }
+    return QTextBrowser::loadResource(type, name);
 }

@@ -52,8 +52,7 @@ public:
     bool exists(const QString &path) const;
     bool isDir(const QString &path) const;
 
-    // Obsidian-style resolution: exact path first, then by file name,
-    // preferring the source note's folder, then the shortest path.
+    // Obsidian's order: exact path, then file name preferring `from`'s folder, then shortest path.
     QString resolve(const QString &target, const QString &from) const;
     // Shortest link text that resolves back to `path`.
     QString linkText(const QString &path) const;
@@ -65,8 +64,7 @@ public:
     bool createFolder(const QString &path);
     bool writeNote(const QString &path, const QString &text);
     QString readText(const QString &path) const;
-    // Renames/moves a file or folder and rewrites every link pointing into it.
-    // Returns an error message, or an empty string on success.
+    // Also rewrites links pointing into it; returns an error message, empty on success.
     QString rename(const QString &from, const QString &to);
     bool remove(const QString &path);
 

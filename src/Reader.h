@@ -14,6 +14,7 @@ Q_SIGNALS:
 
 protected:
     void resizeEvent(QResizeEvent *e) override;
+    QVariant loadResource(int type, const QUrl &name) override;
 
 private:
     int m_lastWidth = 0;

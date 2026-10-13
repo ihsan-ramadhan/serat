@@ -1,6 +1,7 @@
 #include "Panels.h"
 
 #include "Markdown.h"
+#include "Theme.h"
 #include "Vault.h"
 
 #include <QApplication>
@@ -14,6 +15,7 @@
 #include <QLineEdit>
 #include <QMenu>
 #include <QMimeData>
+#include <QPainter>
 #include <QSortFilterProxyModel>
 #include <QUrl>
 #include <QVBoxLayout>
@@ -68,6 +70,18 @@ public:
                 name.chop(3);
             return name;
         }
+        if (role == Qt::DecorationRole && index.column() == 0) {
+            static const QIcon folder = Theme::icon(u"folder"_s, u"folder-open"_s);
+            static const QIcon note = Theme::icon(u"file-text"_s);
+            static const QIcon image = Theme::icon(u"file-image"_s);
+            static const QIcon other = Theme::icon(u"file"_s);
+            const auto *fs = static_cast<QFileSystemModel *>(sourceModel());
+            const QModelIndex source = mapToSource(index);
+            if (fs->isDir(source))
+                return folder;
+            const QString name = fs->fileName(source);
+            return Vault::isNote(name) ? note : Vault::isImage(name) ? image : other;
+        }
         return v;
     }
 
@@ -98,8 +112,6 @@ protected:
 };
 
 } // namespace
-
-// ---------------------------------------------------------------- FileTree
 
 FileTree::FileTree(QWidget *parent)
     : QTreeView(parent)
@@ -202,6 +214,20 @@ void FileTree::showMenu(const QPoint &pos)
     menu.exec(viewport()->mapToGlobal(pos));
 }
 
+void FileTree::drawBranches(QPainter *painter, const QRect &rect, const QModelIndex &index) const
+{
+    if (selectionModel()->isSelected(index))
+        painter->fillRect(rect, palette().color(QPalette::Highlight));
+    if (!m_fs->isDir(m_proxy->mapToSource(index)))
+        return;
+    static const QIcon closed = Theme::icon(u"chevron-right"_s);
+    static const QIcon open = Theme::icon(u"chevron-down"_s);
+    const int size = 12;
+    const QRect cell(rect.right() - indentation() + 1, rect.top(), indentation(), rect.height());
+    const QRect icon(cell.center().x() - size / 2 + 1, cell.center().y() - size / 2 + 1, size, size);
+    (isExpanded(index) ? open : closed).paint(painter, icon);
+}
+
 void FileTree::mouseReleaseEvent(QMouseEvent *e)
 {
     if (e->button() == Qt::MiddleButton) {
@@ -252,8 +278,6 @@ void FileTree::dropEvent(QDropEvent *e)
     e->setDropAction(Qt::CopyAction);
     e->accept();
 }
-
-// ---------------------------------------------------------------- SearchPanel
 
 SearchPanel::SearchPanel(QWidget *parent)
     : QWidget(parent)
@@ -320,8 +344,6 @@ void SearchPanel::rerun()
     m_summary->setText(files ? tr("%n file(s)", nullptr, files) : tr("No matches"));
 }
 
-// ---------------------------------------------------------------- BacklinksPanel
-
 BacklinksPanel::BacklinksPanel(QWidget *parent)
     : QTreeWidget(parent)
 {
@@ -360,8 +382,6 @@ void BacklinksPanel::showFor(const Vault *vault, const QString &path)
     }
     expandAll();
 }
-
-// ---------------------------------------------------------------- OutgoingPanel
 
 OutgoingPanel::OutgoingPanel(QWidget *parent)
     : QTreeWidget(parent)
@@ -406,8 +426,6 @@ void OutgoingPanel::showFor(const Vault *vault, const QString &path)
     if (seen.isEmpty())
         placeholder(this, tr("No outgoing links."));
 }
-
-// ---------------------------------------------------------------- OutlinePanel
 
 OutlinePanel::OutlinePanel(QWidget *parent)
     : QTreeWidget(parent)

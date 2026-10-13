@@ -2,9 +2,11 @@
 
 #include "Markdown.h"
 #include "MarkdownHighlighter.h"
+#include "TableEditor.h"
 #include "Vault.h"
 
 #include <QAbstractItemView>
+#include <QAbstractTextDocumentLayout>
 #include <QCompleter>
 #include <QDateTime>
 #include <QFile>
@@ -12,9 +14,13 @@
 #include <QImage>
 #include <QKeyEvent>
 #include <QMimeData>
+#include <QPointer>
+#include <QScopedValueRollback>
 #include <QPainter>
+#include <QTextLayout>
 #include <QRegularExpression>
 #include <QScrollBar>
+#include <QSet>
 #include <QStringListModel>
 #include <QTextBlock>
 #include <QUrl>
@@ -60,13 +66,26 @@ Editor::Editor(QWidget *parent)
     m_completer->setFilterMode(Qt::MatchContains);
     m_completer->setMaxVisibleItems(10);
     connect(m_completer, qOverload<const QString &>(&QCompleter::activated), this, &Editor::insertCompletion);
+
+    m_tableTimer.setSingleShot(true);
+    m_tableTimer.setInterval(0);
+    connect(&m_tableTimer, &QTimer::timeout, this, &Editor::scanTables);
+    connect(document(), &QTextDocument::contentsChange, this, [this](int pos, int removed, int added) {
+        if (m_inKeyPress)
+            m_typedBlock = document()->findBlock(pos).blockNumber();
+        if ((removed || added) && !m_tableBusy)
+            m_tableTimer.start();
+    });
+    connect(this, &QPlainTextEdit::updateRequest, this, &Editor::positionTables);
+    connect(this, &QPlainTextEdit::cursorPositionChanged, this, &Editor::onCursorMoved);
+    connect(this, &QPlainTextEdit::cursorPositionChanged, this, &Editor::updateRawBlocks);
+    connect(this, &QPlainTextEdit::selectionChanged, this, &Editor::updateRawBlocks);
     retheme();
 }
 
 void Editor::setLinkCandidates(const QStringList &names)
 {
-    // Every autosave refreshes the vault; resetting the model would drop the
-    // selected row of an open completion popup.
+    // Resetting the model on every autosave would drop the popup's selected row.
     if (names == m_candidates->stringList())
         return;
     m_candidates->setStringList(names);
@@ -79,6 +98,9 @@ void Editor::applyFont(const QFont &font)
     setFont(font);
     setTabStopDistance(QFontMetricsF(font).horizontalAdvance(u' ') * 4);
     retheme();
+    for (const Table &t : std::as_const(m_tables))
+        t.overlay->setNoteFont(font);
+    layoutTables();
 }
 
 void Editor::retheme()
@@ -110,6 +132,7 @@ void Editor::resizeEvent(QResizeEvent *e)
 {
     QPlainTextEdit::resizeEvent(e);
     updateMargins();
+    layoutTables();
 }
 
 void Editor::updateMargins()
@@ -134,10 +157,180 @@ void Editor::paintEvent(QPaintEvent *e)
         }
     }
     QPlainTextEdit::paintEvent(e);
+    if (!m_live)
+        return;
+
+    QPainter p(viewport());
+    p.setRenderHint(QPainter::Antialiasing);
+    const QPalette pal = palette();
+    const QColor muted = pal.color(QPalette::PlaceholderText);
+    const QColor bar = mix(pal.color(QPalette::Base), pal.color(QPalette::Text), 0.25);
+    const QPointF offset = contentOffset();
+    for (QTextBlock b = firstVisibleBlock(); b.isValid(); b = b.next()) {
+        if (blockBoundingGeometry(b).translated(offset).top() > viewport()->height())
+            break;
+        if (!previewed(b))
+            continue;
+        for (const Deco &d : decorations(b)) {
+            switch (d.kind) {
+            case Deco::Quote:
+                p.fillRect(d.rect, bar);
+                break;
+            case Deco::Rule:
+                p.fillRect(QRectF(d.rect.left(), d.rect.center().y(), d.rect.width(), 1), bar);
+                break;
+            case Deco::Bullet: {
+                const double r = qMax(2.5, d.rect.height() * 0.11);
+                p.setPen(Qt::NoPen);
+                p.setBrush(muted);
+                p.drawEllipse(d.rect.center(), r, r);
+                break;
+            }
+            case Deco::Task: {
+                const double side = qMin(d.rect.height() * 0.62, 16.0);
+                const QRectF box(d.rect.center().x() - side / 2, d.rect.center().y() - side / 2, side, side);
+                if (d.checked) {
+                    p.setPen(Qt::NoPen);
+                    p.setBrush(pal.color(QPalette::Link));
+                    p.drawRoundedRect(box, 3, 3);
+                    p.setPen(QPen(pal.color(QPalette::Base), 1.8, Qt::SolidLine, Qt::RoundCap, Qt::RoundJoin));
+                    p.setBrush(Qt::NoBrush);
+                    p.drawPolyline(QList<QPointF>{box.topLeft() + QPointF(side * 0.24, side * 0.52),
+                                                  box.topLeft() + QPointF(side * 0.43, side * 0.7),
+                                                  box.topLeft() + QPointF(side * 0.76, side * 0.32)});
+                } else {
+                    p.setPen(QPen(muted, 1.5));
+                    p.setBrush(Qt::NoBrush);
+                    p.drawRoundedRect(box.adjusted(0.75, 0.75, -0.75, -0.75), 3, 3);
+                }
+                break;
+            }
+            }
+        }
+    }
+}
+
+void Editor::setLivePreview(bool on)
+{
+    if (on == m_live)
+        return;
+    m_live = on;
+    m_highlighter->setLivePreview(on);
+    m_highlighter->rehighlight();
+    scanTables();
+    viewport()->update();
+}
+
+void Editor::updateRawBlocks()
+{
+    const QTextCursor c = textCursor();
+    const QTextBlock first = document()->findBlock(c.selectionStart());
+    const QTextBlock last = document()->findBlock(c.selectionEnd());
+    const int from = first.blockNumber(), to = last.blockNumber();
+    const int colFrom = c.selectionStart() - first.position(), colTo = c.selectionEnd() - last.position();
+    if (from == m_rawFrom && to == m_rawTo && colFrom == m_colFrom && colTo == m_colTo)
+        return;
+    const int oldFrom = m_rawFrom, oldTo = m_rawTo;
+    m_rawFrom = from;
+    m_rawTo = to;
+    m_colFrom = colFrom;
+    m_colTo = colTo;
+    m_highlighter->setRawRange(from, colFrom, to, colTo);
+    updateTableHint();
+    if (!m_live)
+        return;
+    auto refresh = [this](int a, int b) {
+        for (QTextBlock blk = document()->findBlockByNumber(a); blk.isValid() && blk.blockNumber() <= b; blk = blk.next())
+            m_highlighter->rehighlightBlock(blk);
+    };
+    if (oldFrom >= 0)
+        refresh(oldFrom, oldTo);
+    refresh(from, to);
+    viewport()->update();
+}
+
+// Markdown makes text right under a table one of its rows; warn while it is typed.
+void Editor::updateTableHint()
+{
+    QString hint;
+    const QTextBlock b = textCursor().block();
+    if (m_rawTable.isValid()) {
+        const int row = b.blockNumber() - m_rawTable.blockNumber();
+        if (row >= 2 && row < m_rawLines && !MdTable::hasPipe(b.text()) && !b.text().trimmed().isEmpty())
+            hint = tr("This line is part of the table above. Leave an empty line before it to start a paragraph.");
+    }
+    if (hint != m_hint) {
+        m_hint = hint;
+        Q_EMIT hintChanged(hint);
+    }
+}
+
+bool Editor::previewed(const QTextBlock &block) const
+{
+    if (!m_live || !block.isVisible() || !m_highlighter->hidesMarkup(block.blockNumber()))
+        return false;
+    if (const auto *t = static_cast<const TableLineData *>(block.userData()); t && t->pixelSize)
+        return false;
+    const auto inside = [](int state) {
+        return state > 0 && (state & (BlockState::InFence | BlockState::FenceLine | BlockState::Frontmatter));
+    };
+    return !inside(block.userState()) && !inside(block.previous().userState());
+}
+
+QList<Editor::Deco> Editor::decorations(const QTextBlock &block) const
+{
+    static const QRegularExpression hr(u"^ {0,3}([-*_])( *\\1){2,} *$"_s);
+    static const QRegularExpression quote(u"^\\s*(>[ >]*)"_s);
+    static const QRegularExpression list(u"^\\s*([-*+])\\s+(\\[[ xX]\\]\\s)?"_s);
+    QList<Deco> out;
+    QTextLayout *layout = block.layout();
+    if (!layout || layout->lineCount() == 0)
+        return out;
+    const QString text = block.text();
+    const QRectF r = blockBoundingGeometry(block).translated(contentOffset());
+    auto chars = [&](int i, int n) {
+        const QTextLine line = layout->lineForTextPosition(i);
+        const double x1 = line.cursorToX(i), x2 = line.cursorToX(i + n);
+        return QRectF(r.left() + x1, r.top() + line.y(), x2 - x1, line.height());
+    };
+
+    if (hr.match(text).hasMatch()) {
+        const double left = r.left() + document()->documentMargin();
+        out.append({Deco::Rule, QRectF(left, r.top(), viewport()->width() - 2 * left, r.height())});
+        return out;
+    }
+    int from = 0;
+    if (const auto m = quote.match(text); m.hasMatch()) {
+        for (int i = int(m.capturedStart(1)); i < m.capturedEnd(1); ++i)
+            if (text[i] == u'>')
+                out.append({Deco::Quote, QRectF(chars(i, 1).left() + 1, r.top(), 3, r.height())});
+        from = int(m.capturedEnd(1));
+    }
+    const auto m = list.match(text, from, QRegularExpression::NormalMatch, QRegularExpression::AnchorAtOffsetMatchOption);
+    if (m.hasMatch()) {
+        if (m.capturedLength(2)) {
+            const int at = int(m.capturedStart(2));
+            out.append({Deco::Task, chars(at, 3), text[at + 1] != u' ', at + 1});
+        } else {
+            out.append({Deco::Bullet, chars(int(m.capturedStart(1)), 1)});
+        }
+    }
+    return out;
+}
+
+QString Editor::clickedLink(const QPoint &pos) const
+{
+    const QTextCursor c = cursorForPosition(pos);
+    if (!previewed(c.block()))
+        return {};
+    if (c.atBlockEnd() && pos.x() > cursorRect(c).right() + 2)
+        return {}; // past the end of the line
+    return linkAt(c);
 }
 
 void Editor::keyPressEvent(QKeyEvent *e)
 {
+    const QScopedValueRollback typing(m_inKeyPress, true);
     if (m_completer->popup()->isVisible()) {
         switch (e->key()) {
         case Qt::Key_Enter:
@@ -153,6 +346,23 @@ void Editor::keyPressEvent(QKeyEvent *e)
     }
 
     const auto mods = e->modifiers() & ~Qt::KeypadModifier;
+    switch (e->key()) {
+    case Qt::Key_Up:
+    case Qt::Key_Down:
+    case Qt::Key_Left:
+    case Qt::Key_Right:
+    case Qt::Key_PageUp:
+    case Qt::Key_PageDown: {
+        m_navKey = true;
+        m_navUp = e->key() == Qt::Key_Up || e->key() == Qt::Key_Left || e->key() == Qt::Key_PageUp;
+        QPlainTextEdit::keyPressEvent(e);
+        m_navKey = false;
+        return;
+    }
+    default:
+        break;
+    }
+
     QTextCursor c = textCursor();
     const QChar prev = document()->characterAt(c.position() - 1);
     const QChar next = document()->characterAt(c.position());
@@ -247,8 +457,7 @@ bool Editor::continueList()
 
 void Editor::indentLines(bool outdent)
 {
-    // Follow the note's own indentation: tabs by default (Obsidian), or the
-    // width of the first space-indented list item.
+    // Indent like the note does: tabs (Obsidian's default) or its first space indent.
     QString unit = u"\t"_s;
     for (QTextBlock b = document()->begin(); b.isValid(); b = b.next()) {
         const auto m = listRe().match(b.text());
@@ -365,6 +574,26 @@ QString Editor::linkAt(const QTextCursor &cursor) const
 
 void Editor::mousePressEvent(QMouseEvent *e)
 {
+    if (m_live && e->button() == Qt::LeftButton && !(e->modifiers() & (Qt::ControlModifier | Qt::ShiftModifier))) {
+        const QTextBlock b = cursorForPosition(e->position().toPoint()).block();
+        if (previewed(b)) {
+            for (const Deco &d : decorations(b)) {
+                if (d.kind == Deco::Task && d.rect.adjusted(-3, 0, 3, 0).contains(e->position())) {
+                    QTextCursor t(document());
+                    t.setPosition(b.position() + d.pos);
+                    t.setPosition(b.position() + d.pos + 1, QTextCursor::KeepAnchor);
+                    t.insertText(d.checked ? u" "_s : u"x"_s);
+                    e->accept();
+                    return;
+                }
+            }
+        }
+        if (const QString href = clickedLink(e->position().toPoint()); !href.isEmpty()) {
+            Q_EMIT linkActivated(href, false);
+            e->accept();
+            return;
+        }
+    }
     const bool follow = (e->button() == Qt::LeftButton && (e->modifiers() & Qt::ControlModifier))
                         || e->button() == Qt::MiddleButton;
     if (follow) {
@@ -380,8 +609,16 @@ void Editor::mousePressEvent(QMouseEvent *e)
 
 void Editor::mouseMoveEvent(QMouseEvent *e)
 {
-    const bool onLink = (e->modifiers() & Qt::ControlModifier) && !linkAt(cursorForPosition(e->position().toPoint())).isEmpty();
-    viewport()->setCursor(onLink ? Qt::PointingHandCursor : Qt::IBeamCursor);
+    const QPoint pos = e->position().toPoint();
+    bool hand = (e->modifiers() & Qt::ControlModifier) && !linkAt(cursorForPosition(pos)).isEmpty();
+    if (!hand && m_live && !(e->buttons() & Qt::LeftButton)) {
+        hand = !clickedLink(pos).isEmpty();
+        const QTextBlock b = cursorForPosition(pos).block();
+        if (!hand && previewed(b))
+            for (const Deco &d : decorations(b))
+                hand = hand || (d.kind == Deco::Task && d.rect.adjusted(-3, 0, 3, 0).contains(e->position()));
+    }
+    viewport()->setCursor(hand ? Qt::PointingHandCursor : Qt::IBeamCursor);
     QPlainTextEdit::mouseMoveEvent(e);
 }
 
@@ -441,4 +678,472 @@ void Editor::insertFromMimeData(const QMimeData *source)
         return;
     }
     QPlainTextEdit::insertFromMimeData(source);
+}
+
+int Editor::tableIndex(const TableOverlay *overlay) const
+{
+    for (int i = 0; i < m_tables.size(); ++i)
+        if (m_tables[i].overlay == overlay)
+            return i;
+    return -1;
+}
+
+int Editor::tableAt(const QTextBlock &block) const
+{
+    const int n = block.blockNumber();
+    for (int i = 0; i < m_tables.size(); ++i) {
+        const int first = m_tables[i].head.blockNumber();
+        if (n >= first && n < first + m_tables[i].lines)
+            return i;
+    }
+    return -1;
+}
+
+// Skips the delimiter line.
+QTextBlock Editor::tableLine(const Table &t, int row) const
+{
+    return document()->findBlockByNumber(t.head.blockNumber() + (row == 0 ? 0 : row + 1));
+}
+
+void Editor::scanTables()
+{
+    m_tableTimer.stop();
+    if (m_tableBusy)
+        return;
+    m_tableBusy = true;
+
+    auto fenced = [](const QTextBlock &b) {
+        const int st = b.userState();
+        return st > 0 && (st & (BlockState::InFence | BlockState::Frontmatter));
+    };
+    // Table boundaries follow md4c so the editor agrees with the reading view.
+    static const QRegularExpression heading(u"^ {0,3}#{1,6}(\\s|$)"_s);
+    static const QRegularExpression rule(u"^ {0,3}([-*_])( *\\1){2,} *$"_s);
+    static const QRegularExpression ender(u"^ {0,3}([-*+][ \\t]|\\d+[.)][ \\t]|>)"_s);
+    auto opens = [&](const QTextBlock &prev) {
+        if (!prev.isValid() || prev.text().trimmed().isEmpty())
+            return true;
+        const int st = prev.userState();
+        const bool fenceClose = st > 0 && (st & BlockState::FenceLine) && !(st & BlockState::InFence);
+        return fenceClose || heading.match(prev.text()).hasMatch() || rule.match(prev.text()).hasMatch();
+    };
+    auto continues = [&](const QTextBlock &b) {
+        const QString t = b.text();
+        return !t.trimmed().isEmpty() && !fenced(b) && !ender.match(t).hasMatch() && !rule.match(t).hasMatch();
+    };
+    const int cursorBlock = hasFocus() ? textCursor().blockNumber() : -1;
+    auto inRange = [](int n, const QTextBlock &first, int lines) {
+        return n >= first.blockNumber() && n < first.blockNumber() + lines;
+    };
+    QList<QPair<QTextBlock, int>> found;
+    bool rawFound = false;
+    for (QTextBlock b = m_live ? document()->begin() : QTextBlock(); b.isValid();) {
+        const QTextBlock next = b.next();
+        if (!fenced(b) && next.isValid() && opens(b.previous()) && MdTable::hasPipe(b.text())
+            && MdTable::isDelimiter(next.text())
+            && MdTable::splitRow(b.text()).size() == MdTable::splitRow(next.text()).size()) {
+            int lines = 2;
+            QTextBlock e = next.next();
+            while (e.isValid() && continues(e)) {
+                ++lines;
+                e = e.next();
+            }
+            const bool typing = inRange(cursorBlock, b, lines) && inRange(m_typedBlock, b, lines);
+            const bool chosen = m_rawTable.isValid() && b == m_rawTable && inRange(textCursor().blockNumber(), b, lines);
+            if (chosen || typing) {
+                m_rawTable = b;
+                m_rawLines = lines;
+                rawFound = true;
+            } else {
+                found.append({b, lines});
+            }
+            b = e;
+            continue;
+        }
+        b = next;
+    }
+    if (!rawFound)
+        m_rawTable = QTextBlock();
+
+    while (m_tables.size() > found.size()) {
+        TableOverlay *o = m_tables.takeLast().overlay;
+        o->hide();
+        o->deleteLater();
+    }
+    QSet<int> covered;
+    for (int i = 0; i < found.size(); ++i) {
+        if (i == m_tables.size()) {
+            auto *o = new TableOverlay(viewport());
+            o->setNoteFont(font());
+            QPointer<TableOverlay> guard(o);
+            connect(o, &TableOverlay::changed, this,
+                    [this, guard](const QList<QStringList> &rows, const QStringList &delims, int r, int c, bool edit) {
+                        // Leave the grid's own signal handler before the overlays get rebuilt.
+                        m_pendingWrites.append({guard, rows, delims, r, c, edit});
+                        QTimer::singleShot(0, this, &Editor::flushTableWrites);
+                    });
+            connect(o, &TableOverlay::leave, this, [this, o](bool down) { leaveTable(o, down); });
+            connect(o, &TableOverlay::editSource, this, [this, o] { editTableSource(o); });
+            connect(o, &TableOverlay::deleteTable, this, [this, o] { deleteTable(o); });
+            connect(o, &TableOverlay::undo, this, &QPlainTextEdit::undo);
+            connect(o, &TableOverlay::redo, this, &QPlainTextEdit::redo);
+            connect(o, &TableOverlay::rowFocused, this, [this, o](int row) { showTableRow(o, row); });
+            connect(o, &TableOverlay::linkActivated, this, &Editor::linkActivated);
+            o->setCellRenderer([this](const QString &cell) {
+                if (!m_vault)
+                    return cell.toHtmlEscaped();
+                RenderOptions opt;
+                opt.vault = m_vault;
+                opt.notePath = m_notePath;
+                opt.contentWidth = 240;
+                opt.palette = palette();
+                opt.dark = palette().color(QPalette::Base).lightness() < 128;
+                opt.depth = 2; // no task toggles or nested note embeds inside a cell
+                return renderTableCell(cell, opt);
+            });
+            m_tables.append({{}, 0, 0, o});
+        }
+        Table &t = m_tables[i];
+        t.head = found[i].first;
+        t.lines = found[i].second;
+        QList<QStringList> rows;
+        QStringList delims;
+        QTextBlock b = t.head;
+        for (int k = 0; k < t.lines; ++k, b = b.next()) {
+            covered.insert(b.blockNumber());
+            if (k == 1)
+                delims = MdTable::splitRow(b.text());
+            else
+                rows << MdTable::splitRow(b.text());
+        }
+        t.overlay->setTable(rows, delims);
+    }
+
+    for (QTextBlock b = document()->begin(); b.isValid(); b = b.next()) {
+        if (covered.contains(b.blockNumber()))
+            continue;
+        if (!b.isVisible()) {
+            b.setVisible(true);
+            document()->markContentsDirty(b.position(), b.length());
+        }
+        if (auto *d = static_cast<TableLineData *>(b.userData()); d && d->pixelSize) {
+            d->pixelSize = 0;
+            m_highlighter->rehighlightBlock(b);
+        }
+    }
+    m_tableBusy = false;
+    layoutTables();
+    updateTableHint();
+    viewport()->update();
+}
+
+void Editor::setLineHeight(const QTextBlock &block, int height)
+{
+    QTextBlock b = block;
+    auto *d = static_cast<TableLineData *>(b.userData());
+    if (!d) {
+        d = new TableLineData;
+        b.setUserData(d);
+    }
+    QFont f = font();
+    f.setPixelSize(100);
+    const double perPixel = QFontMetricsF(f).height() / 100.0;
+    int px = d->pixelSize ? d->pixelSize : qMax(1, int(height / perPixel));
+    // The text layout decides the real line height, so measure and adjust.
+    for (int attempt = 0; attempt < 6; ++attempt) {
+        if (d->pixelSize != px) {
+            d->pixelSize = px;
+            m_highlighter->rehighlightBlock(b);
+        }
+        const double actual = document()->documentLayout()->blockBoundingRect(b).height();
+        if (actual >= height && actual - height <= 2 * perPixel + 1)
+            break;
+        int step = int((height - actual) / perPixel);
+        if (step == 0)
+            step = actual < height ? 1 : -1;
+        px = qMax(1, px + step);
+    }
+}
+
+void Editor::layoutTables()
+{
+    if (m_tableBusy || m_tables.isEmpty())
+        return;
+    m_tableBusy = true;
+    const int margin = int(document()->documentMargin());
+    const int width = viewport()->width() - 2 * margin;
+    auto *layout = document()->documentLayout();
+    for (Table &t : m_tables) {
+        const QList<int> want = t.overlay->layoutFor(width);
+        const QTextBlock delimiter = t.head.next();
+        if (QTextBlock d = delimiter; d.isVisible()) {
+            d.setVisible(false);
+            document()->markContentsDirty(delimiter.position(), delimiter.length());
+        }
+        QList<int> actual;
+        t.height = 0;
+        for (int row = 0; row < want.size(); ++row) {
+            const QTextBlock b = tableLine(t, row);
+            setLineHeight(b, want[row]);
+            actual << int(layout->blockBoundingRect(b).height());
+            t.height += actual.last();
+        }
+        t.overlay->setLineHeights(actual);
+    }
+    m_tableBusy = false;
+    positionTables();
+}
+
+void Editor::positionTables()
+{
+    if (m_tableTimer.isActive())
+        return; // block handles may be stale until the rescan
+    const QPointF offset = contentOffset();
+    const int margin = int(document()->documentMargin());
+    const int width = viewport()->width() - 2 * margin;
+    for (const Table &t : std::as_const(m_tables)) {
+        const QRectF r = blockBoundingGeometry(t.head).translated(offset);
+        t.overlay->setGeometry(margin, int(r.top()), width, t.height);
+        t.overlay->show();
+    }
+}
+
+void Editor::moveCursorQuietly(const QTextCursor &cursor)
+{
+    const bool busy = m_tableBusy;
+    m_tableBusy = true;
+    setTextCursor(cursor);
+    m_tableBusy = busy;
+}
+
+void Editor::onCursorMoved()
+{
+    if (m_tableBusy || m_tableTimer.isActive())
+        return;
+    const QTextCursor c = textCursor();
+    const int n = c.block().blockNumber();
+    if (m_rawTable.isValid()) {
+        const int first = m_rawTable.blockNumber();
+        if (n < first || n >= first + m_rawLines) {
+            m_rawTable = QTextBlock();
+            m_typedBlock = -1;
+            m_tableTimer.start();
+            return;
+        }
+    }
+    const int i = tableAt(c.block());
+    if (i < 0)
+        return;
+    if (m_navKey) {
+        if (!c.hasSelection())
+            m_tables[i].overlay->focusCell(m_navUp ? m_tables[i].overlay->lineCount() - 1 : 0, 0, false);
+        return;
+    }
+    // Find, go-to-line or a selection landed inside the grid: show the source.
+    m_rawTable = m_tables[i].head;
+    m_rawLines = m_tables[i].lines;
+    scanTables();
+    ensureCursorVisible();
+}
+
+void Editor::leaveTable(TableOverlay *overlay, bool down)
+{
+    const int i = tableIndex(overlay);
+    if (i < 0)
+        return;
+    const Table t = m_tables[i];
+    // Keep a blank line between table and text, or Markdown merges them.
+    auto blank = [](const QTextBlock &b) { return b.text().trimmed().isEmpty(); };
+    auto addLines = [this](bool atEnd, const QString &text) {
+        QTextCursor c(document());
+        c.movePosition(atEnd ? QTextCursor::End : QTextCursor::Start);
+        c.insertText(text);
+        scanTables();
+    };
+    QTextBlock target;
+    if (down) {
+        const QTextBlock next = document()->findBlockByNumber(t.head.blockNumber() + t.lines);
+        if (!next.isValid())
+            addLines(true, u"\n\n"_s);
+        else if (blank(next) && !next.next().isValid())
+            addLines(true, u"\n"_s);
+        else
+            target = blank(next) ? next.next() : next;
+        if (!target.isValid())
+            target = document()->lastBlock();
+    } else {
+        const QTextBlock prev = document()->findBlockByNumber(t.head.blockNumber() - 1);
+        if (!prev.isValid())
+            addLines(false, u"\n\n"_s);
+        else if (blank(prev) && !prev.previous().isValid())
+            addLines(false, u"\n"_s);
+        else
+            target = blank(prev) ? prev.previous() : prev;
+        if (!target.isValid())
+            target = document()->firstBlock();
+    }
+    QTextCursor c(target);
+    if (!down)
+        c.movePosition(QTextCursor::EndOfBlock);
+    moveCursorQuietly(c);
+    setFocus();
+    ensureCursorVisible();
+}
+
+void Editor::editTableSource(TableOverlay *overlay)
+{
+    const int i = tableIndex(overlay);
+    if (i < 0)
+        return;
+    m_rawTable = m_tables[i].head;
+    m_rawLines = m_tables[i].lines;
+    const QTextCursor c(m_rawTable);
+    scanTables();
+    moveCursorQuietly(c);
+    setFocus();
+    ensureCursorVisible();
+}
+
+void Editor::deleteTable(TableOverlay *overlay)
+{
+    const int i = tableIndex(overlay);
+    if (i < 0)
+        return;
+    const Table t = m_tables[i];
+    const QTextBlock last = document()->findBlockByNumber(t.head.blockNumber() + t.lines - 1);
+    int start = t.head.position();
+    int end = last.position() + last.length() - 1;
+    if (last.next().isValid())
+        ++end;
+    else if (start > 0)
+        --start;
+    QTextCursor c(document());
+    c.setPosition(start);
+    c.setPosition(end, QTextCursor::KeepAnchor);
+    c.removeSelectedText();
+    scanTables();
+    moveCursorQuietly(c);
+    setFocus();
+}
+
+void Editor::writeTable(TableOverlay *overlay, const QList<QStringList> &rows, const QStringList &delims,
+                        int focusRow, int focusCol, bool edit)
+{
+    const int i = tableIndex(overlay);
+    if (i < 0 || rows.isEmpty())
+        return;
+    const Table t = m_tables[i];
+    const qsizetype oldCols = overlay->delims().size();
+
+    QList<QTextBlock> blocks;
+    QStringList oldLines;
+    QList<QStringList> before, after;
+    QTextBlock b = t.head;
+    for (int k = 0; k < t.lines; ++k, b = b.next()) {
+        blocks << b;
+        oldLines << b.text();
+        QStringList cells = MdTable::splitRow(b.text());
+        if (k != 1)
+            cells.resize(oldCols);
+        before << cells;
+    }
+    after << rows.first() << delims << rows.mid(1);
+
+    // Untouched rows keep their exact text; padded tables stay padded.
+    qsizetype same = 0;
+    while (same < before.size() && same < after.size() && before[same] == after[same])
+        ++same;
+    qsizetype sameEnd = 0;
+    while (sameEnd < before.size() - same && sameEnd < after.size() - same
+           && before[before.size() - 1 - sameEnd] == after[after.size() - 1 - sameEnd])
+        ++sameEnd;
+    QStringList newLines;
+    for (qsizetype k = 0; k < after.size(); ++k) {
+        if (k < same)
+            newLines << oldLines[k];
+        else if (k >= after.size() - sameEnd)
+            newLines << oldLines[k - after.size() + before.size()];
+        else
+            newLines << (k == 1 ? u"| "_s + after[1].join(u" | "_s) + u" |"_s : MdTable::joinRow(after[k]));
+    }
+    if (MdTable::isAligned(oldLines))
+        newLines = MdTable::alignedLines(after);
+
+    qsizetype p = 0;
+    while (p < oldLines.size() && p < newLines.size() && oldLines[p] == newLines[p])
+        ++p;
+    qsizetype s = 0;
+    while (s < oldLines.size() - p && s < newLines.size() - p
+           && oldLines[oldLines.size() - 1 - s] == newLines[newLines.size() - 1 - s])
+        ++s;
+    const qsizetype oldMid = oldLines.size() - p - s;
+    const qsizetype newMid = newLines.size() - p - s;
+
+    if (oldMid || newMid) {
+        m_tableBusy = true;
+        QTextCursor c(document());
+        c.beginEditBlock();
+        if (oldMid == newMid) {
+            for (qsizetype k = p; k < p + oldMid; ++k) {
+                if (oldLines[k] == newLines[k])
+                    continue;
+                c.setPosition(blocks[k].position());
+                c.movePosition(QTextCursor::EndOfBlock, QTextCursor::KeepAnchor);
+                c.insertText(newLines[k]);
+            }
+        } else {
+            const QStringList text = newLines.mid(p, newMid);
+            if (oldMid == 0) {
+                const QTextBlock prev = blocks[p - 1];
+                c.setPosition(prev.position() + prev.length() - 1);
+                c.insertText(u'\n' + text.join(u'\n'));
+            } else {
+                const QTextBlock last = blocks[p + oldMid - 1];
+                int start = blocks[p].position();
+                if (newMid == 0)
+                    --start; // the newline before the removed rows
+                c.setPosition(start);
+                c.setPosition(last.position() + last.length() - 1, QTextCursor::KeepAnchor);
+                c.insertText(text.join(u'\n'));
+            }
+        }
+        c.endEditBlock();
+        m_tableBusy = false;
+        scanTables();
+    }
+    if (i < m_tables.size())
+        m_tables[i].overlay->focusCell(focusRow, focusCol, edit);
+}
+
+void Editor::showTableRow(TableOverlay *overlay, int row)
+{
+    const int i = tableIndex(overlay);
+    if (i < 0)
+        return;
+    const QTextBlock b = tableLine(m_tables[i], row);
+    QScrollBar *bar = verticalScrollBar();
+    QRectF r = blockBoundingGeometry(b).translated(contentOffset());
+    if (r.top() < 0) {
+        bar->setValue(b.firstLineNumber());
+        return;
+    }
+    for (int guard = 0; guard < 500 && r.bottom() > viewport()->height() && bar->value() < bar->maximum(); ++guard) {
+        bar->setValue(bar->value() + 1);
+        r = blockBoundingGeometry(b).translated(contentOffset());
+    }
+}
+
+void Editor::flushTableWrites()
+{
+    const QList<PendingWrite> writes = std::exchange(m_pendingWrites, {});
+    for (const PendingWrite &w : writes)
+        if (w.overlay)
+            writeTable(w.overlay, w.rows, w.delims, w.row, w.col, w.edit);
+}
+
+void Editor::commitTables()
+{
+    for (const Table &t : std::as_const(m_tables))
+        t.overlay->finishEditing();
+    flushTableWrites();
 }

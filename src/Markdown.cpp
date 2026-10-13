@@ -61,12 +61,9 @@ th { font-weight: 700; }
 
 namespace {
 
-// md4c follows GFM and treats a single '~' as strikethrough; Obsidian only
-// accepts "~~". Lone tildes are swapped for a same-width placeholder before
-// parsing (keeps byte offsets intact) and swapped back here.
+// md4c strikes through a single '~', Obsidian needs "~~": lone tildes become a same-width placeholder.
 constexpr char LoneTilde = '\x1a';
-// "![[x]]" would make md4c start an image at "![" and miss the wikilink, so
-// the '!' is swapped for a marker the renderer turns into an embed.
+// md4c would read "![[x]]" as an image, so the '!' becomes a marker the renderer embeds.
 constexpr char EmbedMark = '\x1e';
 
 QString fromMd(const MD_CHAR *text, MD_SIZE size, bool keepEmbedMark = false)
@@ -84,7 +81,7 @@ QString attr(const MD_ATTRIBUTE &a)
 
 struct Callout {
     QString color;
-    QString icon;
+    QString icon; // :/icons/<icon>.svg, loaded by Reader through "icon:" URLs
 };
 
 Callout calloutStyle(const QString &type)
@@ -97,32 +94,33 @@ Callout calloutStyle(const QString &type)
         return false;
     };
     if (in({u"tip", u"hint", u"important"}))
-        return {u"#00bfa5"_s, u"🔥"_s};
+        return {u"#00bfa5"_s, u"flame"_s};
     if (in({u"abstract", u"summary", u"tldr"}))
-        return {u"#00b0ff"_s, u"📋"_s};
-    if (in({u"info", u"todo"}))
-        return {u"#00b8d4"_s, u"ℹ️"_s};
+        return {u"#00b0ff"_s, u"clipboard"_s};
+    if (in({u"info"}))
+        return {u"#00b8d4"_s, u"info"_s};
+    if (in({u"todo"}))
+        return {u"#00b8d4"_s, u"circle-check"_s};
     if (in({u"success", u"check", u"done"}))
-        return {u"#00c853"_s, u"✅"_s};
+        return {u"#00c853"_s, u"check"_s};
     if (in({u"question", u"help", u"faq"}))
-        return {u"#e0ac00"_s, u"❓"_s};
+        return {u"#e0ac00"_s, u"help"_s};
     if (in({u"warning", u"caution", u"attention"}))
-        return {u"#ff9100"_s, u"⚠️"_s};
+        return {u"#ff9100"_s, u"alert"_s};
     if (in({u"failure", u"fail", u"missing"}))
-        return {u"#ff5252"_s, u"❌"_s};
+        return {u"#ff5252"_s, u"close"_s};
     if (in({u"danger", u"error"}))
-        return {u"#ff1744"_s, u"⚡"_s};
+        return {u"#ff1744"_s, u"zap"_s};
     if (in({u"bug"}))
-        return {u"#f50057"_s, u"🐞"_s};
+        return {u"#f50057"_s, u"bug"_s};
     if (in({u"example"}))
-        return {u"#7c4dff"_s, u"📑"_s};
+        return {u"#7c4dff"_s, u"outline"_s};
     if (in({u"quote", u"cite"}))
-        return {u"#9e9e9e"_s, u"❝"_s};
-    return {u"#448aff"_s, u"✏️"_s};
+        return {u"#9e9e9e"_s, u"quote"_s};
+    return {u"#448aff"_s, u"pencil"_s};
 }
 
-// Extracts the section under `heading` (until the next heading of the same or
-// higher level). Returns the whole text if the heading is not found.
+// Up to the next heading of the same or higher level; the whole text if `heading` is missing.
 QString sectionOf(const QString &text, const QString &heading)
 {
     const QStringList lines = text.split(u'\n');
@@ -220,7 +218,7 @@ private:
         switch (a) {
         case MD_ALIGN_CENTER: return u" align=\"center\""_s;
         case MD_ALIGN_RIGHT: return u" align=\"right\""_s;
-        default: return {};
+        default: return u" align=\"left\""_s;
         }
     }
 
@@ -269,7 +267,7 @@ private:
             m_out += u"<p>"_s;
             break;
         case MD_BLOCK_TABLE:
-            m_out += u"<table cellspacing=\"0\" cellpadding=\"6\" border=\"1\" width=\"100%\" "
+            m_out += u"<table cellspacing=\"0\" cellpadding=\"8\" border=\"1\" width=\"100%\" "
                      "style=\"border-collapse:collapse; border-color:%1; border-style:solid; margin-bottom:12px;\">"_s
                          .arg(m_border);
             break;
@@ -277,7 +275,8 @@ private:
             m_out += u"<tr>"_s;
             break;
         case MD_BLOCK_TH:
-            m_out += u"<th%1 bgcolor=\"%2\">"_s.arg(alignAttr(static_cast<MD_BLOCK_TD_DETAIL *>(detail)->align), m_codeBg);
+            m_out += u"<th%1 bgcolor=\"%2\">"_s.arg(alignAttr(static_cast<MD_BLOCK_TD_DETAIL *>(detail)->align),
+                                                     m_opt.palette.color(QPalette::AlternateBase).name());
             ++m_inCell;
             break;
         case MD_BLOCK_TD:
@@ -524,7 +523,9 @@ private:
             rest.prepend(u"<p>"_s);
         const Callout style = calloutStyle(type);
         const QString bg = mix(m_base, QColor(style.color), m_opt.dark ? 0.14 : 0.09).name();
-        const QString head = u"<p style=\"color:%1;\"><b>%2&nbsp;&nbsp;%3</b></p>"_s.arg(style.color, style.icon, title);
+        const QString icon = u"<img src=\"icon:%1?color=%2\" width=\"18\" height=\"18\" align=\"middle\">"_s.arg(
+            style.icon, QString::fromLatin1(QUrl::toPercentEncoding(style.color)));
+        const QString head = u"<p style=\"color:%1;\"><b>%2&nbsp;&nbsp;%3</b></p>"_s.arg(style.color, icon, title);
         m_out += box(style.color, bg, head + rest);
     }
 
@@ -573,4 +574,14 @@ RenderResult renderMarkdown(const QString &text, const RenderOptions &opt)
     Renderer r(opt, &result.codeBlocks);
     result.html = r.render(text);
     return result;
+}
+
+QString renderTableCell(const QString &cell, const RenderOptions &opt)
+{
+    // Parse it as a one-cell table so it follows GFM cell rules (inline only).
+    const QString html = renderMarkdown(u"| "_s + QString(cell).replace(u'|', u"\\|"_s) + u" |\n| --- |\n"_s, opt).html;
+    const qsizetype open = html.indexOf(u"<th"_s);
+    const qsizetype start = html.indexOf(u'>', open) + 1;
+    const qsizetype end = html.lastIndexOf(u"</th>"_s);
+    return open < 0 || end < start ? cell.toHtmlEscaped() : html.mid(start, end - start);
 }

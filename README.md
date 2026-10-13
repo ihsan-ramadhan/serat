@@ -1,57 +1,47 @@
 # Serat
 
-A native Markdown notes app that opens Obsidian vaults as they are. Notes stay plain
-`.md` files in a folder; Serat reads `[[wikilinks]]`, embeds, callouts and task lists the
-way Obsidian writes them, and rewrites links when you rename or move a note.
+A desktop app for Markdown notes. Your notes stay plain `.md` files in a folder (a
+vault), so any other editor, sync tool or git can work with them too. Serat understands
+`[[wikilinks]]`, embeds, callouts and task lists, and updates links when you rename or
+move a note.
 
-Built with Qt 6 Widgets and C++20, so the same code runs on Linux, Windows and macOS.
-Markdown is parsed with [md4c](https://github.com/mity/md4c); code blocks are coloured
-by KSyntaxHighlighting when it is available.
+Built with Qt 6 and C++20. Runs on Linux, Windows and macOS.
 
-## What works
+## Features
 
-- File tree with new, rename, delete (to the system trash) and drag-and-drop move
-- Tabs with per-tab back/forward history, restored on the next start
-- Editor with styled source: heading sizes, bold/italic/strike, code, links, callouts
-- Reading view: tables, nested and task lists, callouts, code blocks with a copy link,
-  image and note embeds (`![[x.png]]`, `![[note#Heading]]`), frontmatter
-- `[[` autocomplete, Enter continues lists, Tab/Shift+Tab indent, checkboxes toggle
-  from the reading view
-- Link resolution follows Obsidian: exact path, then file name, preferring the note's
-  own folder, then the shortest path
-- Renaming a note or folder rewrites every link pointing into it, keeping headings and
-  aliases; links that still resolve are left untouched
-- Backlinks, outgoing links and outline panels; vault search; quick switcher
-- Pasted screenshots are saved as `Pasted image <timestamp>.png`, like Obsidian
-- Changes made outside the app (sync, git, another editor) are picked up live
+**Writing**
+- Live preview while editing: Markdown symbols stay hidden except where the cursor is
+  (`#` on its line, `**` or `[[ ]]` only on the word it touches). Lists show bullets,
+  tasks show checkboxes you can click, and a click on a link opens it.
+  View > Live preview switches to plain source.
+- `[[` autocompletes note names; Enter continues lists; Tab and Shift+Tab indent
+- Paste a screenshot and it is saved into the vault as `Pasted image <timestamp>.png`
+- A new note you leave without a name or any text is removed instead of piling up as
+  `Untitled` files
 
-Not there yet: graph view, canvas, live preview that hides markup while editing, tags
-pane, properties editor, community plugins.
+**Tables**
+- Tables are edited as a grid, no pipes to type: click a cell and write
+- Tab in the last cell or the + under the table adds a row; the + on the right adds a column
+- Right-click a cell to insert or delete rows and columns, align a column, or switch that
+  table to its Markdown source
+- Only the rows you change are rewritten; a table padded into neat columns stays padded
 
-## Benchmark
+**Reading**
+- Reading view with tables, nested and task lists, callouts, code blocks with a copy
+  button, frontmatter, and embedded images and notes (`![[x.png]]`, `![[note#Heading]]`)
+- Click a checkbox in the reading view to tick it in the file
 
-Same vault (38 notes, 5 images), both apps restoring their previous tabs, launched
-three times each and left idle. Medians shown.
+**Links and navigation**
+- Renaming or moving a note or folder rewrites every link that points into it
+- Backlinks, outgoing links and outline panels
+- Vault-wide search and a quick switcher
+- Tabs with their own back and forward history, restored on the next start
+- Edits made outside the app (sync, git, another editor) show up immediately
 
-| | Obsidian 1.14.4 | Serat 0.1.0 |
-|---|---|---|
-| Window mapped | 0.54 s | 0.13 s |
-| Ready (whole app under 2% of one core for 1 s) | 2.15 s | 0.17 s |
-| CPU time spent starting up | 2.30 s | 0.12 s |
-| Memory, PSS summed over all processes | 461 MB | 43 MB |
-| Memory, private (USS) | 332 MB | 28 MB |
-| Processes / threads | 7 / ~100 | 1 / 11 |
-| CPU while idle, 15–35 s after launch | 3.4 % | < 0.1 % |
-| Installed size | 364 MiB (app + electron43) | 0.7 MiB + Qt 6 and KSyntaxHighlighting* |
+**Look**
+- Light and dark theme that follows the system, or set it under View > Theme
 
-\* Qt 6 base is 69 MiB but usually already present; on the test machine 34 other
-packages depend on it. Counting it anyway, Serat totals about 80 MiB.
-
-Measured on 2026-10-13: Intel Core i5-13420H, 16 GB RAM, CachyOS (Linux 7.2.9), niri
-(Wayland), Qt 6.12.0, electron43 43.7.9. Memory comes from `/proc/<pid>/smaps_rollup`,
-CPU from `/proc/<pid>/stat`, and the window from niri's IPC. The comparison is not
-like for like: Obsidian also runs plugins, Sync and background indexing, which Serat
-does not have.
+Not yet: graph view, tags pane, properties editor.
 
 ## Shortcuts
 
@@ -59,33 +49,48 @@ does not have.
 |---|---|
 | Ctrl+O | Quick switcher (Ctrl+Enter opens in a new tab) |
 | Ctrl+N | New note |
-| Ctrl+E | Toggle reading view |
-| Ctrl+Shift+F | Search vault |
+| Ctrl+E | Switch between editing and reading |
+| Ctrl+Shift+E | Live preview on / off |
+| Ctrl+Shift+F | Search the vault |
 | Ctrl+F | Find in note |
 | F2 | Rename note |
-| Ctrl+click | Follow a link in the editor (Ctrl+Shift+click: new tab) |
+| Ctrl+click | Follow a link (Ctrl+Shift+click: in a new tab) |
 | Alt+Left / Alt+Right | Back / forward |
 | Ctrl+Tab, Ctrl+W | Next tab, close tab |
-| Ctrl+\\, Ctrl+Shift+\\ | Toggle left / right sidebar |
+| Ctrl+\\, Ctrl+Shift+\\ | Show or hide the left / right sidebar |
 | Ctrl+= / Ctrl+- / Ctrl+0 | Zoom |
 
-## Build
+In a table: Tab moves to the next cell, Enter edits a cell, Delete clears it, Esc goes
+back to the text below the table.
 
-### Linux (Arch)
+## Install from source
+
+### Linux
+
+Arch:
 
 ```sh
-sudo pacman -S --needed qt6-base md4c syntax-highlighting cmake ninja
+sudo pacman -S --needed qt6-base qt6-svg md4c syntax-highlighting cmake ninja
+```
+
+Debian/Ubuntu:
+
+```sh
+sudo apt install qt6-base-dev libqt6svg6-dev libmd4c-dev libkf6syntaxhighlighting-dev cmake ninja-build
+```
+
+Then:
+
+```sh
 cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
 cmake --build build
-ctest --test-dir build
 cmake --install build --prefix ~/.local
 ```
 
-Debian/Ubuntu: `qt6-base-dev libmd4c-dev libkf6syntaxhighlighting-dev cmake ninja-build`.
-
 ### Windows
 
-Install Qt 6 (MSVC) with the online installer, then from a "Qt 6 for Desktop" prompt:
+Install Qt 6 (MSVC, with the Qt SVG module) using the online installer, then from a
+"Qt 6 for Desktop" prompt:
 
 ```bat
 cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
@@ -93,9 +98,8 @@ cmake --build build
 cmake --install build --prefix dist
 ```
 
-md4c is downloaded and built automatically when no system copy is found. The install
-step runs `windeployqt`, so `dist` is a self-contained folder. KSyntaxHighlighting is
-optional; without it code blocks render uncoloured.
+`dist` is a self-contained folder. md4c is downloaded and built automatically when it is
+not installed.
 
 ### macOS
 
@@ -103,27 +107,29 @@ optional; without it code blocks render uncoloured.
 brew install qt md4c cmake ninja
 cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_PREFIX_PATH="$(brew --prefix qt)"
 cmake --build build
-cmake --install build --prefix dist   # runs macdeployqt, produces Serat.app
+cmake --install build --prefix dist   # produces Serat.app
 ```
+
+KSyntaxHighlighting is optional everywhere; without it code blocks are not coloured.
+Run the tests with `ctest --test-dir build`.
 
 ## Usage
 
 ```sh
-serat ~/Documents/Obsidian\ Vault
+serat ~/Notes
 ```
 
-Without an argument Serat reopens the last vault, or shows the vaults Obsidian knows
-about. Serat never writes to `.obsidian/`; it only reads `app.json` to honour the
-"confirm file deletion" setting.
+Without an argument Serat reopens the last vault, or shows a list of vaults to pick from.
 
 ## Credits
 
-Serat exists because of [Obsidian](https://obsidian.md). The vault format, the
-`[[wikilink]]` and `![[embed]]` syntax, callouts, the link resolution rules and the
-"Pasted image" naming all follow how Obsidian does things, so a vault can move between
-the two apps without changes. Serat is an independent project: it contains no Obsidian
-code and is not affiliated with or endorsed by Obsidian or Dynalist Inc. "Obsidian" is a
-trademark of its owners.
+Serat follows how [Obsidian](https://obsidian.md) stores a vault: the `[[wikilink]]` and
+`![[embed]]` syntax, callouts, the link resolution rules and the "Pasted image" file
+names. A vault can move between the two apps without changes. The welcome screen lists
+vaults registered in Obsidian, and Serat reads `.obsidian/app.json` only to honour its
+"confirm file deletion" setting; it never writes inside `.obsidian/`. Serat is an
+independent project, contains no Obsidian code, and is not affiliated with or endorsed by
+Obsidian or Dynalist Inc. "Obsidian" is a trademark of its owners.
 
 Built on:
 

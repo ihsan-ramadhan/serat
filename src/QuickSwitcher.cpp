@@ -56,6 +56,7 @@ QuickSwitcher::QuickSwitcher(const Vault *vault, const QStringList &recent, QWid
     m_edit->setPlaceholderText(tr("Find or create a note…"));
     m_edit->installEventFilter(this);
     m_list->setUniformItemSizes(true);
+    m_list->setObjectName(u"switcher"_s);
     auto *hint = new QLabel(tr("↑↓ navigate   ↵ open   Ctrl+↵ open in new tab   Esc dismiss"), this);
     hint->setForegroundRole(QPalette::PlaceholderText);
 

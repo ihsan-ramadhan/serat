@@ -1,6 +1,7 @@
 #include "MarkdownHighlighter.h"
 
 #include "Markdown.h"
+#include "TableEditor.h"
 
 #include <QFontDatabase>
 #include <QPalette>
@@ -21,6 +22,7 @@ void MarkdownHighlighter::setTheme(const QPalette &pal, const QFont &font)
     const QColor muted = mix(text, base, 0.5);
     const bool dark = base.lightness() < 128;
     const double pt = font.pointSizeF();
+    m_font = font;
     static const double scale[6] = {1.75, 1.45, 1.25, 1.1, 1.0, 1.0};
 
     for (int i = 0; i < 6; ++i) {
@@ -62,7 +64,37 @@ void MarkdownHighlighter::setTheme(const QPalette &pal, const QFont &font)
     m_mark.setBackground(mix(base, QColor(u"#ffd400"_s), dark ? 0.35 : 0.45));
     m_html = {};
     m_html.setForeground(mix(text, QColor(u"#e06c75"_s), 0.6));
+    m_ghost = {};
+    m_ghost.setForeground(Qt::transparent);
+    m_collapse = m_ghost;
+    // Near-zero width without making the line taller.
+    QFont tiny;
+    tiny.setPixelSize(1);
+    m_collapse.setFont(tiny, QTextCharFormat::FontPropertiesSpecifiedOnly);
+    m_collapse.setFontLetterSpacingType(QFont::PercentageSpacing);
+    m_collapse.setFontLetterSpacing(1);
     rehighlight();
+}
+
+void MarkdownHighlighter::setRawRange(int fromBlock, int fromCol, int toBlock, int toCol)
+{
+    m_rawFrom = fromBlock;
+    m_rawTo = toBlock;
+    m_colFrom = fromCol;
+    m_colTo = toCol;
+}
+
+void MarkdownHighlighter::markup(int start, int length, Hide how)
+{
+    apply(start, length, !m_hide ? m_markup : how == Collapse ? m_collapse : m_ghost);
+}
+
+void MarkdownHighlighter::inlineMarkup(int start, int length, int elementStart, int elementEnd)
+{
+    bool raw = !m_hide;
+    if (raw && m_live && m_rawFrom == m_rawTo) // one line: only the element the cursor touches
+        raw = m_colTo >= elementStart && m_colFrom <= elementEnd;
+    apply(start, length, raw ? m_markup : m_collapse);
 }
 
 void MarkdownHighlighter::apply(int start, int length, const QTextCharFormat &fmt)
@@ -83,9 +115,27 @@ void MarkdownHighlighter::highlightBlock(const QString &text)
     static const QRegularExpression quote(u"^\\s*(>[ >]*)"_s);
     static const QRegularExpression callout(u"^\\s*>\\s*\\[![\\w-]+\\][+-]?.*$"_s);
     static const QRegularExpression list(u"^(\\s*)([-*+]|\\d+[.)])(\\s+)(\\[[ xX]\\]\\s)?"_s);
+    static const QRegularExpression calloutHead(u"\\[![\\w-]+\\][+-]? *"_s);
 
     const int prev = qMax(0, previousBlockState());
     const int len = int(text.size());
+    m_block = currentBlock().blockNumber();
+    m_hide = hidesMarkup(m_block);
+
+    // A table line under the grid overlay: invisible, sized to the grid row.
+    if (const auto *t = static_cast<const TableLineData *>(currentBlockUserData()); t && t->pixelSize > 0) {
+        QFont f = m_font;
+        f.setPixelSize(t->pixelSize);
+        QTextCharFormat slot;
+        slot.setFont(f);
+        slot.setFontLetterSpacingType(QFont::PercentageSpacing);
+        slot.setFontLetterSpacing(1); // keeps the line from wrapping at this size
+        slot.setForeground(Qt::transparent);
+        setFormat(0, len, slot);
+        // Keep fence/frontmatter state flowing so the table scan sees it.
+        setCurrentBlockState(prev & (BlockState::InFence | BlockState::Tilde | BlockState::Frontmatter));
+        return;
+    }
 
     if (currentBlock().blockNumber() == 0 && text == u"---") {
         setFormat(0, len, m_markup);
@@ -107,6 +157,9 @@ void MarkdownHighlighter::highlightBlock(const QString &text)
             state = FenceLine;
         setFormat(0, len, m_fenced);
         apply(0, len, m_markup);
+        // A bare fence keeps its width so the line keeps its height.
+        const bool bare = text.mid(m.capturedEnd()).trimmed().isEmpty();
+        markup(int(m.capturedStart(1)), int(m.capturedLength(1)), bare ? Ghost : Collapse);
         setCurrentBlockState(state);
         return;
     }
@@ -120,12 +173,13 @@ void MarkdownHighlighter::highlightBlock(const QString &text)
     if (const auto m = heading.match(text); m.hasMatch()) {
         const int level = int(m.capturedLength(1));
         setFormat(0, len, m_heading[level - 1]);
-        apply(0, int(m.capturedLength(0)), m_markup);
+        markup(0, int(m.capturedLength(0)));
         highlightInline(text, int(m.capturedLength(0)));
         return;
     }
     if (hr.match(text).hasMatch()) {
         setFormat(0, len, m_markup);
+        markup(0, len, Ghost);
         return;
     }
     if (text.trimmed().startsWith(u'|')) {
@@ -140,16 +194,29 @@ void MarkdownHighlighter::highlightBlock(const QString &text)
     int from = 0;
     if (const auto m = quote.match(text); m.hasMatch()) {
         setFormat(0, len, m_quote);
-        apply(0, int(m.capturedEnd(1)), m_markup);
+        markup(0, int(m.capturedEnd(1)), Ghost);
         from = int(m.capturedEnd(1));
-        if (callout.match(text).hasMatch())
+        if (callout.match(text).hasMatch()) {
             apply(from, len - from, m_callout);
+            // "[!tip] Title" shows just the title; a bare "[!tip]" keeps its type.
+            const auto head = calloutHead.match(text, from, QRegularExpression::NormalMatch,
+                                                QRegularExpression::AnchorAtOffsetMatchOption);
+            if (head.hasMatch() && head.capturedEnd() < len)
+                markup(from, int(head.capturedLength()));
+            if (head.hasMatch())
+                from = int(head.capturedEnd());
+        }
     }
     if (const auto m = list.match(text, from, QRegularExpression::NormalMatch, QRegularExpression::AnchorAtOffsetMatchOption);
         m.hasMatch()) {
         apply(int(m.capturedStart(2)), int(m.capturedLength(2)), m_list);
+        if (m.capturedLength(4)) // a task: the checkbox stands in for the dash
+            markup(int(m.capturedStart(2)), int(m.capturedEnd(3) - m.capturedStart(2)));
+        else if (!m.captured(2)[0].isDigit())
+            markup(int(m.capturedStart(2)), 1, Ghost);
         if (m.capturedLength(4)) {
             apply(int(m.capturedStart(4)), 3, m_list);
+            markup(int(m.capturedStart(4)), 3, Ghost);
             const QChar mark = text[m.capturedStart(4) + 1];
             if (mark != u' ')
                 apply(int(m.capturedEnd(0)), len - int(m.capturedEnd(0)), m_done);
@@ -177,8 +244,8 @@ void MarkdownHighlighter::highlightInline(const QString &text, int from)
         const int s = int(m.capturedStart()), l = int(m.capturedLength());
         codeSpans.append({s, s + l});
         apply(s, l, m_code);
-        apply(s, int(m.capturedLength(1)), m_markup);
-        apply(int(m.capturedEnd(2)), int(m.capturedLength(1)), m_markup);
+        inlineMarkup(s, int(m.capturedLength(1)), s, s + l);
+        inlineMarkup(int(m.capturedEnd(2)), int(m.capturedLength(1)), s, s + l);
     }
     auto inCode = [&](int pos) {
         for (const auto &[a, b] : std::as_const(codeSpans))
@@ -196,34 +263,43 @@ void MarkdownHighlighter::highlightInline(const QString &text, int from)
 
     each(bold, [&](const QRegularExpressionMatch &m) {
         apply(int(m.capturedStart()), int(m.capturedLength()), m_bold);
-        apply(int(m.capturedStart()), 2, m_markup);
-        apply(int(m.capturedEnd()) - 2, 2, m_markup);
+        inlineMarkup(int(m.capturedStart()), 2, int(m.capturedStart()), int(m.capturedEnd()));
+        inlineMarkup(int(m.capturedEnd()) - 2, 2, int(m.capturedStart()), int(m.capturedEnd()));
     });
     each(italic, [&](const QRegularExpressionMatch &m) {
         apply(int(m.capturedStart()), int(m.capturedLength()), m_italic);
-        apply(int(m.capturedStart()), 1, m_markup);
-        apply(int(m.capturedEnd()) - 1, 1, m_markup);
+        inlineMarkup(int(m.capturedStart()), 1, int(m.capturedStart()), int(m.capturedEnd()));
+        inlineMarkup(int(m.capturedEnd()) - 1, 1, int(m.capturedStart()), int(m.capturedEnd()));
     });
     each(strike, [&](const QRegularExpressionMatch &m) {
         apply(int(m.capturedStart()), int(m.capturedLength()), m_strike);
-        apply(int(m.capturedStart()), 2, m_markup);
-        apply(int(m.capturedEnd()) - 2, 2, m_markup);
+        inlineMarkup(int(m.capturedStart()), 2, int(m.capturedStart()), int(m.capturedEnd()));
+        inlineMarkup(int(m.capturedEnd()) - 2, 2, int(m.capturedStart()), int(m.capturedEnd()));
     });
     each(mark, [&](const QRegularExpressionMatch &m) {
         apply(int(m.capturedStart(1)), int(m.capturedLength(1)), m_mark);
-        apply(int(m.capturedStart()), 2, m_markup);
-        apply(int(m.capturedEnd()) - 2, 2, m_markup);
+        inlineMarkup(int(m.capturedStart()), 2, int(m.capturedStart()), int(m.capturedEnd()));
+        inlineMarkup(int(m.capturedEnd()) - 2, 2, int(m.capturedStart()), int(m.capturedEnd()));
     });
     each(html, [&](const QRegularExpressionMatch &m) { apply(int(m.capturedStart()), int(m.capturedLength()), m_html); });
     each(url, [&](const QRegularExpressionMatch &m) { apply(int(m.capturedStart()), int(m.capturedLength()), m_link); });
     each(mdlink, [&](const QRegularExpressionMatch &m) {
         apply(int(m.capturedStart()), int(m.capturedLength()), m_markup);
         apply(int(m.capturedStart(1)), int(m.capturedLength(1)), m_link);
+        const int a = int(m.capturedStart()), b = int(m.capturedEnd());
+        inlineMarkup(a, int(m.capturedStart(1)) - a, a, b);
+        inlineMarkup(int(m.capturedEnd(1)), b - int(m.capturedEnd(1)), a, b);
     });
     each(wiki, [&](const QRegularExpressionMatch &m) {
         apply(int(m.capturedStart()), int(m.capturedLength()), m_link);
-        const int open = text[m.capturedStart()] == u'!' ? 3 : 2;
-        apply(int(m.capturedStart()), open, m_markup);
+        const int start = int(m.capturedStart());
+        const int open = text[start] == u'!' ? 3 : 2;
+        apply(start, open, m_markup);
         apply(int(m.capturedEnd()) - 2, 2, m_markup);
+        // [[target|alias]] reads as "alias" in live preview.
+        const qsizetype pipe = text.indexOf(u'|', start);
+        const int shown = pipe > start && pipe < m.capturedEnd() ? int(pipe) + 1 - start : open;
+        inlineMarkup(start, shown, start, int(m.capturedEnd()));
+        inlineMarkup(int(m.capturedEnd()) - 2, 2, start, int(m.capturedEnd()));
     });
 }

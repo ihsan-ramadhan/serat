@@ -9,6 +9,7 @@ class QLabel;
 class QLineEdit;
 class QScrollArea;
 class QStackedWidget;
+class QToolButton;
 class Reader;
 class Vault;
 
@@ -24,8 +25,12 @@ public:
     QString path() const { return m_path; }
     bool isNote() const;
     void open(const QString &path, bool pushHistory = true);
-    bool save();
+    // Autosave passes false so an open table cell editor stays open.
+    bool save(bool commitTables = true);
     void reloadFromDisk();
+    // A new note left without a name or text is removed instead of kept.
+    void markNew() { m_newPath = m_path; }
+    bool discardIfUntouched();
     void pathRenamed(const QString &from, const QString &to);
     void resetTitle();
 
@@ -42,6 +47,7 @@ public:
     void focusTitle();
     void focusContent();
     void applyFont(const QFont &font);
+    void setLivePreview(bool on);
     void setLinkCandidates(const QStringList &names);
     void refreshRender();
     QString statsText() const;
@@ -52,6 +58,7 @@ Q_SIGNALS:
     void pathChanged();
     void statsChanged();
     void modeChanged();
+    void hintChanged(const QString &hint);
 
 protected:
     void resizeEvent(QResizeEvent *e) override;
@@ -66,10 +73,12 @@ private:
     void find(bool backward);
     void updateMargins();
     void scaleImage();
+    void updateHeader();
 
     Vault *m_vault;
     QString m_path;
     QString m_diskText;
+    QString m_newPath;
     bool m_crlf = false;
     bool m_loading = false;
     Mode m_mode = Edit;
@@ -77,6 +86,11 @@ private:
     QStringList m_codeBlocks;
     QFont m_font;
 
+    QWidget *m_header;
+    QToolButton *m_backButton;
+    QToolButton *m_forwardButton;
+    QLabel *m_crumb;
+    QToolButton *m_modeButton;
     QWidget *m_titleBar;
     QLineEdit *m_title;
     QStackedWidget *m_stack;

@@ -1,4 +1,5 @@
 #include "MainWindow.h"
+#include "Theme.h"
 
 #include <QApplication>
 #include <QCommandLineParser>
@@ -16,6 +17,7 @@ int main(int argc, char *argv[])
     QApplication::setApplicationVersion(QStringLiteral(SERAT_VERSION));
     QApplication::setDesktopFileName(u"id.icqn.Serat"_s);
     QApplication::setWindowIcon(QIcon(u":/serat.svg"_s));
+    Theme::install(app);
 
     QCommandLineParser parser;
     parser.setApplicationDescription(u"Native Markdown notes, compatible with Obsidian vaults."_s);

@@ -28,6 +28,7 @@ Q_SIGNALS:
     void moveRequested(const QString &from, const QString &toDir);
 
 protected:
+    void drawBranches(QPainter *painter, const QRect &rect, const QModelIndex &index) const override;
     void mouseReleaseEvent(QMouseEvent *e) override;
     void dragEnterEvent(QDragEnterEvent *e) override;
     void dragMoveEvent(QDragMoveEvent *e) override;
@@ -63,7 +64,6 @@ private:
     QTimer m_timer;
 };
 
-// Notes linking to the current one, with the linking line as context.
 class BacklinksPanel : public QTreeWidget
 {
     Q_OBJECT

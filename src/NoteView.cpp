@@ -3,11 +3,13 @@
 #include "Editor.h"
 #include "Markdown.h"
 #include "Reader.h"
+#include "Theme.h"
 #include "Vault.h"
 
 #include <QApplication>
 #include <QClipboard>
 #include <QDesktopServices>
+#include <QFile>
 #include <QHBoxLayout>
 #include <QKeyEvent>
 #include <QLabel>
@@ -46,10 +48,38 @@ NoteView::NoteView(Vault *vault, QWidget *parent)
     setBackgroundRole(QPalette::Base);
     setAutoFillBackground(true);
 
+    auto toolButton = [this](const QString &icon, const QString &tip) {
+        auto *b = new QToolButton(this);
+        b->setIcon(Theme::icon(icon));
+        b->setIconSize(QSize(18, 18));
+        b->setToolTip(tip);
+        b->setAutoRaise(true);
+        return b;
+    };
+    m_header = new QWidget(this);
+    m_backButton = toolButton(u"chevron-left"_s, tr("Back (Alt+Left)"));
+    m_forwardButton = toolButton(u"chevron-right"_s, tr("Forward (Alt+Right)"));
+    m_crumb = new QLabel(m_header);
+    m_crumb->setForegroundRole(QPalette::PlaceholderText);
+    m_crumb->setAlignment(Qt::AlignCenter);
+    m_crumb->setMinimumWidth(0);
+    m_crumb->setSizePolicy(QSizePolicy::Ignored, QSizePolicy::Preferred);
+    m_modeButton = toolButton(u"book"_s, QString());
+    auto *headerLayout = new QHBoxLayout(m_header);
+    headerLayout->setContentsMargins(8, 6, 8, 0);
+    headerLayout->setSpacing(2);
+    headerLayout->addWidget(m_backButton);
+    headerLayout->addWidget(m_forwardButton);
+    headerLayout->addWidget(m_crumb, 1);
+    headerLayout->addWidget(m_modeButton);
+    connect(m_backButton, &QToolButton::clicked, this, &NoteView::goBack);
+    connect(m_forwardButton, &QToolButton::clicked, this, &NoteView::goForward);
+    connect(m_modeButton, &QToolButton::clicked, this, [this] { setMode(m_mode == Edit ? Read : Edit); });
+
     m_titleBar = new QWidget(this);
     m_title = new QLineEdit(m_titleBar);
     m_title->setFrame(false);
-    m_title->setStyleSheet(u"QLineEdit { background: transparent; border: none; }"_s);
+    m_title->setStyleSheet(u"QLineEdit { background: transparent; border: none; padding: 0px; }"_s);
     auto *titleLayout = new QHBoxLayout(m_titleBar);
     titleLayout->addWidget(m_title);
 
@@ -73,17 +103,12 @@ NoteView::NoteView(Vault *vault, QWidget *parent)
     m_findEdit = new QLineEdit(m_findBar);
     m_findEdit->setPlaceholderText(tr("Find in note"));
     m_findEdit->setClearButtonEnabled(true);
-    auto *prev = new QToolButton(m_findBar);
-    prev->setArrowType(Qt::UpArrow);
-    prev->setToolTip(tr("Previous match (Shift+Enter)"));
-    auto *next = new QToolButton(m_findBar);
-    next->setArrowType(Qt::DownArrow);
-    next->setToolTip(tr("Next match (Enter)"));
-    auto *close = new QToolButton(m_findBar);
-    close->setText(u"✕"_s);
-    close->setAutoRaise(true);
+    auto *prev = toolButton(u"chevron-up"_s, tr("Previous match (Shift+Enter)"));
+    auto *next = toolButton(u"chevron-down"_s, tr("Next match (Enter)"));
+    auto *close = toolButton(u"close"_s, tr("Close (Esc)"));
     auto *findLayout = new QHBoxLayout(m_findBar);
-    findLayout->setContentsMargins(8, 4, 8, 4);
+    findLayout->setContentsMargins(8, 6, 8, 6);
+    findLayout->setSpacing(2);
     findLayout->addWidget(m_findEdit, 1);
     findLayout->addWidget(prev);
     findLayout->addWidget(next);
@@ -93,6 +118,7 @@ NoteView::NoteView(Vault *vault, QWidget *parent)
     auto *layout = new QVBoxLayout(this);
     layout->setContentsMargins(0, 0, 0, 0);
     layout->setSpacing(0);
+    layout->addWidget(m_header);
     layout->addWidget(m_titleBar);
     layout->addWidget(m_stack, 1);
     layout->addWidget(m_findBar);
@@ -100,7 +126,7 @@ NoteView::NoteView(Vault *vault, QWidget *parent)
     m_saveTimer.setSingleShot(true);
     m_saveTimer.setInterval(700);
     connect(&m_saveTimer, &QTimer::timeout, this, [this] {
-        save();
+        save(false);
         Q_EMIT statsChanged();
     });
     m_renderTimer.setSingleShot(true);
@@ -115,6 +141,7 @@ NoteView::NoteView(Vault *vault, QWidget *parent)
             m_saveTimer.start();
     });
     connect(m_editor, &Editor::linkActivated, this, &NoteView::handleHref);
+    connect(m_editor, &Editor::hintChanged, this, &NoteView::hintChanged);
     connect(m_reader, &QTextBrowser::anchorClicked, this, [this](const QUrl &url) {
         handleHref(url.toString(QUrl::FullyEncoded), QApplication::keyboardModifiers() & Qt::ControlModifier);
     });
@@ -165,8 +192,12 @@ void NoteView::open(const QString &path, bool pushHistory)
 {
     if (path == m_path)
         return;
-    save();
-    if (pushHistory && !m_path.isEmpty()) {
+    const bool discarded = discardIfUntouched();
+    if (!discarded)
+        save();
+    else if (!m_back.isEmpty() && m_back.last() == path)
+        m_back.removeLast(); // Back would lead to `path` itself
+    if (pushHistory && !m_path.isEmpty() && !discarded) {
         m_back << m_path;
         m_forward.clear();
     }
@@ -199,8 +230,22 @@ void NoteView::load(const QString &path)
         scaleImage();
         m_stack->setCurrentWidget(m_imageArea);
     }
+    updateHeader();
     Q_EMIT pathChanged();
     Q_EMIT statsChanged();
+}
+
+void NoteView::updateHeader()
+{
+    m_backButton->setEnabled(!m_back.isEmpty());
+    m_forwardButton->setEnabled(!m_forward.isEmpty());
+    const QString dir = m_path.section(u'/', 0, -2);
+    m_crumb->setText(dir.isEmpty() ? QString() : QString(dir).replace(u'/', u"  /  "_s));
+    m_crumb->setToolTip(m_path);
+    m_modeButton->setVisible(isNote());
+    const bool editing = m_mode == Edit;
+    m_modeButton->setIcon(Theme::icon(editing ? u"book"_s : u"pencil"_s));
+    m_modeButton->setToolTip(editing ? tr("Switch to reading view (Ctrl+E)") : tr("Switch to editing (Ctrl+E)"));
 }
 
 void NoteView::resetTitle()
@@ -210,10 +255,12 @@ void NoteView::resetTitle()
     m_title->setCursorPosition(0);
 }
 
-bool NoteView::save()
+bool NoteView::save(bool commitTables)
 {
     if (!isNote())
         return true;
+    if (commitTables)
+        m_editor->commitTables();
     m_saveTimer.stop();
     QString t = editorText();
     if (m_crlf)
@@ -223,6 +270,17 @@ bool NoteView::save()
     if (!m_vault->writeNote(m_path, t))
         return false;
     m_diskText = t;
+    return true;
+}
+
+bool NoteView::discardIfUntouched()
+{
+    if (m_newPath.isEmpty() || m_path != m_newPath || !editorText().trimmed().isEmpty())
+        return false;
+    m_saveTimer.stop();
+    m_newPath.clear();
+    QFile::remove(m_vault->absolutePath(m_path));
+    m_vault->rescan();
     return true;
 }
 
@@ -274,6 +332,7 @@ void NoteView::pathRenamed(const QString &from, const QString &to)
     m_path = to;
     m_editor->setNotePath(to);
     resetTitle();
+    updateHeader();
     Q_EMIT pathChanged();
 }
 
@@ -296,6 +355,7 @@ void NoteView::setMode(Mode mode)
         }
         focusContent();
     }
+    updateHeader();
     Q_EMIT modeChanged();
 }
 
@@ -303,8 +363,10 @@ void NoteView::goBack()
 {
     if (m_back.isEmpty())
         return;
-    save();
-    m_forward.prepend(m_path);
+    if (!discardIfUntouched()) {
+        save();
+        m_forward.prepend(m_path);
+    }
     load(m_back.takeLast());
 }
 
@@ -312,8 +374,10 @@ void NoteView::goForward()
 {
     if (m_forward.isEmpty())
         return;
-    save();
-    m_back << m_path;
+    if (!discardIfUntouched()) {
+        save();
+        m_back << m_path;
+    }
     load(m_forward.takeFirst());
 }
 
@@ -491,6 +555,11 @@ void NoteView::applyFont(const QFont &font)
         render();
 }
 
+void NoteView::setLivePreview(bool on)
+{
+    m_editor->setLivePreview(on);
+}
+
 void NoteView::setLinkCandidates(const QStringList &names)
 {
     m_editor->setLinkCandidates(names);
@@ -505,7 +574,7 @@ QString NoteView::statsText() const
     qsizetype words = 0;
     for (auto it = word.globalMatch(text); it.hasNext(); it.next())
         ++words;
-    return tr("%Ln word(s)", nullptr, int(words)) + u"   "_s + tr("%Ln character(s)", nullptr, int(text.size()));
+    return tr("%Ln word(s)", nullptr, int(words)) + u"  ·  "_s + tr("%Ln character(s)", nullptr, int(text.size()));
 }
 
 void NoteView::resizeEvent(QResizeEvent *e)
@@ -519,7 +588,8 @@ void NoteView::updateMargins()
 {
     const int scroll = style()->pixelMetric(QStyle::PM_ScrollBarExtent);
     const int margin = readableMargin(width() - scroll);
-    m_titleBar->layout()->setContentsMargins(margin, 20, margin + scroll, 4);
+    // +2 aligns the title with the editor text.
+    m_titleBar->layout()->setContentsMargins(margin + 2, 12, margin + scroll, 4);
 }
 
 void NoteView::changeEvent(QEvent *e)
