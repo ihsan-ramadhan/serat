@@ -12,6 +12,7 @@ class QLabel;
 class QSplitter;
 class QStackedWidget;
 class QTabWidget;
+class QUrl;
 class QVBoxLayout;
 class SearchPanel;
 class Vault;
@@ -23,6 +24,9 @@ public:
     explicit MainWindow(QWidget *parent = nullptr);
     void openVault(const QString &path);
     void showWelcome();
+    // A vault folder, a serat:// link, or nothing (just bring the window up).
+    void handleArgument(const QString &arg);
+    void openUrl(const QUrl &url);
 
 protected:
     void closeEvent(QCloseEvent *e) override;
@@ -48,7 +52,12 @@ private:
     void movePath(const QString &from, const QString &toDir);
     void deletePath(const QString &path);
     void quickSwitcher();
-    void searchVault();
+    void searchVault(const QString &text = {});
+    void showTabMenu(const QPoint &pos);
+    void duplicatePath(const QString &path);
+    void chooseFolderAndMove(const QString &path);
+    void revealInTree(const QString &path);
+    QString findVault(const QString &name) const;
     void zoom(double delta);
 
     void onCurrentChanged();

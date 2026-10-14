@@ -59,10 +59,12 @@ Q_SIGNALS:
     void statsChanged();
     void modeChanged();
     void hintChanged(const QString &hint);
+    void searchRequested(const QString &text);
 
 protected:
     void resizeEvent(QResizeEvent *e) override;
     void changeEvent(QEvent *e) override;
+    bool eventFilter(QObject *obj, QEvent *e) override;
 
 private:
     void load(const QString &path);

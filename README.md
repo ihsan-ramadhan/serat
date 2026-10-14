@@ -15,6 +15,8 @@ Built with Qt 6 and C++20. Runs on Linux, Windows and macOS.
   tasks show checkboxes you can click, and a click on a link opens it.
   View > Live preview switches to plain source.
 - `[[` autocompletes note names; Enter continues lists; Tab and Shift+Tab indent
+- Right-click in a note to format the selection, insert a table, checkbox, note link or
+  rule, open or copy a link, or search the vault for the selected text
 - Paste a screenshot and it is saved into the vault as `Pasted image <timestamp>.png`
 - A new note you leave without a name or any text is removed instead of piling up as
   `Untitled` files
@@ -36,6 +38,10 @@ Built with Qt 6 and C++20. Runs on Linux, Windows and macOS.
 - Backlinks, outgoing links and outline panels
 - Vault-wide search and a quick switcher
 - Tabs with their own back and forward history, restored on the next start
+- Right-click a file, tab or panel entry to copy its wikilink, vault path, full path or
+  a link that opens it; files can also be duplicated or moved to another folder
+- `serat://open?vault=<name>&file=<path>` links open the note in Serat; clicking one while
+  Serat runs reuses the open window
 - Edits made outside the app (sync, git, another editor) show up immediately
 
 **Look**
@@ -53,6 +59,7 @@ Not yet: graph view, tags pane, properties editor.
 | Ctrl+Shift+E | Live preview on / off |
 | Ctrl+Shift+F | Search the vault |
 | Ctrl+F | Find in note |
+| Ctrl+B / Ctrl+I | Bold / italic (selection or the word at the cursor) |
 | F2 | Rename note |
 | Ctrl+click | Follow a link (Ctrl+Shift+click: in a new tab) |
 | Alt+Left / Alt+Right | Back / forward |
@@ -125,11 +132,12 @@ Without an argument Serat reopens the last vault, or shows a list of vaults to p
 
 Serat follows how [Obsidian](https://obsidian.md) stores a vault: the `[[wikilink]]` and
 `![[embed]]` syntax, callouts, the link resolution rules and the "Pasted image" file
-names. A vault can move between the two apps without changes. The welcome screen lists
-vaults registered in Obsidian, and Serat reads `.obsidian/app.json` only to honour its
-"confirm file deletion" setting; it never writes inside `.obsidian/`. Serat is an
-independent project, contains no Obsidian code, and is not affiliated with or endorsed by
-Obsidian or Dynalist Inc. "Obsidian" is a trademark of its owners.
+names. A vault can move between the two apps without changes, and the copy menu also
+offers an `obsidian://` link for a note. The welcome screen lists vaults registered in
+Obsidian, and Serat reads `.obsidian/app.json` only to honour its "confirm file
+deletion" setting; it never writes inside `.obsidian/`. Serat is an independent
+project, contains no Obsidian code, and is not affiliated with or endorsed by Obsidian
+or Dynalist Inc. "Obsidian" is a trademark of its owners.
 
 Built on:
 

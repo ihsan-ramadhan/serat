@@ -1,6 +1,7 @@
 #include "Panels.h"
 
 #include "Markdown.h"
+#include "PathActions.h"
 #include "Theme.h"
 #include "Vault.h"
 
@@ -46,6 +47,19 @@ void setupList(QTreeWidget *w)
     w->setIndentation(14);
     w->setWordWrap(true);
     w->setTextElideMode(Qt::ElideRight);
+    w->setContextMenuPolicy(Qt::CustomContextMenu);
+}
+
+void itemMenu(QTreeWidget *w, const QPoint &pos, const Vault *vault, const QString &path,
+              const std::function<void(bool newTab)> &open)
+{
+    QMenu menu(w);
+    PathActions::addOpenActions(&menu, w, open);
+    if (vault && vault->exists(path)) {
+        menu.addSeparator();
+        PathActions::addCopyMenu(&menu, *vault, path);
+    }
+    menu.exec(w->viewport()->mapToGlobal(pos));
 }
 
 QTreeWidgetItem *placeholder(QTreeWidget *w, const QString &text)
@@ -196,18 +210,27 @@ void FileTree::showMenu(const QPoint &pos)
     const QString parentDir = dir ? path : dirOf(path);
 
     QMenu menu(this);
-    if (!dir) {
+    if (dir) {
+        menu.addAction(tr("New note"), this, [this, parentDir] { Q_EMIT newNoteRequested(parentDir); });
+        menu.addAction(tr("New folder"), this, [this, parentDir] { Q_EMIT newFolderRequested(parentDir); });
+    } else {
         menu.addAction(tr("Open in new tab"), this, [this, path] { Q_EMIT openRequested(path, true); });
-        menu.addSeparator();
+        menu.addAction(tr("Open in default app"), this, [this, path] {
+            QDesktopServices::openUrl(QUrl::fromLocalFile(m_vault->absolutePath(path)));
+        });
     }
-    menu.addAction(tr("New note"), this, [this, parentDir] { Q_EMIT newNoteRequested(parentDir); });
-    menu.addAction(tr("New folder"), this, [this, parentDir] { Q_EMIT newFolderRequested(parentDir); });
     if (!path.isEmpty()) {
         menu.addSeparator();
+        PathActions::addCopyMenu(&menu, *m_vault, path);
+        menu.addSeparator();
+        if (!dir)
+            menu.addAction(tr("Duplicate"), this, [this, path] { Q_EMIT duplicateRequested(path); });
+        menu.addAction(tr("Move to…"), this, [this, path] { Q_EMIT moveToRequested(path); });
         menu.addAction(tr("Rename…"), this, [this, path] { Q_EMIT renameRequested(path); });
         menu.addAction(tr("Delete"), this, [this, path] { Q_EMIT deleteRequested(path); });
     }
     menu.addSeparator();
+    menu.addAction(tr("Collapse all"), this, &QTreeView::collapseAll);
     menu.addAction(tr("Show in system explorer"), this, [this, parentDir] {
         QDesktopServices::openUrl(QUrl::fromLocalFile(m_vault->absolutePath(parentDir)));
     });
@@ -304,6 +327,20 @@ SearchPanel::SearchPanel(QWidget *parent)
     connect(m_results, &QTreeWidget::itemClicked, this, [this](QTreeWidgetItem *item) {
         Q_EMIT openRequested(item->data(0, PathRole).toString(), item->data(0, LineRole).toInt(), ctrlHeld());
     });
+    connect(m_results, &QWidget::customContextMenuRequested, this, [this](const QPoint &pos) {
+        const QTreeWidgetItem *item = m_results->itemAt(pos);
+        if (!item)
+            return;
+        const QString path = item->data(0, PathRole).toString();
+        const int line = item->data(0, LineRole).toInt();
+        itemMenu(m_results, pos, m_vault, path, [this, path, line](bool newTab) { Q_EMIT openRequested(path, line, newTab); });
+    });
+}
+
+void SearchPanel::search(const QString &text)
+{
+    m_edit->setText(text);
+    rerun();
 }
 
 void SearchPanel::focusSearch()
@@ -351,11 +388,20 @@ BacklinksPanel::BacklinksPanel(QWidget *parent)
     connect(this, &QTreeWidget::itemClicked, this, [this](QTreeWidgetItem *item) {
         Q_EMIT openRequested(item->data(0, PathRole).toString(), item->data(0, LineRole).toInt(), ctrlHeld());
     });
+    connect(this, &QWidget::customContextMenuRequested, this, [this](const QPoint &pos) {
+        const QTreeWidgetItem *item = itemAt(pos);
+        if (!item || !(item->flags() & Qt::ItemIsEnabled))
+            return;
+        const QString path = item->data(0, PathRole).toString();
+        const int line = item->data(0, LineRole).toInt();
+        itemMenu(this, pos, m_vault, path, [this, path, line](bool newTab) { Q_EMIT openRequested(path, line, newTab); });
+    });
 }
 
 void BacklinksPanel::showFor(const Vault *vault, const QString &path)
 {
     clear();
+    m_vault = vault;
     if (!vault || path.isEmpty())
         return;
     const auto links = vault->backlinks(path);
@@ -391,11 +437,21 @@ OutgoingPanel::OutgoingPanel(QWidget *parent)
     connect(this, &QTreeWidget::itemClicked, this, [this](QTreeWidgetItem *item) {
         Q_EMIT linkRequested(item->data(0, TargetRole).toString(), ctrlHeld());
     });
+    connect(this, &QWidget::customContextMenuRequested, this, [this](const QPoint &pos) {
+        const QTreeWidgetItem *item = itemAt(pos);
+        if (!item || !(item->flags() & Qt::ItemIsEnabled))
+            return;
+        const QString target = item->data(0, TargetRole).toString();
+        const QString path = m_vault ? m_vault->resolve(target.section(u'#', 0, 0), m_path) : QString();
+        itemMenu(this, pos, m_vault, path, [this, target](bool newTab) { Q_EMIT linkRequested(target, newTab); });
+    });
 }
 
 void OutgoingPanel::showFor(const Vault *vault, const QString &path)
 {
     clear();
+    m_vault = vault;
+    m_path = path;
     const Note *note = vault ? vault->note(path) : nullptr;
     if (!note)
         return;

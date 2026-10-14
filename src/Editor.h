@@ -30,11 +30,13 @@ public:
 Q_SIGNALS:
     void linkActivated(const QString &href, bool newTab);
     void hintChanged(const QString &hint);
+    void searchRequested(const QString &text);
 
 protected:
     void keyPressEvent(QKeyEvent *e) override;
     void mousePressEvent(QMouseEvent *e) override;
     void mouseMoveEvent(QMouseEvent *e) override;
+    void contextMenuEvent(QContextMenuEvent *e) override;
     void resizeEvent(QResizeEvent *e) override;
     void paintEvent(QPaintEvent *e) override;
     void changeEvent(QEvent *e) override;
@@ -56,6 +58,10 @@ private:
         bool checked = false;
         int pos = 0; // task mark offset in the block
     };
+    void toggleWrap(const QString &mark);
+    void insertBlock(const QString &text, bool table);
+    void insertTask();
+    void insertWikilink();
     void updateRawBlocks();
     void updateTableHint();
     bool previewed(const QTextBlock &block) const;
@@ -92,6 +98,8 @@ private:
     QCompleter *m_completer;
     QStringListModel *m_candidates;
     QColor m_codeBg;
+    QAction *m_bold;
+    QAction *m_italic;
     bool m_live = false;
     int m_rawFrom = -1, m_rawTo = -1;
     int m_colFrom = -1, m_colTo = -1;

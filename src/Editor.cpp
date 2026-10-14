@@ -2,10 +2,14 @@
 
 #include "Markdown.h"
 #include "MarkdownHighlighter.h"
+#include "PathActions.h"
 #include "TableEditor.h"
 #include "Vault.h"
 
 #include <QAbstractItemView>
+#include <QAction>
+#include <QApplication>
+#include <QClipboard>
 #include <QAbstractTextDocumentLayout>
 #include <QCompleter>
 #include <QDateTime>
@@ -13,6 +17,7 @@
 #include <QFileInfo>
 #include <QImage>
 #include <QKeyEvent>
+#include <QMenu>
 #include <QMimeData>
 #include <QPointer>
 #include <QScopedValueRollback>
@@ -66,6 +71,17 @@ Editor::Editor(QWidget *parent)
     m_completer->setFilterMode(Qt::MatchContains);
     m_completer->setMaxVisibleItems(10);
     connect(m_completer, qOverload<const QString &>(&QCompleter::activated), this, &Editor::insertCompletion);
+
+    m_bold = new QAction(tr("Bold"), this);
+    m_bold->setShortcut(QKeySequence::Bold);
+    m_italic = new QAction(tr("Italic"), this);
+    m_italic->setShortcut(QKeySequence::Italic);
+    for (QAction *a : {m_bold, m_italic}) {
+        a->setShortcutContext(Qt::WidgetShortcut);
+        addAction(a);
+    }
+    connect(m_bold, &QAction::triggered, this, [this] { toggleWrap(u"**"_s); });
+    connect(m_italic, &QAction::triggered, this, [this] { toggleWrap(u"*"_s); });
 
     m_tableTimer.setSingleShot(true);
     m_tableTimer.setInterval(0);
@@ -1146,4 +1162,149 @@ void Editor::commitTables()
     for (const Table &t : std::as_const(m_tables))
         t.overlay->finishEditing();
     flushTableWrites();
+}
+
+void Editor::contextMenuEvent(QContextMenuEvent *e)
+{
+    QMenu *menu = createStandardContextMenu(e->pos());
+    QAction *first = menu->actions().value(0);
+    if (const QString href = linkAt(cursorForPosition(e->pos())); !href.isEmpty()) {
+        auto *open = new QAction(tr("Open link"), menu);
+        connect(open, &QAction::triggered, this, [this, href] { Q_EMIT linkActivated(href, false); });
+        auto *openTab = new QAction(tr("Open link in new tab"), menu);
+        connect(openTab, &QAction::triggered, this, [this, href] { Q_EMIT linkActivated(href, true); });
+        auto *copy = new QAction(tr("Copy link"), menu);
+        connect(copy, &QAction::triggered, this, [href] { QApplication::clipboard()->setText(PathActions::hrefText(href)); });
+        menu->insertActions(first, {open, openTab, copy});
+        menu->insertSeparator(first);
+    }
+
+    menu->addSeparator();
+    QMenu *format = menu->addMenu(tr("Format"));
+    format->addAction(m_bold);
+    format->addAction(m_italic);
+    format->addAction(tr("Strikethrough"), this, [this] { toggleWrap(u"~~"_s); });
+    format->addAction(tr("Highlight"), this, [this] { toggleWrap(u"=="_s); });
+    format->addAction(tr("Code"), this, [this] { toggleWrap(u"`"_s); });
+    QMenu *insert = menu->addMenu(tr("Insert"));
+    insert->addAction(tr("Table"), this, [this] {
+        insertBlock(u"| Column 1 | Column 2 |\n| --- | --- |\n|  |  |"_s, true);
+    });
+    insert->addAction(tr("Checkbox"), this, &Editor::insertTask);
+    insert->addAction(tr("Link to note…"), this, &Editor::insertWikilink);
+    insert->addAction(tr("Horizontal rule"), this, [this] { insertBlock(u"---"_s, false); });
+
+    const QString selected = textCursor().selectedText().trimmed();
+    if (!selected.isEmpty() && !selected.contains(QChar::ParagraphSeparator)) {
+        menu->addSeparator();
+        const QString shown = selected.size() > 30 ? selected.left(29) + u'…' : selected;
+        menu->addAction(tr("Search vault for “%1”").arg(shown), this, [this, selected] { Q_EMIT searchRequested(selected); });
+    }
+    menu->exec(e->globalPos());
+    delete menu;
+}
+
+// Wraps the selection (or the word at the cursor) in `mark`, or unwraps it if it is already wrapped.
+void Editor::toggleWrap(const QString &mark)
+{
+    QTextCursor c = textCursor();
+    if (!c.hasSelection())
+        c.select(QTextCursor::WordUnderCursor);
+    if (!c.hasSelection()) {
+        c.insertText(mark + mark);
+        c.movePosition(QTextCursor::Left, QTextCursor::MoveAnchor, int(mark.size()));
+        setTextCursor(c);
+        return;
+    }
+    const int n = int(mark.size());
+    auto textAt = [this](int pos, int len) {
+        if (pos < 0)
+            return QString();
+        QTextCursor t(document());
+        t.setPosition(pos);
+        t.setPosition(qMin(pos + len, document()->characterCount() - 1), QTextCursor::KeepAnchor);
+        return t.selectedText();
+    };
+    int start = c.selectionStart(), end = c.selectionEnd();
+    const QString inner = c.selectedText();
+    c.beginEditBlock();
+    if (textAt(start - n, n) == mark && textAt(end, n) == mark) {
+        c.setPosition(end);
+        c.setPosition(end + n, QTextCursor::KeepAnchor);
+        c.removeSelectedText();
+        c.setPosition(start - n);
+        c.setPosition(start, QTextCursor::KeepAnchor);
+        c.removeSelectedText();
+        start -= n;
+        end -= n;
+    } else if (inner.size() >= 2 * n && inner.startsWith(mark) && inner.endsWith(mark)) {
+        c.insertText(inner.mid(n, inner.size() - 2 * n));
+        end -= 2 * n;
+    } else {
+        c.setPosition(end);
+        c.insertText(mark);
+        c.setPosition(start);
+        c.insertText(mark);
+        start += n;
+        end += n;
+    }
+    c.endEditBlock();
+    c.setPosition(start);
+    c.setPosition(end, QTextCursor::KeepAnchor);
+    setTextCursor(c);
+}
+
+// Puts `text` on its own lines with blank lines around it, so Markdown reads it as a block.
+void Editor::insertBlock(const QString &text, bool table)
+{
+    auto blank = [](const QTextBlock &b) { return b.text().trimmed().isEmpty(); };
+    QTextCursor c = textCursor();
+    c.clearSelection();
+    c.movePosition(QTextCursor::EndOfBlock);
+    QString before;
+    if (!blank(c.block()))
+        before = u"\n\n"_s;
+    else if (c.block().previous().isValid() && !blank(c.block().previous()))
+        before = u"\n"_s;
+    const QTextBlock next = c.block().next();
+    const QString after = !next.isValid() || !blank(next) ? u"\n"_s : QString();
+    c.beginEditBlock();
+    c.insertText(before + text + after);
+    c.endEditBlock();
+
+    const int lines = int(text.count(u'\n')) + 1;
+    const QTextBlock first = document()->findBlock(c.position() - int(after.size()) - int(text.size()));
+    QTextBlock below = document()->findBlockByNumber(first.blockNumber() + lines);
+    moveCursorQuietly(QTextCursor(below.isValid() ? below : document()->lastBlock()));
+    if (!table)
+        return;
+    scanTables();
+    for (const Table &t : std::as_const(m_tables))
+        if (t.head == first)
+            t.overlay->focusCell(0, 0, true);
+}
+
+void Editor::insertTask()
+{
+    static const QRegularExpression item(u"^(\\s*)([-*+]|\\d+[.)])\\s+(\\[[ xX]\\]\\s)?"_s);
+    const QTextBlock b = textCursor().block();
+    const auto m = item.match(b.text());
+    if (m.hasMatch() && m.capturedLength(3))
+        return;
+    int at = m.hasMatch() ? int(m.capturedEnd(0)) : 0;
+    while (!m.hasMatch() && at < b.text().size() && b.text()[at].isSpace())
+        ++at;
+    QTextCursor t(b);
+    t.setPosition(b.position() + at);
+    t.insertText(m.hasMatch() ? u"[ ] "_s : u"- [ ] "_s);
+}
+
+void Editor::insertWikilink()
+{
+    QTextCursor c = textCursor();
+    c.insertText(u"[[]]"_s);
+    c.movePosition(QTextCursor::Left, QTextCursor::MoveAnchor, 2);
+    setTextCursor(c);
+    setFocus();
+    updateCompletion();
 }

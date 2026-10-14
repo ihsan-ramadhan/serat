@@ -26,6 +26,8 @@ Q_SIGNALS:
     void renameRequested(const QString &path);
     void deleteRequested(const QString &path);
     void moveRequested(const QString &from, const QString &toDir);
+    void moveToRequested(const QString &path);
+    void duplicateRequested(const QString &path);
 
 protected:
     void drawBranches(QPainter *painter, const QRect &rect, const QModelIndex &index) const override;
@@ -51,6 +53,7 @@ public:
     explicit SearchPanel(QWidget *parent = nullptr);
     void setVault(Vault *vault) { m_vault = vault; rerun(); }
     void focusSearch();
+    void search(const QString &text);
     void rerun();
 
 Q_SIGNALS:
@@ -73,6 +76,9 @@ public:
 
 Q_SIGNALS:
     void openRequested(const QString &path, int line, bool newTab);
+
+private:
+    const Vault *m_vault = nullptr;
 };
 
 class OutgoingPanel : public QTreeWidget
@@ -84,6 +90,10 @@ public:
 
 Q_SIGNALS:
     void linkRequested(const QString &target, bool newTab);
+
+private:
+    const Vault *m_vault = nullptr;
+    QString m_path;
 };
 
 class OutlinePanel : public QTreeWidget

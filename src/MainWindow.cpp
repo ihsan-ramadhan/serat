@@ -2,6 +2,7 @@
 
 #include "NoteView.h"
 #include "Panels.h"
+#include "PathActions.h"
 #include "QuickSwitcher.h"
 #include "Theme.h"
 #include "Vault.h"
@@ -12,6 +13,7 @@
 #include <QCryptographicHash>
 #include <QDesktopServices>
 #include <QDir>
+#include <QDirIterator>
 #include <QFileDialog>
 #include <QFileInfo>
 #include <QHBoxLayout>
@@ -19,6 +21,7 @@
 #include <QJsonDocument>
 #include <QJsonObject>
 #include <QLabel>
+#include <QMenu>
 #include <QMenuBar>
 #include <QMessageBox>
 #include <QPushButton>
@@ -32,6 +35,7 @@
 #include <QTabWidget>
 #include <QToolButton>
 #include <QUrl>
+#include <QUrlQuery>
 #include <QVBoxLayout>
 
 using namespace Qt::StringLiterals;
@@ -170,6 +174,8 @@ void MainWindow::buildUi()
     m_tabs->setUsesScrollButtons(true);
     m_tabs->tabBar()->setExpanding(false);
     m_tabs->tabBar()->installEventFilter(this);
+    m_tabs->tabBar()->setContextMenuPolicy(Qt::CustomContextMenu);
+    connect(m_tabs->tabBar(), &QWidget::customContextMenuRequested, this, &MainWindow::showTabMenu);
     auto *plus = new QToolButton;
     plus->setIcon(Theme::icon(u"file-plus"_s));
     plus->setIconSize(QSize(18, 18));
@@ -255,6 +261,8 @@ void MainWindow::buildUi()
     connect(m_tree, &FileTree::renameRequested, this, &MainWindow::promptRename);
     connect(m_tree, &FileTree::deleteRequested, this, &MainWindow::deletePath);
     connect(m_tree, &FileTree::moveRequested, this, &MainWindow::movePath);
+    connect(m_tree, &FileTree::moveToRequested, this, &MainWindow::chooseFolderAndMove);
+    connect(m_tree, &FileTree::duplicateRequested, this, &MainWindow::duplicatePath);
     connect(m_search, &SearchPanel::openRequested, this,
             [this](const QString &p, int line, bool newTab) { openPath(p, newTab, {}, line); });
     connect(m_backlinks, &BacklinksPanel::openRequested, this,
@@ -605,6 +613,7 @@ NoteView *MainWindow::createTab()
         if (v == currentView())
             updateStatus();
     });
+    connect(v, &NoteView::searchRequested, this, [this](const QString &text) { searchVault(text); });
     connect(v, &NoteView::hintChanged, this, [this, v](const QString &hint) {
         if (v != currentView())
             return;
@@ -801,11 +810,148 @@ void MainWindow::quickSwitcher()
         openPath(dlg.selectedPath(), dlg.newTab());
 }
 
-void MainWindow::searchVault()
+void MainWindow::searchVault(const QString &text)
 {
     m_left->show();
     m_left->setCurrentWidget(m_search);
+    if (!text.isEmpty())
+        m_search->search(text);
     m_search->focusSearch();
+}
+
+void MainWindow::showTabMenu(const QPoint &pos)
+{
+    QTabBar *bar = m_tabs->tabBar();
+    const int index = bar->tabAt(pos);
+    auto *v = qobject_cast<NoteView *>(m_tabs->widget(index));
+    if (!v || !m_vault)
+        return;
+    const QString path = v->path();
+    QMenu menu(this);
+    menu.addAction(tr("Close"), this, [this, v] { closeTab(m_tabs->indexOf(v)); });
+    QAction *others = menu.addAction(tr("Close others"), this, [this, v] {
+        for (int i = m_tabs->count() - 1; i >= 0; --i)
+            if (m_tabs->widget(i) != v)
+                closeTab(i);
+    });
+    others->setEnabled(m_tabs->count() > 1);
+    QAction *right = menu.addAction(tr("Close tabs to the right"), this, [this, v] {
+        for (int i = m_tabs->count() - 1; i > m_tabs->indexOf(v); --i)
+            closeTab(i);
+    });
+    right->setEnabled(index < m_tabs->count() - 1);
+    menu.addSeparator();
+    menu.addAction(tr("Open in new tab"), this, [this, path] { openPath(path, true); });
+    menu.addAction(tr("Reveal in file tree"), this, [this, path] { revealInTree(path); });
+    menu.addSeparator();
+    PathActions::addCopyMenu(&menu, *m_vault, path);
+    menu.exec(bar->mapToGlobal(pos));
+}
+
+void MainWindow::revealInTree(const QString &path)
+{
+    m_left->show();
+    m_left->setCurrentWidget(m_tree);
+    m_tree->reveal(path);
+    m_tree->setFocus();
+}
+
+void MainWindow::duplicatePath(const QString &path)
+{
+    const QString copy = m_vault->uniquePath(path);
+    if (!QFile::copy(m_vault->absolutePath(path), m_vault->absolutePath(copy))) {
+        QMessageBox::warning(this, tr("Duplicate failed"), tr("Could not copy “%1”.").arg(path));
+        return;
+    }
+    m_vault->rescan();
+    openPath(copy, false);
+    if (NoteView *v = currentView(); v && v->isNote())
+        v->focusTitle();
+}
+
+void MainWindow::chooseFolderAndMove(const QString &path)
+{
+    const QString from = dirOf(path);
+    const QString root = tr("(vault root)");
+    QStringList folders;
+    if (!from.isEmpty())
+        folders << root;
+    QDirIterator it(m_vault->root(), QDir::Dirs | QDir::NoDotAndDotDot, QDirIterator::Subdirectories);
+    while (it.hasNext()) {
+        const QString dir = m_vault->relativePath(it.next());
+        const bool hidden = dir.startsWith(u'.') || dir.contains(u"/."_s);
+        if (!hidden && dir != from && dir != path && !dir.startsWith(path + u'/'))
+            folders << dir;
+    }
+    std::sort(folders.begin() + (from.isEmpty() ? 0 : 1), folders.end());
+    if (folders.isEmpty()) {
+        QMessageBox::information(this, tr("Move to"), tr("There is no other folder to move “%1” to.").arg(path));
+        return;
+    }
+    bool ok = false;
+    const QString to = QInputDialog::getItem(this, tr("Move to"), tr("Move “%1” to:").arg(path.section(u'/', -1)), folders,
+                                             0, false, &ok);
+    if (ok)
+        movePath(path, to == root ? QString() : to);
+}
+
+QString MainWindow::findVault(const QString &name) const
+{
+    QStringList candidates;
+    if (m_vault)
+        candidates << m_vault->root();
+    candidates << QSettings().value(u"recentVaults"_s).toStringList() << obsidianVaults();
+    for (const QString &dir : std::as_const(candidates))
+        if (QFileInfo(dir).fileName() == name && QFileInfo(dir).isDir())
+            return dir;
+    return {};
+}
+
+void MainWindow::handleArgument(const QString &arg)
+{
+    if (arg.startsWith(u"serat:"_s, Qt::CaseInsensitive))
+        openUrl(QUrl(arg));
+    else if (const QString dir = arg.startsWith(u"file:"_s) ? QUrl(arg).toLocalFile() : arg; QFileInfo(dir).isDir())
+        openVault(QFileInfo(dir).absoluteFilePath());
+    if (isMinimized())
+        showNormal();
+    raise();
+    activateWindow();
+}
+
+void MainWindow::openUrl(const QUrl &url)
+{
+    const QUrlQuery query(url);
+    const QString name = query.queryItemValue(u"vault"_s, QUrl::FullyDecoded);
+    const QString file = query.queryItemValue(u"file"_s, QUrl::FullyDecoded);
+    if (url.host() != u"open" || name.isEmpty()) {
+        QMessageBox::warning(this, tr("Cannot open link"), tr("“%1” is not a Serat link.").arg(url.toDisplayString()));
+        return;
+    }
+    const QString root = findVault(name);
+    if (root.isEmpty()) {
+        QMessageBox::warning(this, tr("Vault not found"),
+                             tr("No vault named “%1” is known here. Open its folder in Serat once, then try the link again.").arg(name));
+        return;
+    }
+    if (!m_vault || m_vault->root() != root)
+        openVault(root);
+    if (file.isEmpty())
+        return;
+    QString path = file;
+    if (!m_vault->exists(path) && m_vault->exists(path + u".md"_s))
+        path += u".md"_s;
+    if (!m_vault->exists(path)) {
+        QMessageBox::warning(this, tr("Note not found"), tr("“%1” is not in the vault “%2”.").arg(file, name));
+        return;
+    }
+    for (NoteView *v : views()) {
+        if (v->path() == path) {
+            m_tabs->setCurrentWidget(v);
+            return;
+        }
+    }
+    openPath(path, true);
 }
 
 void MainWindow::zoom(double delta)

@@ -93,6 +93,7 @@ NoteView::NoteView(Vault *vault, QWidget *parent)
     m_imageArea->setWidgetResizable(true);
     m_imageArea->setWidget(m_image);
     m_imageArea->setBackgroundRole(QPalette::Base);
+    m_imageArea->viewport()->installEventFilter(this);
 
     m_stack = new QStackedWidget(this);
     m_stack->addWidget(m_editor);
@@ -142,6 +143,11 @@ NoteView::NoteView(Vault *vault, QWidget *parent)
     });
     connect(m_editor, &Editor::linkActivated, this, &NoteView::handleHref);
     connect(m_editor, &Editor::hintChanged, this, &NoteView::hintChanged);
+    connect(m_editor, &Editor::searchRequested, this, &NoteView::searchRequested);
+    connect(m_reader, &Reader::openRequested, this, &NoteView::handleHref);
+    connect(m_reader, &Reader::imageRequested, this, [this](const QString &file, bool newTab) {
+        Q_EMIT linkRequested(m_vault->relativePath(file), newTab);
+    });
     connect(m_reader, &QTextBrowser::anchorClicked, this, [this](const QUrl &url) {
         handleHref(url.toString(QUrl::FullyEncoded), QApplication::keyboardModifiers() & Qt::ControlModifier);
     });
@@ -581,7 +587,14 @@ void NoteView::resizeEvent(QResizeEvent *e)
 {
     QWidget::resizeEvent(e);
     updateMargins();
-    scaleImage();
+}
+
+bool NoteView::eventFilter(QObject *obj, QEvent *e)
+{
+    // A tab opened in the background lays out its image area later than the tab itself.
+    if (obj == m_imageArea->viewport() && e->type() == QEvent::Resize)
+        scaleImage();
+    return QWidget::eventFilter(obj, e);
 }
 
 void NoteView::updateMargins()
@@ -606,5 +619,12 @@ void NoteView::scaleImage()
         return;
     }
     const int w = m_imageArea->viewport()->width() - 48;
-    m_image->setPixmap(m_pixmap.width() > w && w > 0 ? m_pixmap.scaledToWidth(w, Qt::SmoothTransformation) : m_pixmap);
+    if (w <= 0 || m_pixmap.width() <= w) {
+        m_image->setPixmap(m_pixmap);
+        return;
+    }
+    const qreal dpr = devicePixelRatioF();
+    QPixmap fitted = m_pixmap.scaledToWidth(qRound(w * dpr), Qt::SmoothTransformation);
+    fitted.setDevicePixelRatio(dpr);
+    m_image->setPixmap(fitted);
 }

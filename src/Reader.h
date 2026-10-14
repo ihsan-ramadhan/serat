@@ -11,9 +11,12 @@ public:
 
 Q_SIGNALS:
     void contentWidthChanged();
+    void openRequested(const QString &href, bool newTab);
+    void imageRequested(const QString &localFile, bool newTab);
 
 protected:
     void resizeEvent(QResizeEvent *e) override;
+    void contextMenuEvent(QContextMenuEvent *e) override;
     QVariant loadResource(int type, const QUrl &name) override;
 
 private:

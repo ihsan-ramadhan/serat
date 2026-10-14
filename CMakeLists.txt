@@ -5,7 +5,7 @@ set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
-find_package(Qt6 6.5 REQUIRED COMPONENTS Widgets Svg)
+find_package(Qt6 6.5 REQUIRED COMPONENTS Widgets Svg Network)
 qt_standard_project_setup()
 
 # md4c: the system package, or its single source file built from upstream.
@@ -32,6 +32,7 @@ qt_add_executable(serat
     src/CodeHighlight.cpp src/CodeHighlight.h
     src/MarkdownHighlighter.cpp src/MarkdownHighlighter.h
     src/Theme.cpp src/Theme.h
+    src/PathActions.cpp src/PathActions.h
     src/TableEditor.cpp src/TableEditor.h
     src/Editor.cpp src/Editor.h
     src/Reader.cpp src/Reader.h
@@ -43,7 +44,7 @@ qt_add_executable(serat
 file(GLOB serat_icons RELATIVE ${CMAKE_CURRENT_SOURCE_DIR} CONFIGURE_DEPENDS data/icons/*.svg)
 qt_add_resources(serat "icons" PREFIX "/" BASE data FILES data/serat.svg ${serat_icons})
 
-target_link_libraries(serat PRIVATE Qt6::Widgets Qt6::Svg md4c::md4c)
+target_link_libraries(serat PRIVATE Qt6::Widgets Qt6::Svg Qt6::Network md4c::md4c)
 target_compile_definitions(serat PRIVATE QT_NO_KEYWORDS SERAT_VERSION="${PROJECT_VERSION}")
 if(KF6SyntaxHighlighting_FOUND)
     target_link_libraries(serat PRIVATE KF6::SyntaxHighlighting)
@@ -54,6 +55,7 @@ set_target_properties(serat PROPERTIES
     WIN32_EXECUTABLE ON
     MACOSX_BUNDLE ON
     MACOSX_BUNDLE_GUI_IDENTIFIER id.icqn.Serat
+    MACOSX_BUNDLE_INFO_PLIST ${CMAKE_CURRENT_SOURCE_DIR}/data/Info.plist.in
     MACOSX_BUNDLE_BUNDLE_NAME Serat
     MACOSX_BUNDLE_SHORT_VERSION_STRING ${PROJECT_VERSION})
 
