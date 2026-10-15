@@ -57,7 +57,7 @@ private:
     void commandPalette();
     QWidget *buildFilesPage();
     void fillNoteMenu(QMenu *menu, NoteView *v, bool tab);
-    void addFileActions(QMenu *menu, const QString &path);
+    void addFileActions(QMenu *menu, const QString &path, bool deletable = false);
     void searchVault(const QString &text = {});
     void showTabMenu(const QPoint &pos);
     void duplicatePath(const QString &path);

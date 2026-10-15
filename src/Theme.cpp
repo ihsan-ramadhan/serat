@@ -157,6 +157,17 @@ QTableView#mdTable { background: %2; color: %6; border: none; border-top: 1px so
                      selection-background-color: %9; selection-color: %6; }
 QTableView#mdTable QLineEdit { border: 1px solid %8; border-radius: 0px; padding: 0px 7px; background: %2; } /* lines up with TextInset */
 QToolButton#tableAdd { border-radius: 4px; }
+
+QFrame#properties { background: %2; border: none; }
+QFrame#properties QToolButton { font-weight: 400; }
+QFrame#properties QToolButton#propertiesHeader { font-weight: 600; padding: 3px 6px 3px 2px; }
+QFrame#properties QLineEdit { background: transparent; border: 1px solid transparent; border-radius: 4px; padding: 3px 6px; }
+QFrame#properties QLineEdit:hover { background: %5; }
+QFrame#properties QLineEdit:focus { background: %2; border: 1px solid %8; }
+QLineEdit#propertyKey { color: %7; }
+QLabel#propertyRaw { color: %7; padding: 3px 6px; }
+QFrame#pill { background: %3; border: 1px solid %4; border-radius: 10px; }
+QToolButton#pillRemove { padding: 1px; border-radius: 7px; }
 )"_s.arg(c.window.name(), c.base.name(), c.raised.name(), c.border.name(), c.hover.name(), c.text.name(),
            c.muted.name(), c.accent.name(), c.selection.name())
         .arg(scroll, scrollHover, pressed);

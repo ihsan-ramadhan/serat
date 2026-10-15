@@ -1,6 +1,7 @@
 #include "Markdown.h"
 
 #include "CodeHighlight.h"
+#include "Frontmatter.h"
 #include "Vault.h"
 
 #include <QDir>
@@ -79,12 +80,9 @@ QString attr(const MD_ATTRIBUTE &a)
     return fromMd(a.text, a.size);
 }
 
-struct Callout {
-    QString color;
-    QString icon; // :/icons/<icon>.svg, loaded by Reader through "icon:" URLs
-};
+} // namespace
 
-Callout calloutStyle(const QString &type)
+CalloutStyle calloutStyle(const QString &type)
 {
     const QString t = type.toLower();
     auto in = [&](std::initializer_list<const char16_t *> names) {
@@ -119,6 +117,8 @@ Callout calloutStyle(const QString &type)
         return {u"#9e9e9e"_s, u"quote"_s};
     return {u"#448aff"_s, u"pencil"_s};
 }
+
+namespace {
 
 // Up to the next heading of the same or higher level; the whole text if `heading` is missing.
 QString sectionOf(const QString &text, const QString &heading)
@@ -200,15 +200,29 @@ public:
 private:
     void renderFrontmatter(const QString &yaml)
     {
-        m_out += u"<table cellspacing=\"0\" cellpadding=\"3\" style=\"margin-bottom:12px; color:%1;\">"_s.arg(m_muted);
-        for (const QString &line : yaml.split(u'\n')) {
-            const qsizetype colon = line.indexOf(u':');
-            if (colon <= 0 || line.startsWith(u' ') || line.startsWith(u'\t')) {
-                m_out += u"<tr><td></td><td>%1</td></tr>"_s.arg(line.trimmed().toHtmlEscaped());
+        using Frontmatter::Type;
+        m_out += u"<table cellspacing=\"0\" cellpadding=\"3\" style=\"margin-bottom:12px;\">"_s;
+        for (const Frontmatter::Property &p : Frontmatter::parse(yaml.split(u'\n'))) {
+            if (p.key.isEmpty())
                 continue;
+            QString value;
+            if (p.type == Type::List && p.key == u"tags") {
+                QStringList tags;
+                for (const QString &t : p.items)
+                    tags << u"<span style=\"color:%1;\">#%2</span>"_s.arg(m_opt.palette.color(QPalette::Link).name(), t.toHtmlEscaped());
+                value = tags.join(u' ');
+            } else if (p.type == Type::List) {
+                value = p.items.join(u", "_s).toHtmlEscaped();
+            } else if (p.type == Type::Checkbox) {
+                value = p.value == u"true" ? u"\u2611"_s : u"\u2610"_s;
+            } else if (p.type == Type::Raw) {
+                QStringList body = p.lines.mid(1);
+                body.prepend(p.lines.value(0).section(u':', 1));
+                value = body.join(u' ').simplified().toHtmlEscaped();
+            } else {
+                value = p.value.toHtmlEscaped();
             }
-            m_out += u"<tr><td><b>%1</b></td><td>%2</td></tr>"_s.arg(line.left(colon).toHtmlEscaped(),
-                                                                    line.mid(colon + 1).trimmed().toHtmlEscaped());
+            m_out += u"<tr><td style=\"color:%1; padding-right:16px;\">%2</td><td>%3</td></tr>"_s.arg(m_muted, p.key.toHtmlEscaped(), value);
         }
         m_out += u"</table>"_s;
     }
@@ -521,7 +535,7 @@ private:
         QString rest = inner.mid(m.capturedEnd());
         if (m.captured(4) == u"<br>")
             rest.prepend(u"<p>"_s);
-        const Callout style = calloutStyle(type);
+        const CalloutStyle style = calloutStyle(type);
         const QString bg = mix(m_base, QColor(style.color), m_opt.dark ? 0.14 : 0.09).name();
         const QString icon = u"<img src=\"icon:%1?color=%2\" width=\"18\" height=\"18\" align=\"middle\">"_s.arg(
             style.icon, QString::fromLatin1(QUrl::toPercentEncoding(style.color)));

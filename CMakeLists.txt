@@ -34,6 +34,8 @@ qt_add_executable(serat
     src/Theme.cpp src/Theme.h
     src/PathActions.cpp src/PathActions.h
     src/TableEditor.cpp src/TableEditor.h
+    src/Frontmatter.cpp src/Frontmatter.h
+    src/Properties.cpp src/Properties.h
     src/Editor.cpp src/Editor.h
     src/Reader.cpp src/Reader.h
     src/NoteView.cpp src/NoteView.h
@@ -63,7 +65,7 @@ set_target_properties(serat PROPERTIES
 include(CTest)
 if(BUILD_TESTING)
     find_package(Qt6 REQUIRED COMPONENTS Test)
-    qt_add_executable(tst_vault tests/tst_vault.cpp src/Vault.cpp src/Markdown.cpp src/CodeHighlight.cpp)
+    qt_add_executable(tst_vault tests/tst_vault.cpp src/Vault.cpp src/Markdown.cpp src/CodeHighlight.cpp src/Frontmatter.cpp)
     target_include_directories(tst_vault PRIVATE src)
     target_link_libraries(tst_vault PRIVATE Qt6::Widgets Qt6::Test md4c::md4c)
     target_compile_definitions(tst_vault PRIVATE QT_NO_KEYWORDS)

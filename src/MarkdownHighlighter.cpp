@@ -4,6 +4,7 @@
 #include "TableEditor.h"
 
 #include <QFontDatabase>
+#include <QFontMetricsF>
 #include <QPalette>
 #include <QRegularExpression>
 
@@ -73,6 +74,7 @@ void MarkdownHighlighter::setTheme(const QPalette &pal, const QFont &font)
     m_collapse.setFont(tiny, QTextCharFormat::FontPropertiesSpecifiedOnly);
     m_collapse.setFontLetterSpacingType(QFont::PercentageSpacing);
     m_collapse.setFontLetterSpacing(1);
+    m_calloutPad = QFontMetricsF(font).height() * 1.1;
     rehighlight();
 }
 
@@ -113,9 +115,9 @@ void MarkdownHighlighter::highlightBlock(const QString &text)
     static const QRegularExpression heading(u"^(#{1,6})[ \\t]"_s);
     static const QRegularExpression hr(u"^ {0,3}([-*_])( *\\1){2,} *$"_s);
     static const QRegularExpression quote(u"^\\s*(>[ >]*)"_s);
-    static const QRegularExpression callout(u"^\\s*>\\s*\\[![\\w-]+\\][+-]?.*$"_s);
+    static const QRegularExpression callout(u"^\\s*>\\s*\\[![\\w-]+\\]"_s);
     static const QRegularExpression list(u"^(\\s*)([-*+]|\\d+[.)])(\\s+)(\\[[ xX]\\]\\s)?"_s);
-    static const QRegularExpression calloutHead(u"\\[![\\w-]+\\][+-]? *"_s);
+    static const QRegularExpression calloutHead(u"\\[!([\\w-]+)\\][+-]? *"_s);
 
     const int prev = qMax(0, previousBlockState());
     const int len = int(text.size());
@@ -133,7 +135,8 @@ void MarkdownHighlighter::highlightBlock(const QString &text)
         slot.setForeground(Qt::transparent);
         setFormat(0, len, slot);
         // Keep fence/frontmatter state flowing so the table scan sees it.
-        setCurrentBlockState(prev & (BlockState::InFence | BlockState::Tilde | BlockState::Frontmatter));
+        const bool opensFrontmatter = currentBlock().blockNumber() == 0 && text == u"---";
+        setCurrentBlockState(opensFrontmatter ? Frontmatter : prev & (InFence | Tilde | Frontmatter));
         return;
     }
 
@@ -193,18 +196,29 @@ void MarkdownHighlighter::highlightBlock(const QString &text)
 
     int from = 0;
     if (const auto m = quote.match(text); m.hasMatch()) {
-        setFormat(0, len, m_quote);
+        const bool head = callout.match(text).hasMatch();
+        const bool inCallout = head || (prev & Callout);
+        if (inCallout)
+            setCurrentBlockState(Callout);
+        else
+            setFormat(0, len, m_quote);
         markup(0, int(m.capturedEnd(1)), Ghost);
+        if (inCallout && m_hide) {
+            QTextCharFormat pad;
+            pad.setFontLetterSpacingType(QFont::AbsoluteSpacing);
+            pad.setFontLetterSpacing(m_calloutPad);
+            apply(int(text.indexOf(u'>')), 1, pad);
+        }
         from = int(m.capturedEnd(1));
-        if (callout.match(text).hasMatch()) {
-            apply(from, len - from, m_callout);
-            // "[!tip] Title" shows just the title; a bare "[!tip]" keeps its type.
-            const auto head = calloutHead.match(text, from, QRegularExpression::NormalMatch,
-                                                QRegularExpression::AnchorAtOffsetMatchOption);
-            if (head.hasMatch() && head.capturedEnd() < len)
-                markup(from, int(head.capturedLength()));
-            if (head.hasMatch())
-                from = int(head.capturedEnd());
+        if (head) {
+            // The editor paints the icon, and the type's name when there is no title.
+            const auto h = calloutHead.match(text, from, QRegularExpression::NormalMatch,
+                                             QRegularExpression::AnchorAtOffsetMatchOption);
+            QTextCharFormat title = m_callout;
+            title.setForeground(QColor(calloutStyle(h.captured(1)).color));
+            apply(from, len - from, title);
+            markup(from, int(h.capturedLength()));
+            from = int(h.capturedEnd());
         }
     }
     if (const auto m = list.match(text, from, QRegularExpression::NormalMatch, QRegularExpression::AnchorAtOffsetMatchOption);

@@ -1,14 +1,20 @@
 #pragma once
 
+#include <QHash>
+#include <QImage>
 #include <QPlainTextEdit>
 #include <QPointer>
+#include <QSet>
 #include <QTextBlock>
 #include <QTimer>
 
 #include <functional>
 
+class ImageBlock;
 class MarkdownHighlighter;
+class PropertiesPanel;
 class QMenu;
+class QPainter;
 class QCompleter;
 class QStringListModel;
 class TableOverlay;
@@ -48,7 +54,7 @@ public:
     void followLinkAtCursor(bool newTab);
     // The context menu shows the window's command actions, plus file actions on vault links.
     void setCommands(std::function<QAction *(const QString &id)> command,
-                     std::function<void(QMenu *, const QString &path)> fileActions);
+                     std::function<void(QMenu *, const QString &path, bool image)> fileActions);
 
 Q_SIGNALS:
     void linkActivated(const QString &href, bool newTab);
@@ -113,6 +119,21 @@ private:
     void flushTableWrites();
     void moveCursorQuietly(const QTextCursor &cursor);
 
+    int frontmatterEnd() const;
+    void scanProperties(QSet<int> &covered);
+    void writeFrontmatter(const QStringList &lines);
+    void leaveProperties();
+    void showPropertiesSource();
+    struct Image {
+        QTextBlock block;
+        int height = 0;
+        ImageBlock *widget = nullptr;
+    };
+    void scanImages(QSet<int> &covered);
+    void showImageMenu(const QString &path, const QPoint &globalPos);
+    QPair<QTextBlock, QTextBlock> calloutAt(const QTextBlock &block) const;
+    void paintCalloutHead(QPainter &p, const QTextBlock &block);
+
     Vault *m_vault = nullptr;
     QString m_notePath;
     MarkdownHighlighter *m_highlighter;
@@ -122,7 +143,7 @@ private:
     bool m_headingMode = false; // completing the heading after '#'
     QColor m_codeBg;
     std::function<QAction *(const QString &)> m_command;
-    std::function<void(QMenu *, const QString &)> m_fileActions;
+    std::function<void(QMenu *, const QString &, bool)> m_fileActions;
     bool m_live = false;
     int m_rawFrom = -1, m_rawTo = -1;
     int m_colFrom = -1, m_colTo = -1;
@@ -145,4 +166,12 @@ private:
     bool m_inKeyPress = false;
     int m_typedBlock = -1; // block of the last edit made from the keyboard
     bool m_navUp = false;
+
+    PropertiesPanel *m_props = nullptr;
+    int m_propLines = 0; // frontmatter lines under the panel, 0 while it is hidden
+    int m_propsHeight = 0;
+    bool m_rawProps = false;
+    QList<Image> m_images;
+    QTextBlock m_rawImage;
+    QHash<QString, QImage> m_icons;
 };

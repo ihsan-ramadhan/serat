@@ -406,7 +406,11 @@ void MainWindow::buildActions()
     add(insert, u"insert.rule"_s, tr("Horizontal rule"), {}, withEditor([](Editor *e) { e->insertRule(); }));
     add(insert, u"insert.codeblock"_s, tr("Code block"), {}, withEditor([](Editor *e) { e->insertCodeBlock(); }));
     insert->addSeparator();
-    add(insert, u"insert.property"_s, tr("Add file property"), QKeySequence(u"Ctrl+;"_s), withEditor([](Editor *e) { e->addProperty(); }));
+    add(insert, u"insert.property"_s, tr("Add file property"), QKeySequence(u"Ctrl+;"_s), [this] {
+        // Unlike the other editor commands this one also runs from inside the properties panel.
+        if (NoteView *v = currentView(); v && v->isNote() && v->mode() == NoteView::Edit)
+            v->editor()->addProperty();
+    });
 
     QMenu *go = menuBar()->addMenu(tr("&Go"));
     add(go, u"app.palette"_s, tr("Command palette"), QKeySequence(u"Ctrl+P"_s), [this] { commandPalette(); });
@@ -624,6 +628,7 @@ void MainWindow::saveSession()
     s.setValue(u"recent"_s, m_recent);
     s.setValue(u"leftVisible"_s, m_left->isVisible());
     s.setValue(u"rightVisible"_s, m_right->isVisible());
+    s.setValue(u"expandedFolders"_s, m_tree->expandedFolders());
     s.endGroup();
 }
 
@@ -637,6 +642,7 @@ void MainWindow::restoreSession()
     const QStringList tabs = s.value(u"tabs"_s).toStringList();
     const QStringList modes = s.value(u"modes"_s).toStringList();
     const int current = s.value(u"current"_s, 0).toInt();
+    m_tree->setExpandedFolders(s.value(u"expandedFolders"_s).toStringList());
     s.endGroup();
 
     for (qsizetype i = 0; i < tabs.size(); ++i) {
@@ -729,7 +735,7 @@ NoteView *MainWindow::createTab()
         menu.exec(pos);
     });
     v->editor()->setCommands([this](const QString &id) { return m_commands.value(id); },
-                             [this](QMenu *menu, const QString &path) { addFileActions(menu, path); });
+                             [this](QMenu *menu, const QString &path, bool image) { addFileActions(menu, path, image); });
     connect(v, &NoteView::hintChanged, this, [this, v](const QString &hint) {
         if (v != currentView())
             return;
@@ -929,6 +935,8 @@ void MainWindow::quickSwitcher(bool newTab)
         openLink(dlg.createName(), {}, newTab || dlg.newTab());
     else
         openPath(dlg.selectedPath(), newTab || dlg.newTab());
+    if (NoteView *v = currentView())
+        v->focusContent();
 }
 
 void MainWindow::commandPalette()
@@ -1088,7 +1096,7 @@ void MainWindow::fillNoteMenu(QMenu *menu, NoteView *v, bool tab)
     menu->addAction(tr("Delete file"), this, [this, path] { deletePath(path); });
 }
 
-void MainWindow::addFileActions(QMenu *menu, const QString &path)
+void MainWindow::addFileActions(QMenu *menu, const QString &path, bool deletable)
 {
     PathActions::addCopyMenu(menu, *m_vault, path);
     menu->addSeparator();
@@ -1100,6 +1108,10 @@ void MainWindow::addFileActions(QMenu *menu, const QString &path)
         QDesktopServices::openUrl(QUrl::fromLocalFile(QFileInfo(m_vault->absolutePath(path)).absolutePath()));
     });
     menu->addAction(tr("Reveal file in navigation"), this, [this, path] { revealInTree(path); });
+    if (deletable) {
+        menu->addSeparator();
+        menu->addAction(Vault::isImage(path) ? tr("Delete image") : tr("Delete file"), this, [this, path] { deletePath(path); });
+    }
 }
 
 void MainWindow::revealInTree(const QString &path)
@@ -1214,13 +1226,16 @@ void MainWindow::openUrl(const QUrl &url)
         QMessageBox::warning(this, tr("Note not found"), tr("“%1” is not in the vault “%2”.").arg(file, name));
         return;
     }
-    for (NoteView *v : views()) {
-        if (v->path() == path) {
-            m_tabs->setCurrentWidget(v);
-            return;
-        }
-    }
-    openPath(path, true);
+    NoteView *open = nullptr;
+    for (NoteView *v : views())
+        if (v->path() == path)
+            open = v;
+    if (open)
+        m_tabs->setCurrentWidget(open);
+    else
+        openPath(path, true);
+    if (NoteView *v = currentView())
+        v->focusContent();
 }
 
 void MainWindow::zoom(double delta)

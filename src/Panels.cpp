@@ -21,6 +21,8 @@
 #include <QUrl>
 #include <QVBoxLayout>
 
+#include <functional>
+
 using namespace Qt::StringLiterals;
 
 namespace {
@@ -180,6 +182,8 @@ FileTree::FileTree(QWidget *parent)
     connect(m_fs, &QFileSystemModel::directoryLoaded, this, [this] {
         if (!m_pendingReveal.isEmpty())
             reveal(m_pendingReveal);
+        if (!m_pendingExpand.isEmpty())
+            setExpandedFolders(std::exchange(m_pendingExpand, {}));
     });
 }
 
@@ -264,6 +268,34 @@ void FileTree::setSort(Sort sort)
 FileTree::Sort FileTree::sortOrder() const
 {
     return static_cast<FsProxy *>(m_proxy)->mode;
+}
+
+QStringList FileTree::expandedFolders() const
+{
+    QStringList out;
+    const std::function<void(const QModelIndex &)> walk = [&](const QModelIndex &parent) {
+        for (int i = 0; i < model()->rowCount(parent); ++i) {
+            const QModelIndex index = model()->index(i, 0, parent);
+            if (isExpanded(index))
+                out << pathAt(index);
+            walk(index);
+        }
+    };
+    walk(rootIndex());
+    return out + m_pendingExpand;
+}
+
+void FileTree::setExpandedFolders(const QStringList &folders)
+{
+    if (!m_vault)
+        return;
+    for (const QString &folder : folders) {
+        const QModelIndex index = m_proxy->mapFromSource(m_fs->index(m_vault->absolutePath(folder)));
+        if (index.isValid())
+            expand(index);
+        else if (m_vault->isDir(folder))
+            m_pendingExpand << folder;
+    }
 }
 
 bool FileTree::anyExpanded() const

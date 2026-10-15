@@ -9,6 +9,7 @@ constexpr int InFence = 1;
 constexpr int Tilde = 2;
 constexpr int FenceLine = 4;
 constexpr int Frontmatter = 8;
+constexpr int Callout = 16; // a callout's "> [!type]" line and the quote lines under it
 }
 
 class MarkdownHighlighter : public QSyntaxHighlighter
@@ -38,6 +39,7 @@ private:
     QTextCharFormat m_bold, m_italic, m_strike, m_mark, m_table, m_html;
     QTextCharFormat m_collapse, m_ghost;
     QFont m_font;
+    double m_calloutPad = 0; // room for the icon the editor draws in front of a callout title
     bool m_live = false;
     bool m_hide = false;
     int m_rawFrom = -1, m_rawTo = -1;

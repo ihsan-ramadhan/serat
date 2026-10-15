@@ -3,7 +3,9 @@
 #include "Markdown.h"
 #include "MarkdownHighlighter.h"
 #include "PathActions.h"
+#include "Properties.h"
 #include "TableEditor.h"
+#include "Theme.h"
 #include "Vault.h"
 
 #include <QAbstractItemView>
@@ -13,9 +15,11 @@
 #include <QAbstractTextDocumentLayout>
 #include <QCompleter>
 #include <QDateTime>
+#include <QDir>
 #include <QFile>
 #include <QFileInfo>
 #include <QImage>
+#include <QImageReader>
 #include <QKeyEvent>
 #include <QMenu>
 #include <QMimeData>
@@ -45,7 +49,97 @@ QString wikiHref(const QString &target)
     return u"wiki:"_s + QString::fromUtf8(QUrl::toPercentEncoding(target));
 }
 
+bool fencedOrFrontmatter(const QTextBlock &b)
+{
+    const int st = b.userState();
+    return st > 0 && (st & (BlockState::InFence | BlockState::Frontmatter));
+}
+
+const QRegularExpression &calloutHeadRe()
+{
+    static const QRegularExpression re(u"^\\s*>\\s*\\[!([\\w-]+)\\][+-]? *(.*)$"_s);
+    return re;
+}
+
 } // namespace
+
+// An image embed drawn over its line in live preview.
+class ImageBlock : public QWidget
+{
+public:
+    explicit ImageBlock(QWidget *parent)
+        : QWidget(parent)
+    {
+        setCursor(Qt::ArrowCursor);
+    }
+
+    QString path; // vault-relative
+    std::function<void(const QPoint &)> menu;
+    std::function<void()> clicked;
+
+    void setImage(const QString &file, const QSize &wanted)
+    {
+        m_wanted = wanted;
+        if (file == m_file)
+            return;
+        m_file = file;
+        QImageReader reader(file);
+        reader.setAutoTransform(true);
+        m_natural = reader.size();
+        // Keep big photos small in memory; the editor never shows them wider than this.
+        if (m_natural.width() > 2000)
+            reader.setScaledSize(m_natural.scaled(2000, m_natural.height(), Qt::KeepAspectRatio));
+        m_image = reader.read();
+        if (!m_natural.isValid())
+            m_natural = m_image.size();
+        m_scaled = {};
+    }
+
+    bool isNull() const { return m_image.isNull(); }
+
+    QSize sizeFor(int maxWidth) const
+    {
+        QSize s = m_natural;
+        if (s.isEmpty())
+            return {};
+        if (m_wanted.width() > 0 && m_wanted.height() > 0)
+            s = s.scaled(m_wanted, Qt::KeepAspectRatio);
+        else if (m_wanted.width() > 0)
+            s = QSize(m_wanted.width(), qMax(1, qRound(s.height() * double(m_wanted.width()) / s.width())));
+        if (s.width() > maxWidth)
+            s = QSize(maxWidth, qMax(1, qRound(s.height() * double(maxWidth) / s.width())));
+        return s;
+    }
+
+protected:
+    void paintEvent(QPaintEvent *) override
+    {
+        const qreal dpr = devicePixelRatioF();
+        const QSize px = size() * dpr;
+        if (m_scaled.size() != px) {
+            m_scaled = QPixmap::fromImage(m_image.scaled(px, Qt::IgnoreAspectRatio, Qt::SmoothTransformation));
+            m_scaled.setDevicePixelRatio(dpr);
+        }
+        QPainter(this).drawPixmap(0, 0, m_scaled);
+    }
+    void contextMenuEvent(QContextMenuEvent *e) override
+    {
+        if (menu)
+            menu(e->globalPos());
+    }
+    void mousePressEvent(QMouseEvent *e) override
+    {
+        if (e->button() == Qt::LeftButton && clicked)
+            clicked();
+        e->accept();
+    }
+
+private:
+    QString m_file;
+    QImage m_image;
+    QSize m_natural, m_wanted;
+    QPixmap m_scaled;
+};
 
 int readableMargin(int available, int maxWidth, int minMargin)
 {
@@ -163,6 +257,28 @@ void Editor::paintEvent(QPaintEvent *e)
             if (state > 0 && (state & (BlockState::InFence | BlockState::FenceLine)))
                 p.fillRect(QRectF(0, r.top(), viewport()->width(), r.height()), m_codeBg);
         }
+        p.setRenderHint(QPainter::Antialiasing);
+        p.setPen(Qt::NoPen);
+        const bool dark = palette().color(QPalette::Base).lightness() < 128;
+        const double left = document()->documentMargin();
+        for (QTextBlock b = m_live ? firstVisibleBlock() : QTextBlock(); b.isValid();) {
+            const QRectF r = blockBoundingGeometry(b).translated(offset);
+            if (r.top() > viewport()->height())
+                break;
+            const auto [first, last] = calloutAt(b);
+            if (!first.isValid()) {
+                b = b.next();
+                continue;
+            }
+            if (m_highlighter->hidesMarkup(first.blockNumber())) {
+                const double top = blockBoundingGeometry(first).translated(offset).top() - 2;
+                const double bottom = blockBoundingGeometry(last).translated(offset).bottom() + 2;
+                const QColor color(calloutStyle(calloutHeadRe().match(first.text()).captured(1)).color);
+                p.setBrush(mix(palette().color(QPalette::Base), color, dark ? 0.14 : 0.09));
+                p.drawRoundedRect(QRectF(left, top, viewport()->width() - 2 * left, bottom - top), 6, 6);
+            }
+            b = last.next();
+        }
     }
     QPlainTextEdit::paintEvent(e);
     if (!m_live)
@@ -179,6 +295,8 @@ void Editor::paintEvent(QPaintEvent *e)
             break;
         if (!previewed(b))
             continue;
+        if (b.userState() > 0 && (b.userState() & BlockState::Callout))
+            paintCalloutHead(p, b);
         for (const Deco &d : decorations(b)) {
             switch (d.kind) {
             case Deco::Quote:
@@ -234,7 +352,14 @@ void Editor::updateRawBlocks()
     const QTextCursor c = textCursor();
     const QTextBlock first = document()->findBlock(c.selectionStart());
     const QTextBlock last = document()->findBlock(c.selectionEnd());
-    const int from = first.blockNumber(), to = last.blockNumber();
+    int from = first.blockNumber(), to = last.blockNumber();
+    // A callout shows its source as a whole while the cursor is in it.
+    if (m_live) {
+        if (const QTextBlock head = calloutAt(first).first; head.isValid())
+            from = head.blockNumber();
+        if (const QTextBlock end = calloutAt(last).second; end.isValid())
+            to = end.blockNumber();
+    }
     const int colFrom = c.selectionStart() - first.position(), colTo = c.selectionEnd() - last.position();
     if (from == m_rawFrom && to == m_rawTo && colFrom == m_colFrom && colTo == m_colTo)
         return;
@@ -308,8 +433,9 @@ QList<Editor::Deco> Editor::decorations(const QTextBlock &block) const
         return out;
     }
     int from = 0;
+    const bool callout = block.userState() > 0 && (block.userState() & BlockState::Callout);
     if (const auto m = quote.match(text); m.hasMatch()) {
-        for (int i = int(m.capturedStart(1)); i < m.capturedEnd(1); ++i)
+        for (int i = int(m.capturedStart(1)); i < m.capturedEnd(1) && !callout; ++i)
             if (text[i] == u'>')
                 out.append({Deco::Quote, QRectF(chars(i, 1).left() + 1, r.top(), 3, r.height())});
         from = int(m.capturedEnd(1));
@@ -360,9 +486,12 @@ void Editor::keyPressEvent(QKeyEvent *e)
     case Qt::Key_Left:
     case Qt::Key_Right:
     case Qt::Key_PageUp:
-    case Qt::Key_PageDown: {
+    case Qt::Key_PageDown:
+    case Qt::Key_Home:
+    case Qt::Key_End: {
         m_navKey = true;
-        m_navUp = e->key() == Qt::Key_Up || e->key() == Qt::Key_Left || e->key() == Qt::Key_PageUp;
+        m_navUp = e->key() == Qt::Key_Up || e->key() == Qt::Key_Left || e->key() == Qt::Key_PageUp
+                  || e->key() == Qt::Key_Home;
         QPlainTextEdit::keyPressEvent(e);
         m_navKey = false;
         return;
@@ -737,10 +866,7 @@ void Editor::scanTables()
         return;
     m_tableBusy = true;
 
-    auto fenced = [](const QTextBlock &b) {
-        const int st = b.userState();
-        return st > 0 && (st & (BlockState::InFence | BlockState::Frontmatter));
-    };
+    const auto fenced = fencedOrFrontmatter;
     // Table boundaries follow md4c so the editor agrees with the reading view.
     static const QRegularExpression heading(u"^ {0,3}#{1,6}(\\s|$)"_s);
     static const QRegularExpression rule(u"^ {0,3}([-*_])( *\\1){2,} *$"_s);
@@ -844,6 +970,9 @@ void Editor::scanTables()
         t.overlay->setTable(rows, delims);
     }
 
+    scanProperties(covered);
+    scanImages(covered);
+
     for (QTextBlock b = document()->begin(); b.isValid(); b = b.next()) {
         if (covered.contains(b.blockNumber()))
             continue;
@@ -892,12 +1021,26 @@ void Editor::setLineHeight(const QTextBlock &block, int height)
 
 void Editor::layoutTables()
 {
-    if (m_tableBusy || m_tables.isEmpty())
+    if (m_tableBusy || (m_tables.isEmpty() && m_images.isEmpty() && !m_propLines))
         return;
     m_tableBusy = true;
     const int margin = int(document()->documentMargin());
     const int width = viewport()->width() - 2 * margin;
     auto *layout = document()->documentLayout();
+    if (m_propLines) {
+        for (QTextBlock b = document()->firstBlock().next(); b.isValid() && b.blockNumber() < m_propLines; b = b.next()) {
+            if (b.isVisible()) {
+                b.setVisible(false);
+                document()->markContentsDirty(b.position(), b.length());
+            }
+        }
+        setLineHeight(document()->firstBlock(), m_props->heightFor(width));
+        m_propsHeight = int(layout->blockBoundingRect(document()->firstBlock()).height());
+    }
+    for (Image &im : m_images) {
+        setLineHeight(im.block, im.widget->sizeFor(width).height() + 8);
+        im.height = int(layout->blockBoundingRect(im.block).height());
+    }
     for (Table &t : m_tables) {
         const QList<int> want = t.overlay->layoutFor(width);
         const QTextBlock delimiter = t.head.next();
@@ -931,6 +1074,19 @@ void Editor::positionTables()
         t.overlay->setGeometry(margin, int(r.top()), width, t.height);
         t.overlay->show();
     }
+    for (const Image &im : std::as_const(m_images)) {
+        const QRectF r = blockBoundingGeometry(im.block).translated(offset);
+        const QSize size = im.widget->sizeFor(width);
+        im.widget->setGeometry(margin, int(r.top()) + (im.height - size.height()) / 2, size.width(), size.height());
+        im.widget->show();
+    }
+    if (m_props && m_propLines) {
+        const QRectF r = blockBoundingGeometry(document()->firstBlock()).translated(offset);
+        m_props->setGeometry(margin, int(r.top()), width, m_propsHeight);
+        m_props->show();
+    } else if (m_props) {
+        m_props->hide();
+    }
 }
 
 void Editor::moveCursorQuietly(const QTextCursor &cursor)
@@ -947,6 +1103,36 @@ void Editor::onCursorMoved()
         return;
     const QTextCursor c = textCursor();
     const int n = c.block().blockNumber();
+    bool rescan = false;
+    if (m_rawImage.isValid() && c.block() != m_rawImage) {
+        m_rawImage = QTextBlock();
+        rescan = true;
+    }
+    if (m_rawProps && n > frontmatterEnd()) {
+        m_rawProps = false;
+        m_typedBlock = -1;
+        rescan = true;
+    }
+    if (n < m_propLines) {
+        if (m_navKey && !c.hasSelection()) {
+            m_props->focusRow(m_navUp);
+        } else {
+            m_rawProps = true;
+            scanTables();
+            ensureCursorVisible();
+        }
+        return;
+    }
+    for (const Image &im : std::as_const(m_images)) {
+        if (im.block == c.block()) {
+            m_rawImage = im.block;
+            scanTables();
+            ensureCursorVisible();
+            return;
+        }
+    }
+    if (rescan)
+        m_tableTimer.start();
     if (m_rawTable.isValid()) {
         const int first = m_rawTable.blockNumber();
         if (n < first || n >= first + m_rawLines) {
@@ -1174,7 +1360,7 @@ void Editor::commitTables()
 }
 
 void Editor::setCommands(std::function<QAction *(const QString &)> command,
-                         std::function<void(QMenu *, const QString &)> fileActions)
+                         std::function<void(QMenu *, const QString &, bool)> fileActions)
 {
     m_command = std::move(command);
     m_fileActions = std::move(fileActions);
@@ -1268,7 +1454,7 @@ void Editor::contextMenuEvent(QContextMenuEvent *e)
         const QString target = QUrl::fromPercentEncoding(href.mid(5).toUtf8()).section(u'#', 0, 0);
         if (const QString path = m_vault->resolve(target, m_notePath); !path.isEmpty()) {
             menu.addSeparator();
-            m_fileActions(&menu, path);
+            m_fileActions(&menu, path, false);
         }
     }
     menu.exec(e->globalPos());
@@ -1520,9 +1706,22 @@ void Editor::deleteParagraph()
     setTextCursor(c);
 }
 
-// Ctrl+; adds a line to the frontmatter (creating it), with the name selected for typing.
+// Ctrl+; adds a row to the properties panel, or in source mode a frontmatter line with the name selected.
 void Editor::addProperty()
 {
+    if (m_live) {
+        if (frontmatterEnd() < 0) {
+            m_tableBusy = true;
+            QTextCursor(document()).insertText(u"---\n---\n"_s);
+            m_tableBusy = false;
+        }
+        m_rawProps = false;
+        scanTables();
+        if (m_propLines) {
+            m_props->addProperty();
+            return;
+        }
+    }
     const QString name = tr("property");
     QTextCursor c(document());
     int lineStart = -1;
@@ -1545,4 +1744,248 @@ void Editor::addProperty()
     c.setPosition(lineStart + int(name.size()), QTextCursor::KeepAnchor);
     setTextCursor(c);
     setFocus();
+}
+
+// Block number of the closing "---", or -1 when the note has no frontmatter.
+int Editor::frontmatterEnd() const
+{
+    const QTextBlock first = document()->firstBlock();
+    if (first.text() != u"---")
+        return -1;
+    for (QTextBlock b = first.next(); b.isValid(); b = b.next())
+        if (b.text() == u"---" || b.text() == u"...")
+            return b.blockNumber();
+    return -1;
+}
+
+void Editor::scanProperties(QSet<int> &covered)
+{
+    const int end = m_live ? frontmatterEnd() : -1;
+    const int cursor = textCursor().blockNumber();
+    if (end > 0 && cursor <= end && m_typedBlock >= 0 && m_typedBlock <= end)
+        m_rawProps = true; // the frontmatter is being typed as text
+    if (end < 0 || m_rawProps) {
+        m_propLines = 0;
+        if (m_props)
+            m_props->hide();
+        return;
+    }
+    if (!m_props) {
+        m_props = new PropertiesPanel(viewport());
+        connect(m_props, &PropertiesPanel::changed, this, [this](const QStringList &lines) {
+            // Leave the panel's signal handler before the document changes under it.
+            QTimer::singleShot(0, this, [this, lines] { writeFrontmatter(lines); });
+        });
+        connect(m_props, &PropertiesPanel::leave, this, &Editor::leaveProperties);
+        connect(m_props, &PropertiesPanel::editSource, this, &Editor::showPropertiesSource);
+        connect(m_props, &PropertiesPanel::heightChanged, this, &Editor::layoutTables);
+    }
+    m_propLines = end + 1;
+    QStringList lines;
+    for (QTextBlock b = document()->firstBlock(); b.isValid() && b.blockNumber() <= end; b = b.next()) {
+        covered.insert(b.blockNumber());
+        if (b.blockNumber() > 0 && b.blockNumber() < end)
+            lines << b.text();
+    }
+    m_props->setSource(lines);
+    if (cursor <= end && !m_props->isAncestorOf(QApplication::focusWidget())) {
+        const QTextBlock body = document()->findBlockByNumber(end + 1);
+        QTextCursor c(document());
+        c.setPosition(body.isValid() ? body.position() : document()->lastBlock().position()
+                                                             + document()->lastBlock().length() - 1);
+        moveCursorQuietly(c);
+    }
+}
+
+void Editor::writeFrontmatter(const QStringList &lines)
+{
+    const int end = frontmatterEnd();
+    if (end < 0)
+        return;
+    QStringList old;
+    for (QTextBlock b = document()->firstBlock().next(); b.blockNumber() < end; b = b.next())
+        old << b.text();
+    if (old == lines && !lines.isEmpty())
+        return;
+    m_tableBusy = true;
+    QTextCursor c(document());
+    c.beginEditBlock();
+    if (lines.isEmpty()) {
+        const QTextBlock close = document()->findBlockByNumber(end);
+        c.setPosition(0);
+        c.setPosition(qMin(close.position() + close.length(), document()->characterCount() - 1), QTextCursor::KeepAnchor);
+        c.removeSelectedText();
+    } else {
+        // Only the lines that differ are replaced, so undo stays small.
+        qsizetype p = 0;
+        while (p < old.size() && p < lines.size() && old[p] == lines[p])
+            ++p;
+        qsizetype s = 0;
+        while (s < old.size() - p && s < lines.size() - p && old[old.size() - 1 - s] == lines[lines.size() - 1 - s])
+            ++s;
+        const QTextBlock from = document()->findBlockByNumber(int(1 + p));
+        const QTextBlock to = document()->findBlockByNumber(int(1 + old.size() - s));
+        c.setPosition(from.position());
+        c.setPosition(to.position(), QTextCursor::KeepAnchor);
+        const QStringList mid = lines.mid(p, lines.size() - p - s);
+        c.insertText(mid.isEmpty() ? QString() : mid.join(u'\n') + u'\n');
+    }
+    c.endEditBlock();
+    m_tableBusy = false;
+    scanTables();
+}
+
+void Editor::leaveProperties()
+{
+    QTextBlock body = document()->findBlockByNumber(m_propLines);
+    if (!body.isValid()) {
+        QTextCursor c(document());
+        c.movePosition(QTextCursor::End);
+        m_tableBusy = true;
+        c.insertText(u"\n"_s);
+        m_tableBusy = false;
+        body = document()->lastBlock();
+    }
+    moveCursorQuietly(QTextCursor(body));
+    setFocus();
+    ensureCursorVisible();
+}
+
+void Editor::showPropertiesSource()
+{
+    m_rawProps = true;
+    scanTables();
+    moveCursorQuietly(QTextCursor(document()->firstBlock().next()));
+    setFocus();
+    ensureCursorVisible();
+}
+
+void Editor::scanImages(QSet<int> &covered)
+{
+    static const QRegularExpression wiki(u"^\\s*!\\[\\[([^\\[\\]|#\\n]+)(?:#[^\\[\\]|\\n]*)?(?:\\|([^\\[\\]\\n]*))?\\]\\]\\s*$"_s);
+    static const QRegularExpression md(u"^\\s*!\\[([^\\]\\n]*)\\]\\(<?([^)<>\\n]+?)>?(?:\\s+\"[^\"]*\")?\\)\\s*$"_s);
+    static const QRegularExpression size(u"^\\s*(\\d+)(?:x(\\d+))?\\s*$"_s);
+    QList<Image> old = std::exchange(m_images, {});
+    for (QTextBlock b = m_live && m_vault ? document()->begin() : QTextBlock(); b.isValid(); b = b.next()) {
+        const QString text = b.text();
+        if (!text.contains(u"!["_s) || covered.contains(b.blockNumber()) || fencedOrFrontmatter(b) || b == m_rawImage)
+            continue;
+        QString path, spec;
+        if (const auto m = wiki.match(text); m.hasMatch()) {
+            path = m_vault->resolve(m.captured(1).trimmed(), m_notePath);
+            spec = m.captured(2);
+        } else if (const auto m = md.match(text); m.hasMatch()) {
+            const QString src = m.captured(2).trimmed();
+            const QUrl url(src);
+            if (!url.scheme().isEmpty() && !url.isLocalFile())
+                continue;
+            const QString target = url.isLocalFile() ? url.toLocalFile() : QUrl::fromPercentEncoding(src.toUtf8());
+            path = m_vault->resolve(target, m_notePath);
+            if (path.isEmpty()) {
+                const QString abs = QFileInfo(m_vault->absolutePath(m_notePath)).dir().absoluteFilePath(target);
+                if (QFileInfo(abs).isFile())
+                    path = m_vault->relativePath(QDir::cleanPath(abs));
+            }
+            spec = m.captured(1).section(u'|', -1);
+        }
+        if (path.isEmpty() || !Vault::isImage(path))
+            continue;
+        const QString abs = m_vault->absolutePath(path);
+        if (!QFileInfo(abs).isFile())
+            continue;
+        ImageBlock *w = nullptr;
+        for (int i = 0; i < old.size() && !w; ++i)
+            if (old[i].widget->path == path)
+                w = old.takeAt(i).widget;
+        if (!w && !old.isEmpty())
+            w = old.takeFirst().widget;
+        if (!w) {
+            w = new ImageBlock(viewport());
+            w->menu = [this, w](const QPoint &pos) { showImageMenu(w->path, pos); };
+            w->clicked = [this, w] {
+                for (const Image &im : std::as_const(m_images)) {
+                    if (im.widget == w) {
+                        QTextCursor c(im.block);
+                        c.movePosition(QTextCursor::EndOfBlock);
+                        setTextCursor(c);
+                        setFocus();
+                        return;
+                    }
+                }
+            };
+        }
+        const auto sm = size.match(spec);
+        w->path = path;
+        w->setImage(abs, sm.hasMatch() ? QSize(sm.captured(1).toInt(), sm.captured(2).toInt()) : QSize());
+        if (w->isNull()) {
+            old << Image{{}, 0, w};
+            continue;
+        }
+        m_images.append({b, 0, w});
+        covered.insert(b.blockNumber());
+    }
+    for (const Image &im : std::as_const(old)) {
+        im.widget->hide();
+        im.widget->deleteLater();
+    }
+}
+
+void Editor::showImageMenu(const QString &path, const QPoint &globalPos)
+{
+    if (!m_vault)
+        return;
+    const QString abs = m_vault->absolutePath(path);
+    QMenu menu(this);
+    menu.addAction(tr("Copy image"), this, [abs] { QApplication::clipboard()->setImage(QImage(abs)); });
+    menu.addAction(tr("Open in new tab"), this, [this, path] { Q_EMIT linkActivated(wikiHref(path), true); });
+    if (m_fileActions) {
+        menu.addSeparator();
+        m_fileActions(&menu, path, true);
+    }
+    menu.exec(globalPos);
+}
+
+// First and last line of the callout around `block`, both invalid outside one.
+QPair<QTextBlock, QTextBlock> Editor::calloutAt(const QTextBlock &block) const
+{
+    auto in = [](const QTextBlock &b) { return b.isValid() && b.userState() > 0 && (b.userState() & BlockState::Callout); };
+    auto head = [](const QTextBlock &b) { return calloutHeadRe().match(b.text()).hasMatch(); };
+    if (!in(block))
+        return {};
+    QTextBlock first = block;
+    while (!head(first) && in(first.previous()))
+        first = first.previous();
+    QTextBlock last = block;
+    while (in(last.next()) && !head(last.next()))
+        last = last.next();
+    return {first, last};
+}
+
+void Editor::paintCalloutHead(QPainter &p, const QTextBlock &block)
+{
+    const auto m = calloutHeadRe().match(block.text());
+    QTextLayout *layout = block.layout();
+    if (!m.hasMatch() || !layout || layout->lineCount() == 0)
+        return;
+    const QTextLine line = layout->lineAt(0);
+    const QRectF r = blockBoundingGeometry(block).translated(contentOffset());
+    const int at = int(block.text().indexOf(u"[!"_s));
+    const double x = r.left() + line.cursorToX(at);
+    const QRectF lineRect(r.left(), r.top() + line.y(), r.width(), line.height());
+    const CalloutStyle style = calloutStyle(m.captured(1));
+    const int side = qRound(qMin(lineRect.height() * 0.8, QFontMetricsF(font()).height() * 1.05));
+    const qreal dpr = devicePixelRatioF();
+    const QString key = style.icon + style.color + QString::number(side) + u'@' + QString::number(dpr);
+    if (!m_icons.contains(key))
+        m_icons.insert(key, Theme::image(style.icon, QColor(style.color), side, dpr));
+    p.drawImage(QPointF(x - side - QFontMetricsF(font()).height() * 0.35, lineRect.center().y() - side / 2.0), m_icons[key]);
+    if (!m.captured(2).trimmed().isEmpty())
+        return;
+    const QString type = m.captured(1);
+    QFont bold = font();
+    bold.setBold(true);
+    p.setFont(bold);
+    p.setPen(QColor(style.color));
+    p.drawText(QRectF(x, lineRect.top(), r.width() - x, lineRect.height()), Qt::AlignLeft | Qt::AlignVCenter,
+               type.left(1).toUpper() + type.mid(1).toLower());
 }

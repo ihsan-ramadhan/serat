@@ -18,6 +18,13 @@ Built with Qt 6 and C++20. Runs on Linux, Windows and macOS.
   Tab and Shift+Tab indent
 - Format, Paragraph (lists, headings, quote) and Insert (table, callout, rule, code
   block) commands in the menu bar, the right-click menu and the command palette
+- Properties: the frontmatter shows as rows you edit in place, with a type per property
+  (text, list, number, checkbox, date, date and time), tags and aliases as removable
+  pills, and Ctrl+; to add one. Unchanged lines are written back as they were, and YAML
+  the panel cannot edit safely stays read-only; right-click > Edit source opens the text.
+- Callouts show as coloured boxes with their icon and title; images (`![[x.png|200]]`,
+  `![](path)`) show in place. Moving the cursor into either reveals the Markdown.
+  Right-click an image to copy, open, rename, move or delete it.
 - Find and replace in the note
 - Paste a screenshot and it is saved into the vault as `Pasted image <timestamp>.png`
 - A new note you leave without a name or any text is removed instead of piling up as
@@ -32,7 +39,7 @@ Built with Qt 6 and C++20. Runs on Linux, Windows and macOS.
 
 **Reading**
 - Reading view with tables, nested and task lists, callouts, code blocks with a copy
-  button, frontmatter, and embedded images and notes (`![[x.png]]`, `![[note#Heading]]`)
+  button, properties, and embedded images and notes (`![[x.png]]`, `![[note#Heading]]`)
 - Click a checkbox in the reading view to tick it in the file
 
 **Links and navigation**
@@ -41,7 +48,8 @@ Built with Qt 6 and C++20. Runs on Linux, Windows and macOS.
 - Command palette with every command and its shortcut
 - Vault-wide search (`"exact phrase"`, `path:folder`) and a quick switcher
 - File tree toolbar: new note or folder, sort by name, modified or created time,
-  auto-reveal the open note, collapse or expand all
+  auto-reveal the open note, collapse or expand all; open folders stay open the next time
+  the vault is opened
 - Tabs with their own back and forward history, restored on the next start
 - Right-click a file, folder, tab or panel entry to copy its path or a link to it, make a
   copy, move it, search inside a folder, or open it in another app; the ⋮ button on a
@@ -53,7 +61,7 @@ Built with Qt 6 and C++20. Runs on Linux, Windows and macOS.
 **Look**
 - Light and dark theme that follows the system, or set it under View > Theme
 
-Not yet: graph view, tags pane, properties editor.
+Not yet: graph view, tags pane.
 
 ## Shortcuts
 

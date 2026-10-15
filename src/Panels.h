@@ -23,6 +23,9 @@ public:
     void setSort(Sort sort);
     Sort sortOrder() const;
     bool anyExpanded() const;
+    // Vault-relative folders shown open, including ones inside a collapsed parent.
+    QStringList expandedFolders() const;
+    void setExpandedFolders(const QStringList &folders);
 
 Q_SIGNALS:
     void openRequested(const QString &path, bool newTab);
@@ -50,6 +53,7 @@ private:
     QFileSystemModel *m_fs;
     QSortFilterProxyModel *m_proxy;
     QString m_pendingReveal;
+    QStringList m_pendingExpand; // waiting for QFileSystemModel to load their parents
 };
 
 class SearchPanel : public QWidget

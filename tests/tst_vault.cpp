@@ -1,3 +1,4 @@
+#include "Frontmatter.h"
 #include "Markdown.h"
 #include "Vault.h"
 
@@ -156,6 +157,65 @@ private Q_SLOTS:
     void headingAnchorsIgnoreMarkup()
     {
         QCOMPARE(headingAnchor(u"**Sumber** per tabel (tahap lanjutan)"_s), headingAnchor(u"Sumber per tabel (tahap lanjutan)"_s));
+    }
+
+    void frontmatterParse()
+    {
+        using namespace Frontmatter;
+        const QStringList src = {u"title: \"A: b\""_s, u"tags: [x, \"y z\"]"_s, u"# note"_s, u"done: TRUE"_s, u"n: 3"_s,
+                                 u"when: 2024-01-02"_s, u"nested:"_s, u"  a: 1"_s, u"list:"_s, u"- one"_s, u"- 'it''s'"_s,
+                                 u"text: plain # comment"_s, u"block: |"_s, u"  line"_s, u"empty:"_s};
+        const QList<Property> ps = parse(src);
+        QStringList keys, joined;
+        for (const Property &p : ps) {
+            keys << p.key;
+            joined += p.lines;
+        }
+        QCOMPARE(keys, QStringList({u"title"_s, u"tags"_s, QString(), u"done"_s, u"n"_s, u"when"_s, u"nested"_s, u"list"_s,
+                                    u"text"_s, u"block"_s, u"empty"_s}));
+        QCOMPARE(joined, src);
+        QCOMPARE(ps[0].value, u"A: b"_s);
+        QVERIFY(ps[0].type == Type::Text);
+        QCOMPARE(ps[1].items, QStringList({u"x"_s, u"y z"_s}));
+        QVERIFY(ps[3].type == Type::Checkbox && ps[3].value == u"true");
+        QVERIFY(ps[4].type == Type::Number);
+        QVERIFY(ps[5].type == Type::Date);
+        QVERIFY(ps[6].type == Type::Raw);
+        QVERIFY(ps[7].type == Type::List);
+        QCOMPARE(ps[7].items, QStringList({u"one"_s, u"it's"_s}));
+        QCOMPARE(ps[8].value, u"plain"_s);
+        QVERIFY(ps[9].type == Type::Raw);
+        QVERIFY(ps[10].type == Type::Text && ps[10].value.isEmpty());
+        QVERIFY(parse({u"tags: a, b"_s})[0].items == QStringList({u"a"_s, u"b"_s}));
+    }
+
+    void frontmatterSerialize()
+    {
+        using namespace Frontmatter;
+        Property p;
+        p.key = u"k"_s;
+        for (const QString &v : {u"123"_s, u"true"_s, u"A: b"_s, u"#x"_s, u" padded"_s, u"plain words"_s, u"say \"hi\""_s}) {
+            p.value = v;
+            const QList<Property> back = parse(serialize(p));
+            QCOMPARE(back.size(), 1);
+            QCOMPARE(back[0].value, v);
+            QVERIFY(back[0].type == Type::Text);
+        }
+        QCOMPARE(serialize(p).value(0), u"k: say \"hi\""_s);
+        p.value.clear();
+        QCOMPARE(serialize(p), QStringList{u"k:"_s});
+        Property list;
+        list.key = u"tags"_s;
+        list.type = Type::List;
+        list.items = {u"a"_s, u"b c"_s, u"2024"_s};
+        list.lines = {u"tags:"_s, u"- old"_s};
+        QCOMPARE(serialize(list), QStringList({u"tags:"_s, u"- a"_s, u"- b c"_s, u"- \"2024\""_s}));
+        QCOMPARE(parse(serialize(list))[0].items, list.items);
+        Property box;
+        box.key = u"done"_s;
+        box.type = Type::Checkbox;
+        box.value = u"true"_s;
+        QCOMPARE(serialize(box), QStringList{u"done: true"_s});
     }
 };
 
