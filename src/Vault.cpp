@@ -366,8 +366,19 @@ QList<QPair<QString, Link>> Vault::backlinks(const QString &path) const
 QList<SearchHit> Vault::search(const QString &query, int limit) const
 {
     QList<SearchHit> hits;
-    const QStringList terms = query.toLower().split(QRegularExpression(u"\\s+"_s), Qt::SkipEmptyParts);
-    if (terms.isEmpty())
+    // Words, "quoted phrases" and path:folder (also path:"a folder") narrowing the files.
+    static const QRegularExpression token(u"(path:)?(?:\"([^\"]*)\"|(\\S+))"_s, QRegularExpression::CaseInsensitiveOption);
+    QStringList terms;
+    QString pathFilter;
+    for (auto it = token.globalMatch(query); it.hasNext();) {
+        const auto m = it.next();
+        const QString value = (m.capturedLength(2) || m.captured(0).endsWith(u'"') ? m.captured(2) : m.captured(3)).toLower();
+        if (m.capturedLength(1))
+            pathFilter = value;
+        else if (!value.isEmpty())
+            terms << value;
+    }
+    if (terms.isEmpty() && pathFilter.isEmpty())
         return hits;
 
     for (const QString &f : m_files) {
@@ -376,6 +387,12 @@ QList<SearchHit> Vault::search(const QString &query, int limit) const
             continue;
         const QString lowerText = n->text.toLower();
         const QString lowerPath = f.toLower();
+        if (!pathFilter.isEmpty() && !lowerPath.contains(pathFilter))
+            continue;
+        if (terms.isEmpty()) {
+            hits.append({f, -1, {}});
+            continue;
+        }
         const bool all = std::all_of(terms.cbegin(), terms.cend(), [&](const QString &t) {
             return lowerText.contains(t) || lowerPath.contains(t);
         });

@@ -19,6 +19,11 @@ public:
     void setVault(Vault *vault);
     void reveal(const QString &path);
 
+    enum class Sort { NameAsc, NameDesc, ModifiedNew, ModifiedOld, CreatedNew, CreatedOld };
+    void setSort(Sort sort);
+    Sort sortOrder() const;
+    bool anyExpanded() const;
+
 Q_SIGNALS:
     void openRequested(const QString &path, bool newTab);
     void newNoteRequested(const QString &dir);
@@ -28,6 +33,7 @@ Q_SIGNALS:
     void moveRequested(const QString &from, const QString &toDir);
     void moveToRequested(const QString &path);
     void duplicateRequested(const QString &path);
+    void searchInFolderRequested(const QString &path);
 
 protected:
     void drawBranches(QPainter *painter, const QRect &rect, const QModelIndex &index) const override;

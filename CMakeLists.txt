@@ -39,6 +39,7 @@ qt_add_executable(serat
     src/NoteView.cpp src/NoteView.h
     src/Panels.cpp src/Panels.h
     src/QuickSwitcher.cpp src/QuickSwitcher.h
+    src/CommandPalette.cpp src/CommandPalette.h
     src/MainWindow.cpp src/MainWindow.h
 )
 file(GLOB serat_icons RELATIVE ${CMAKE_CURRENT_SOURCE_DIR} CONFIGURE_DEPENDS data/icons/*.svg)

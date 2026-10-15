@@ -1,5 +1,7 @@
 #include "MainWindow.h"
 
+#include "CommandPalette.h"
+#include "Editor.h"
 #include "NoteView.h"
 #include "Panels.h"
 #include "PathActions.h"
@@ -9,6 +11,7 @@
 
 #include <QActionGroup>
 #include <QApplication>
+#include <QClipboard>
 #include <QCloseEvent>
 #include <QCryptographicHash>
 #include <QDesktopServices>
@@ -136,6 +139,7 @@ MainWindow::MainWindow(QWidget *parent)
 
     QSettings s;
     m_fontDelta = s.value(u"fontDelta"_s, 0.0).toDouble();
+    m_recentCommands = s.value(u"recentCommands"_s).toStringList();
     if (!restoreGeometry(s.value(u"geometry"_s).toByteArray()))
         resize(1280, 820);
     m_split->restoreState(s.value(u"splitter"_s).toByteArray());
@@ -163,7 +167,7 @@ void MainWindow::buildUi()
         }
         return w;
     };
-    m_left = panelTabs({{m_tree, u"folder", tr("Files")}, {m_search, u"search", tr("Search (Ctrl+Shift+F)")}});
+    m_left = panelTabs({{buildFilesPage(), u"folder", tr("Files")}, {m_search, u"search", tr("Search (Ctrl+Shift+F)")}});
 
     m_tabs = new QTabWidget;
     m_tabs->setDocumentMode(true);
@@ -263,6 +267,7 @@ void MainWindow::buildUi()
     connect(m_tree, &FileTree::moveRequested, this, &MainWindow::movePath);
     connect(m_tree, &FileTree::moveToRequested, this, &MainWindow::chooseFolderAndMove);
     connect(m_tree, &FileTree::duplicateRequested, this, &MainWindow::duplicatePath);
+    connect(m_tree, &FileTree::searchInFolderRequested, this, [this](const QString &dir) { searchVault(u"path:\""_s + dir + u"/\" "_s); });
     connect(m_search, &SearchPanel::openRequested, this,
             [this](const QString &p, int line, bool newTab) { openPath(p, newTab, {}, line); });
     connect(m_backlinks, &BacklinksPanel::openRequested, this,
@@ -278,7 +283,8 @@ void MainWindow::buildUi()
 
 void MainWindow::buildActions()
 {
-    auto add = [this](QMenu *menu, const QString &text, const QKeySequence &key, auto fn, bool needsVault = true) {
+    auto add = [this](QMenu *menu, const QString &id, const QString &text, const QKeySequence &key, auto fn,
+                      bool needsVault = true) {
         QAction *a = menu->addAction(text);
         if (!key.isEmpty())
             a->setShortcut(key);
@@ -286,6 +292,7 @@ void MainWindow::buildActions()
         addAction(a);
         if (needsVault)
             m_vaultActions << a;
+        m_commands.insert(id, a);
         return a;
     };
     auto withView = [this](auto fn) {
@@ -294,36 +301,133 @@ void MainWindow::buildActions()
                 fn(v);
         };
     };
+    // Editing commands act on the note's text, not on a table cell, the title or the find bar.
+    auto withEditor = [this](auto fn) {
+        return [this, fn] {
+            NoteView *v = currentView();
+            if (!v || !v->isNote() || v->mode() == NoteView::Read)
+                return;
+            QWidget *focus = QApplication::focusWidget();
+            if (focus && focus != v->editor() && v->isAncestorOf(focus))
+                return;
+            v->editor()->setFocus();
+            fn(v->editor());
+        };
+    };
 
     QMenu *file = menuBar()->addMenu(tr("&File"));
-    add(file, tr("New note"), QKeySequence::New, [this] { newNote({}); });
-    add(file, tr("New folder…"), {}, [this] { newFolder({}); });
+    add(file, u"file.new"_s, tr("New note"), QKeySequence::New, [this] { newNote({}); });
+    add(file, u"file.newFolder"_s, tr("New folder…"), {}, [this] { newFolder({}); });
     file->addSeparator();
-    add(file, tr("Open vault…"), QKeySequence(u"Ctrl+Shift+O"_s), [this] {
+    add(file, u"vault.open"_s, tr("Open vault…"), QKeySequence(u"Ctrl+Shift+O"_s), [this] {
         const QString dir = QFileDialog::getExistingDirectory(this, tr("Open folder as vault"),
                                                               m_vault ? m_vault->root() : QDir::homePath());
         if (!dir.isEmpty())
             openVault(dir);
     }, false);
-    add(file, tr("Close vault"), {}, [this] { showWelcome(); });
+    add(file, u"vault.close"_s, tr("Close vault"), {}, [this] { showWelcome(); });
     file->addSeparator();
-    add(file, tr("Save"), QKeySequence::Save, [this] { saveAll(); });
-    add(file, tr("Close tab"), QKeySequence(u"Ctrl+W"_s), [this] {
+    add(file, u"file.copy"_s, tr("Make a copy of the current file"), {}, withView([this](NoteView *v) { duplicatePath(v->path()); }));
+    add(file, u"file.move"_s, tr("Move current file to another folder…"), {},
+        withView([this](NoteView *v) { chooseFolderAndMove(v->path()); }));
+    QMenu *copyPath = file->addMenu(tr("Copy current file path"));
+    auto copy = [this, withView](auto text) {
+        return withView([this, text](NoteView *v) { QApplication::clipboard()->setText(text(*m_vault, v->path())); });
+    };
+    add(copyPath, u"copy.obsidian"_s, tr("as Obsidian URL"), {},
+        copy([](const Vault &vault, const QString &p) { return PathActions::obsidianUrl(vault, p).toString(QUrl::FullyEncoded); }));
+    add(copyPath, u"copy.serat"_s, tr("as Serat link"), {},
+        copy([](const Vault &vault, const QString &p) { return PathActions::seratUrl(vault, p).toString(QUrl::FullyEncoded); }));
+    add(copyPath, u"copy.vault"_s, tr("from vault folder"), {}, copy([](const Vault &, const QString &p) { return p; }));
+    add(copyPath, u"copy.root"_s, tr("from system root"), {},
+        copy([](const Vault &vault, const QString &p) { return QDir::toNativeSeparators(vault.absolutePath(p)); }));
+    add(file, u"file.defaultApp"_s, tr("Open in default app"), {},
+        withView([this](NoteView *v) { QDesktopServices::openUrl(QUrl::fromLocalFile(m_vault->absolutePath(v->path()))); }));
+    add(file, u"file.explorer"_s, tr("Show in system explorer"), {}, withView([this](NoteView *v) {
+        QDesktopServices::openUrl(QUrl::fromLocalFile(QFileInfo(m_vault->absolutePath(v->path())).absolutePath()));
+    }));
+    add(file, u"file.reveal"_s, tr("Reveal current file in navigation"), {}, withView([this](NoteView *v) { revealInTree(v->path()); }));
+    add(file, u"file.delete"_s, tr("Delete current file"), {}, withView([this](NoteView *v) { deletePath(v->path()); }));
+    file->addSeparator();
+    add(file, u"file.save"_s, tr("Save"), QKeySequence::Save, [this] { saveAll(); });
+    add(file, u"tab.close"_s, tr("Close tab"), QKeySequence(u"Ctrl+W"_s), [this] {
         if (m_tabs->count())
             closeTab(m_tabs->currentIndex());
     });
     file->addSeparator();
-    add(file, tr("Quit"), QKeySequence::Quit, [this] { close(); }, false);
+    add(file, u"app.quit"_s, tr("Quit"), QKeySequence::Quit, [this] { close(); }, false);
 
     QMenu *edit = menuBar()->addMenu(tr("&Edit"));
-    add(edit, tr("Find in note"), QKeySequence::Find, withView([](NoteView *v) { v->showFind(); }));
-    add(edit, tr("Rename note"), QKeySequence(u"F2"_s), withView([](NoteView *v) { v->focusTitle(); }));
+    add(edit, u"edit.find"_s, tr("Find…"), QKeySequence::Find, withView([](NoteView *v) { v->showFind(false); }));
+    add(edit, u"edit.replace"_s, tr("Replace…"), QKeySequence(u"Ctrl+H"_s), withView([](NoteView *v) { v->showFind(true); }));
+    edit->addSeparator();
+    add(edit, u"edit.checkbox"_s, tr("Toggle checkbox status"), QKeySequence(u"Ctrl+L"_s), withEditor([](Editor *e) { e->toggleCheckbox(); }));
+    add(edit, u"edit.deleteParagraph"_s, tr("Delete paragraph"), QKeySequence(u"Ctrl+D"_s), withEditor([](Editor *e) { e->deleteParagraph(); }));
+    add(edit, u"edit.pastePlain"_s, tr("Paste as plain text"), QKeySequence(u"Ctrl+Shift+V"_s),
+        withEditor([](Editor *e) { e->pasteAsPlainText(); }));
+    edit->addSeparator();
+    add(edit, u"link.follow"_s, tr("Follow link under cursor"), QKeySequence(u"Alt+Return"_s),
+        withEditor([](Editor *e) { e->followLinkAtCursor(false); }));
+    add(edit, u"link.followTab"_s, tr("Open link under cursor in new tab"), QKeySequence(u"Ctrl+Return"_s),
+        withEditor([](Editor *e) { e->followLinkAtCursor(true); }));
+    edit->addSeparator();
+    add(edit, u"file.rename"_s, tr("Rename file"), QKeySequence(u"F2"_s), withView([](NoteView *v) { v->focusTitle(); }));
+
+    QMenu *format = menuBar()->addMenu(tr("F&ormat"));
+    add(format, u"format.bold"_s, tr("Bold"), QKeySequence::Bold, withEditor([](Editor *e) { e->toggleWrap(u"**"_s); }));
+    add(format, u"format.italic"_s, tr("Italic"), QKeySequence::Italic, withEditor([](Editor *e) { e->toggleWrap(u"*"_s); }));
+    add(format, u"format.strike"_s, tr("Strikethrough"), {}, withEditor([](Editor *e) { e->toggleWrap(u"~~"_s); }));
+    add(format, u"format.highlight"_s, tr("Highlight"), {}, withEditor([](Editor *e) { e->toggleWrap(u"=="_s); }));
+    format->addSeparator();
+    add(format, u"format.code"_s, tr("Code"), {}, withEditor([](Editor *e) { e->toggleWrap(u"`"_s); }));
+    add(format, u"format.comment"_s, tr("Comment"), QKeySequence(u"Ctrl+/"_s), withEditor([](Editor *e) { e->toggleWrap(u"%%"_s); }));
+    format->addSeparator();
+    add(format, u"format.clear"_s, tr("Clear formatting"), {}, withEditor([](Editor *e) { e->clearFormatting(); }));
+    format->addSeparator();
+    QMenu *paragraph = format->addMenu(tr("Paragraph"));
+    using P = Editor::Paragraph;
+    add(paragraph, u"para.bullet"_s, tr("Bullet list"), {}, withEditor([](Editor *e) { e->setParagraph(P::Bullet); }));
+    add(paragraph, u"para.numbered"_s, tr("Numbered list"), {}, withEditor([](Editor *e) { e->setParagraph(P::Numbered); }));
+    add(paragraph, u"para.task"_s, tr("Task list"), {}, withEditor([](Editor *e) { e->setParagraph(P::Task); }));
+    paragraph->addSeparator();
+    for (int level = 1; level <= 6; ++level)
+        add(paragraph, u"para.h%1"_s.arg(level), tr("Heading %1").arg(level), {},
+            withEditor([level](Editor *e) { e->setParagraph(P::Heading, level); }));
+    add(paragraph, u"para.body"_s, tr("Body"), {}, withEditor([](Editor *e) { e->setParagraph(P::Body); }));
+    paragraph->addSeparator();
+    add(paragraph, u"para.quote"_s, tr("Quote"), {}, withEditor([](Editor *e) { e->setParagraph(P::Quote); }));
+
+    QMenu *insert = menuBar()->addMenu(tr("&Insert"));
+    add(insert, u"link.internal"_s, tr("Add link"), {}, withEditor([](Editor *e) { e->addInternalLink(); }));
+    add(insert, u"link.external"_s, tr("Add external link"), QKeySequence(u"Ctrl+K"_s), withEditor([](Editor *e) { e->insertMarkdownLink(); }));
+    insert->addSeparator();
+    add(insert, u"insert.table"_s, tr("Table"), {}, withEditor([](Editor *e) { e->insertTable(); }));
+    add(insert, u"insert.callout"_s, tr("Callout"), {}, withEditor([](Editor *e) { e->insertCallout(); }));
+    add(insert, u"insert.rule"_s, tr("Horizontal rule"), {}, withEditor([](Editor *e) { e->insertRule(); }));
+    add(insert, u"insert.codeblock"_s, tr("Code block"), {}, withEditor([](Editor *e) { e->insertCodeBlock(); }));
+    insert->addSeparator();
+    add(insert, u"insert.property"_s, tr("Add file property"), QKeySequence(u"Ctrl+;"_s), withEditor([](Editor *e) { e->addProperty(); }));
 
     QMenu *go = menuBar()->addMenu(tr("&Go"));
-    add(go, tr("Quick switcher"), QKeySequence(u"Ctrl+O"_s), [this] { quickSwitcher(); });
-    add(go, tr("Search vault"), QKeySequence(u"Ctrl+Shift+F"_s), [this] { searchVault(); });
+    add(go, u"app.palette"_s, tr("Command palette"), QKeySequence(u"Ctrl+P"_s), [this] { commandPalette(); });
+    add(go, u"app.switcher"_s, tr("Quick switcher"), QKeySequence(u"Ctrl+O"_s), [this] { quickSwitcher(); });
+    add(go, u"app.search"_s, tr("Search vault"), QKeySequence(u"Ctrl+Shift+F"_s), [this] {
+        QString selected;
+        if (NoteView *v = currentView(); v && v->isNote() && v->mode() == NoteView::Edit)
+            selected = v->editor()->textCursor().selectedText();
+        searchVault(selected.contains(QChar::ParagraphSeparator) ? QString() : selected);
+    });
     go->addSeparator();
-    QAction *back = add(go, tr("Back"), QKeySequence(u"Alt+Left"_s), withView([](NoteView *v) { v->goBack(); }));
+    add(go, u"tab.new"_s, tr("New tab"), QKeySequence(u"Ctrl+T"_s), [this] { quickSwitcher(true); });
+    add(go, u"tab.reopen"_s, tr("Reopen closed tab"), QKeySequence(u"Ctrl+Shift+T"_s), [this] {
+        while (!m_closedTabs.isEmpty()) {
+            const QString path = m_closedTabs.takeLast();
+            if (m_vault->exists(path))
+                return openPath(path, true);
+        }
+    });
+    go->addSeparator();
+    QAction *back = add(go, u"nav.back"_s, tr("Back"), QKeySequence(u"Alt+Left"_s), withView([](NoteView *v) { v->goBack(); }));
     // A key listed twice (QKeySequence::Back is Alt+Left) makes the shortcut ambiguous.
     auto unique = [](QList<QKeySequence> keys) {
         QList<QKeySequence> out;
@@ -334,24 +438,30 @@ void MainWindow::buildActions()
     };
     back->setShortcuts(unique(QList<QKeySequence>{QKeySequence(u"Alt+Left"_s), QKeySequence(u"Ctrl+Alt+Left"_s)}
                               + QKeySequence::keyBindings(QKeySequence::Back)));
-    QAction *fwd = add(go, tr("Forward"), QKeySequence(u"Alt+Right"_s), withView([](NoteView *v) { v->goForward(); }));
+    QAction *fwd = add(go, u"nav.forward"_s, tr("Forward"), QKeySequence(u"Alt+Right"_s), withView([](NoteView *v) { v->goForward(); }));
     fwd->setShortcuts(unique(QList<QKeySequence>{QKeySequence(u"Alt+Right"_s), QKeySequence(u"Ctrl+Alt+Right"_s)}
                              + QKeySequence::keyBindings(QKeySequence::Forward)));
     go->addSeparator();
-    add(go, tr("Next tab"), QKeySequence(u"Ctrl+Tab"_s), [this] {
+    add(go, u"tab.next"_s, tr("Next tab"), QKeySequence(u"Ctrl+Tab"_s), [this] {
         if (m_tabs->count())
             m_tabs->setCurrentIndex((m_tabs->currentIndex() + 1) % m_tabs->count());
     })->setShortcuts({QKeySequence(u"Ctrl+Tab"_s), QKeySequence(u"Ctrl+PgDown"_s)});
-    add(go, tr("Previous tab"), QKeySequence(u"Ctrl+Shift+Tab"_s), [this] {
+    add(go, u"tab.previous"_s, tr("Previous tab"), QKeySequence(u"Ctrl+Shift+Tab"_s), [this] {
         if (m_tabs->count())
             m_tabs->setCurrentIndex((m_tabs->currentIndex() + m_tabs->count() - 1) % m_tabs->count());
     })->setShortcuts({QKeySequence(u"Ctrl+Shift+Tab"_s), QKeySequence(u"Ctrl+PgUp"_s)});
+    QMenu *goTab = go->addMenu(tr("Go to tab"));
+    for (int n = 1; n <= 9; ++n)
+        add(goTab, u"tab.%1"_s.arg(n), n == 9 ? tr("Last tab") : tr("Tab %1").arg(n), QKeySequence(u"Ctrl+%1"_s.arg(n)), [this, n] {
+            if (m_tabs->count())
+                m_tabs->setCurrentIndex(n == 9 ? m_tabs->count() - 1 : qMin(n - 1, m_tabs->count() - 1));
+        });
 
     QMenu *view = menuBar()->addMenu(tr("&View"));
-    add(view, tr("Toggle reading view"), QKeySequence(u"Ctrl+E"_s), withView([](NoteView *v) {
+    add(view, u"view.reading"_s, tr("Toggle reading view"), QKeySequence(u"Ctrl+E"_s), withView([](NoteView *v) {
         v->setMode(v->mode() == NoteView::Edit ? NoteView::Read : NoteView::Edit);
     }));
-    QAction *live = add(view, tr("Live preview"), QKeySequence(u"Ctrl+Shift+E"_s), [this](bool on) {
+    QAction *live = add(view, u"view.live"_s, tr("Live preview"), QKeySequence(u"Ctrl+Shift+E"_s), [this](bool on) {
         m_livePreview = on;
         QSettings().setValue(u"livePreview"_s, on);
         for (NoteView *v : views())
@@ -360,14 +470,14 @@ void MainWindow::buildActions()
     live->setCheckable(true);
     m_livePreview = QSettings().value(u"livePreview"_s, true).toBool();
     live->setChecked(m_livePreview);
-    live->setToolTip(tr("Hide Markdown markup except on the line being edited"));
+    live->setToolTip(tr("Hide Markdown markup except where the cursor is"));
     view->addSeparator();
-    add(view, tr("Toggle left sidebar"), QKeySequence(u"Ctrl+\\"_s), [this] { m_left->setVisible(!m_left->isVisible()); });
-    add(view, tr("Toggle right sidebar"), QKeySequence(u"Ctrl+Shift+\\"_s), [this] { m_right->setVisible(!m_right->isVisible()); });
+    add(view, u"view.left"_s, tr("Toggle left sidebar"), QKeySequence(u"Ctrl+\\"_s), [this] { m_left->setVisible(!m_left->isVisible()); });
+    add(view, u"view.right"_s, tr("Toggle right sidebar"), QKeySequence(u"Ctrl+Shift+\\"_s), [this] { m_right->setVisible(!m_right->isVisible()); });
     view->addSeparator();
-    add(view, tr("Zoom in"), QKeySequence::ZoomIn, [this] { zoom(1); })->setShortcuts({QKeySequence::ZoomIn, QKeySequence(u"Ctrl+="_s)});
-    add(view, tr("Zoom out"), QKeySequence::ZoomOut, [this] { zoom(-1); });
-    add(view, tr("Reset zoom"), QKeySequence(u"Ctrl+0"_s), [this] { zoom(-m_fontDelta); });
+    add(view, u"view.zoomIn"_s, tr("Zoom in"), QKeySequence::ZoomIn, [this] { zoom(1); })->setShortcuts({QKeySequence::ZoomIn, QKeySequence(u"Ctrl+="_s)});
+    add(view, u"view.zoomOut"_s, tr("Zoom out"), QKeySequence::ZoomOut, [this] { zoom(-1); });
+    add(view, u"view.zoomReset"_s, tr("Reset zoom"), QKeySequence(u"Ctrl+0"_s), [this] { zoom(-m_fontDelta); });
     view->addSeparator();
     QMenu *theme = view->addMenu(tr("Theme"));
     auto *themes = new QActionGroup(theme);
@@ -380,7 +490,7 @@ void MainWindow::buildActions()
     }
 
     QMenu *help = menuBar()->addMenu(tr("&Help"));
-    add(help, tr("About Serat"), {}, [this] {
+    add(help, u"app.about"_s, tr("About Serat"), {}, [this] {
         QMessageBox::about(this, tr("About Serat"),
                            tr("<h3>Serat %1</h3><p>Native Markdown notes, compatible with Obsidian vaults.</p>"
                               "<p>Ctrl+click a link in the editor to follow it, Ctrl+E switches to the reading view.</p>"
@@ -613,7 +723,13 @@ NoteView *MainWindow::createTab()
         if (v == currentView())
             updateStatus();
     });
-    connect(v, &NoteView::searchRequested, this, [this](const QString &text) { searchVault(text); });
+    connect(v, &NoteView::moreRequested, this, [this, v](const QPoint &pos) {
+        QMenu menu(this);
+        fillNoteMenu(&menu, v, false);
+        menu.exec(pos);
+    });
+    v->editor()->setCommands([this](const QString &id) { return m_commands.value(id); },
+                             [this](QMenu *menu, const QString &path) { addFileActions(menu, path); });
     connect(v, &NoteView::hintChanged, this, [this, v](const QString &hint) {
         if (v != currentView())
             return;
@@ -643,8 +759,11 @@ void MainWindow::closeTab(int index, bool saveFirst)
     auto *v = qobject_cast<NoteView *>(m_tabs->widget(index));
     if (!v)
         return;
-    if (saveFirst && !v->discardIfUntouched())
+    if (saveFirst && !v->discardIfUntouched()) {
         v->save();
+        m_closedTabs.removeAll(v->path());
+        m_closedTabs << v->path();
+    }
     m_tabs->removeTab(index);
     v->deleteLater();
 }
@@ -797,17 +916,110 @@ void MainWindow::deletePath(const QString &path)
         QMessageBox::warning(this, tr("Delete failed"), tr("Could not move “%1” to the trash.").arg(path));
 }
 
-void MainWindow::quickSwitcher()
+void MainWindow::quickSwitcher(bool newTab)
 {
     if (!m_vault)
         return;
     QuickSwitcher dlg(m_vault, m_recent, this);
+    if (newTab)
+        dlg.setWindowTitle(tr("Open in new tab"));
     if (dlg.exec() != QDialog::Accepted)
         return;
     if (!dlg.createName().isEmpty())
-        openLink(dlg.createName(), {}, dlg.newTab());
+        openLink(dlg.createName(), {}, newTab || dlg.newTab());
     else
-        openPath(dlg.selectedPath(), dlg.newTab());
+        openPath(dlg.selectedPath(), newTab || dlg.newTab());
+}
+
+void MainWindow::commandPalette()
+{
+    CommandPalette dlg(menuBar(), m_recentCommands, this);
+    if (dlg.exec() != QDialog::Accepted || !dlg.chosen())
+        return;
+    m_recentCommands.removeAll(dlg.chosenName());
+    m_recentCommands.prepend(dlg.chosenName());
+    m_recentCommands = m_recentCommands.mid(0, 20);
+    QSettings().setValue(u"recentCommands"_s, m_recentCommands);
+    // After the dialog has handed focus back to the note.
+    QTimer::singleShot(0, dlg.chosen(), &QAction::trigger);
+}
+
+QWidget *MainWindow::buildFilesPage()
+{
+    m_files = new QWidget;
+    auto *bar = new QWidget(m_files);
+    auto *barLayout = new QHBoxLayout(bar);
+    barLayout->setContentsMargins(8, 6, 8, 4);
+    barLayout->setSpacing(4);
+    barLayout->addStretch();
+    auto button = [bar, barLayout](const QString &icon, const QString &tip) {
+        auto *b = new QToolButton(bar);
+        b->setIcon(Theme::icon(icon));
+        b->setIconSize(QSize(17, 17));
+        b->setToolTip(tip);
+        b->setAutoRaise(true);
+        barLayout->addWidget(b);
+        return b;
+    };
+    connect(button(u"file-plus"_s, tr("New note")), &QToolButton::clicked, this, [this] { newNote({}); });
+    connect(button(u"folder-plus"_s, tr("New folder")), &QToolButton::clicked, this, [this] { newFolder({}); });
+
+    QToolButton *sort = button(u"sort"_s, tr("Change sort order"));
+    auto *sortMenu = new QMenu(sort);
+    auto *sortGroup = new QActionGroup(sortMenu);
+    const std::pair<FileTree::Sort, QString> orders[] = {
+        {FileTree::Sort::NameAsc, tr("File name (A to Z)")},        {FileTree::Sort::NameDesc, tr("File name (Z to A)")},
+        {FileTree::Sort::ModifiedNew, tr("Modified time (new to old)")}, {FileTree::Sort::ModifiedOld, tr("Modified time (old to new)")},
+        {FileTree::Sort::CreatedNew, tr("Created time (new to old)")},   {FileTree::Sort::CreatedOld, tr("Created time (old to new)")}};
+    const auto saved = FileTree::Sort(QSettings().value(u"fileSort"_s, 0).toInt());
+    m_tree->setSort(saved);
+    for (const auto &[order, label] : orders) {
+        QAction *a = sortMenu->addAction(label, this, [this, order] {
+            m_tree->setSort(order);
+            QSettings().setValue(u"fileSort"_s, int(order));
+        });
+        a->setCheckable(true);
+        a->setChecked(order == saved);
+        sortGroup->addAction(a);
+        if (order == FileTree::Sort::NameDesc || order == FileTree::Sort::ModifiedOld)
+            sortMenu->addSeparator();
+    }
+    connect(sort, &QToolButton::clicked, this, [sort, sortMenu] { sortMenu->exec(sort->mapToGlobal(QPoint(0, sort->height()))); });
+
+    QToolButton *reveal = button(u"reveal"_s, tr("Auto-reveal current file"));
+    reveal->setCheckable(true);
+    m_autoReveal = QSettings().value(u"autoReveal"_s, false).toBool();
+    reveal->setChecked(m_autoReveal);
+    connect(reveal, &QToolButton::toggled, this, [this](bool on) {
+        m_autoReveal = on;
+        QSettings().setValue(u"autoReveal"_s, on);
+        if (NoteView *v = currentView(); on && v)
+            m_tree->reveal(v->path());
+    });
+
+    QToolButton *collapse = button(u"collapse"_s, tr("Collapse all"));
+    auto syncCollapse = [this, collapse] {
+        const bool expanded = m_tree->anyExpanded();
+        collapse->setIcon(Theme::icon(expanded ? u"collapse"_s : u"expand"_s));
+        collapse->setToolTip(expanded ? tr("Collapse all") : tr("Expand all"));
+    };
+    connect(collapse, &QToolButton::clicked, this, [this, syncCollapse] {
+        if (m_tree->anyExpanded())
+            m_tree->collapseAll();
+        else
+            m_tree->expandAll();
+        syncCollapse();
+    });
+    connect(m_tree, &QTreeView::expanded, this, syncCollapse);
+    connect(m_tree, &QTreeView::collapsed, this, syncCollapse);
+    barLayout->addStretch();
+
+    auto *layout = new QVBoxLayout(m_files);
+    layout->setContentsMargins(0, 0, 0, 0);
+    layout->setSpacing(0);
+    layout->addWidget(bar);
+    layout->addWidget(m_tree, 1);
+    return m_files;
 }
 
 void MainWindow::searchVault(const QString &text)
@@ -822,36 +1034,78 @@ void MainWindow::searchVault(const QString &text)
 void MainWindow::showTabMenu(const QPoint &pos)
 {
     QTabBar *bar = m_tabs->tabBar();
-    const int index = bar->tabAt(pos);
-    auto *v = qobject_cast<NoteView *>(m_tabs->widget(index));
+    auto *v = qobject_cast<NoteView *>(m_tabs->widget(bar->tabAt(pos)));
     if (!v || !m_vault)
         return;
-    const QString path = v->path();
     QMenu menu(this);
-    menu.addAction(tr("Close"), this, [this, v] { closeTab(m_tabs->indexOf(v)); });
-    QAction *others = menu.addAction(tr("Close others"), this, [this, v] {
-        for (int i = m_tabs->count() - 1; i >= 0; --i)
-            if (m_tabs->widget(i) != v)
-                closeTab(i);
-    });
-    others->setEnabled(m_tabs->count() > 1);
-    QAction *right = menu.addAction(tr("Close tabs to the right"), this, [this, v] {
-        for (int i = m_tabs->count() - 1; i > m_tabs->indexOf(v); --i)
-            closeTab(i);
-    });
-    right->setEnabled(index < m_tabs->count() - 1);
-    menu.addSeparator();
-    menu.addAction(tr("Open in new tab"), this, [this, path] { openPath(path, true); });
-    menu.addAction(tr("Reveal in file tree"), this, [this, path] { revealInTree(path); });
-    menu.addSeparator();
-    PathActions::addCopyMenu(&menu, *m_vault, path);
+    fillNoteMenu(&menu, v, true);
     menu.exec(bar->mapToGlobal(pos));
+}
+
+// The tab menu and the note's "More options" menu, in Obsidian's order.
+void MainWindow::fillNoteMenu(QMenu *menu, NoteView *v, bool tab)
+{
+    const QString path = v->path();
+    if (tab) {
+        menu->addAction(tr("Close"), this, [this, v] { closeTab(m_tabs->indexOf(v)); });
+        menu->addAction(tr("Close others"), this, [this, v] {
+            for (int i = m_tabs->count() - 1; i >= 0; --i)
+                if (m_tabs->widget(i) != v)
+                    closeTab(i);
+        })->setEnabled(m_tabs->count() > 1);
+        menu->addAction(tr("Close tabs to the right"), this, [this, v] {
+            for (int i = m_tabs->count() - 1; i > m_tabs->indexOf(v); --i)
+                closeTab(i);
+        })->setEnabled(m_tabs->indexOf(v) < m_tabs->count() - 1);
+        menu->addSeparator();
+    }
+    if (v->isNote()) {
+        const bool reading = v->mode() == NoteView::Read;
+        menu->addAction(reading ? tr("Editing view") : tr("Reading view"), this,
+                        [v, reading] { v->setMode(reading ? NoteView::Edit : NoteView::Read); });
+        QAction *source = menu->addAction(tr("Source mode"), this, [this] { m_commands.value(u"view.live"_s)->trigger(); });
+        source->setCheckable(true);
+        source->setChecked(!m_livePreview);
+        menu->addSeparator();
+    }
+    menu->addAction(tr("Rename..."), this, [v] { v->focusTitle(); });
+    menu->addAction(tr("Move file to..."), this, [this, path] { chooseFolderAndMove(path); });
+    if (v->isNote()) {
+        menu->addAction(m_commands.value(u"insert.property"_s));
+        menu->addSeparator();
+        menu->addAction(m_commands.value(u"edit.find"_s));
+        menu->addAction(m_commands.value(u"edit.replace"_s));
+    }
+    menu->addSeparator();
+    PathActions::addCopyMenu(menu, *m_vault, path);
+    menu->addSeparator();
+    menu->addAction(tr("Open in default app"), this, [this, path] { QDesktopServices::openUrl(QUrl::fromLocalFile(m_vault->absolutePath(path))); });
+    menu->addAction(tr("Show in system explorer"), this, [this, path] {
+        QDesktopServices::openUrl(QUrl::fromLocalFile(QFileInfo(m_vault->absolutePath(path)).absolutePath()));
+    });
+    menu->addAction(tr("Reveal file in navigation"), this, [this, path] { revealInTree(path); });
+    menu->addSeparator();
+    menu->addAction(tr("Delete file"), this, [this, path] { deletePath(path); });
+}
+
+void MainWindow::addFileActions(QMenu *menu, const QString &path)
+{
+    PathActions::addCopyMenu(menu, *m_vault, path);
+    menu->addSeparator();
+    menu->addAction(tr("Rename..."), this, [this, path] { promptRename(path); });
+    menu->addAction(tr("Move file to..."), this, [this, path] { chooseFolderAndMove(path); });
+    menu->addSeparator();
+    menu->addAction(tr("Open in default app"), this, [this, path] { QDesktopServices::openUrl(QUrl::fromLocalFile(m_vault->absolutePath(path))); });
+    menu->addAction(tr("Show in system explorer"), this, [this, path] {
+        QDesktopServices::openUrl(QUrl::fromLocalFile(QFileInfo(m_vault->absolutePath(path)).absolutePath()));
+    });
+    menu->addAction(tr("Reveal file in navigation"), this, [this, path] { revealInTree(path); });
 }
 
 void MainWindow::revealInTree(const QString &path)
 {
     m_left->show();
-    m_left->setCurrentWidget(m_tree);
+    m_left->setCurrentWidget(m_files);
     m_tree->reveal(path);
     m_tree->setFocus();
 }
@@ -859,6 +1113,21 @@ void MainWindow::revealInTree(const QString &path)
 void MainWindow::duplicatePath(const QString &path)
 {
     const QString copy = m_vault->uniquePath(path);
+    if (m_vault->isDir(path)) {
+        const QDir from(m_vault->absolutePath(path));
+        bool ok = QDir().mkpath(m_vault->absolutePath(copy));
+        QDirIterator it(from.path(), QDir::AllEntries | QDir::NoDotAndDotDot | QDir::Hidden, QDirIterator::Subdirectories);
+        while (ok && it.hasNext()) {
+            const QFileInfo fi(it.next());
+            const QString target = m_vault->absolutePath(copy) + u'/' + from.relativeFilePath(fi.absoluteFilePath());
+            ok = fi.isDir() ? QDir().mkpath(target) : QFile::copy(fi.absoluteFilePath(), target);
+        }
+        if (!ok)
+            QMessageBox::warning(this, tr("Copy failed"), tr("Could not copy every file in “%1”.").arg(path));
+        m_vault->rescan();
+        m_tree->reveal(copy);
+        return;
+    }
     if (!QFile::copy(m_vault->absolutePath(path), m_vault->absolutePath(copy))) {
         QMessageBox::warning(this, tr("Duplicate failed"), tr("Could not copy “%1”.").arg(path));
         return;
@@ -982,7 +1251,7 @@ void MainWindow::onCurrentChanged()
     refreshPanels();
     updateStatus();
     updateTitle();
-    if (NoteView *v = currentView())
+    if (NoteView *v = currentView(); v && m_autoReveal)
         m_tree->reveal(v->path());
 }
 

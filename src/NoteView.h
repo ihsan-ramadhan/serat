@@ -43,7 +43,8 @@ public:
 
     void jumpToHeading(const QString &heading);
     void jumpToLine(int line);
-    void showFind();
+    void showFind(bool replace = false);
+    Editor *editor() const { return m_editor; }
     void focusTitle();
     void focusContent();
     void applyFont(const QFont &font);
@@ -59,7 +60,7 @@ Q_SIGNALS:
     void statsChanged();
     void modeChanged();
     void hintChanged(const QString &hint);
-    void searchRequested(const QString &text);
+    void moreRequested(const QPoint &globalPos);
 
 protected:
     void resizeEvent(QResizeEvent *e) override;
@@ -73,6 +74,7 @@ private:
     void render();
     void toggleTask(int utf8Offset);
     void find(bool backward);
+    void replace(bool all);
     void updateMargins();
     void scaleImage();
     void updateHeader();
@@ -103,6 +105,8 @@ private:
     QPixmap m_pixmap;
     QWidget *m_findBar;
     QLineEdit *m_findEdit;
+    QWidget *m_replaceRow;
+    QLineEdit *m_replaceEdit;
     QTimer m_saveTimer;
     QTimer m_renderTimer;
 };

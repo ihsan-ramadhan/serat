@@ -72,16 +72,6 @@ Editor::Editor(QWidget *parent)
     m_completer->setMaxVisibleItems(10);
     connect(m_completer, qOverload<const QString &>(&QCompleter::activated), this, &Editor::insertCompletion);
 
-    m_bold = new QAction(tr("Bold"), this);
-    m_bold->setShortcut(QKeySequence::Bold);
-    m_italic = new QAction(tr("Italic"), this);
-    m_italic->setShortcut(QKeySequence::Italic);
-    for (QAction *a : {m_bold, m_italic}) {
-        a->setShortcutContext(Qt::WidgetShortcut);
-        addAction(a);
-    }
-    connect(m_bold, &QAction::triggered, this, [this] { toggleWrap(u"**"_s); });
-    connect(m_italic, &QAction::triggered, this, [this] { toggleWrap(u"*"_s); });
 
     m_tableTimer.setSingleShot(true);
     m_tableTimer.setInterval(0);
@@ -102,9 +92,11 @@ Editor::Editor(QWidget *parent)
 void Editor::setLinkCandidates(const QStringList &names)
 {
     // Resetting the model on every autosave would drop the popup's selected row.
-    if (names == m_candidates->stringList())
+    if (names == m_linkNames)
         return;
-    m_candidates->setStringList(names);
+    m_linkNames = names;
+    if (!m_headingMode)
+        m_candidates->setStringList(names);
     if (m_completer->popup()->isVisible())
         updateCompletion();
 }
@@ -523,11 +515,27 @@ void Editor::updateCompletion()
         popup->hide();
         return;
     }
-    const QString prefix = before.mid(open + 2);
-    if (prefix.contains(u'|') || prefix.contains(u'#') || prefix.size() > 100) {
+    QString prefix = before.mid(open + 2);
+    if (prefix.contains(u'|') || prefix.size() > 100) {
         popup->hide();
         return;
     }
+    // [[#Heading in this note, [[Note#Heading in another one.
+    const qsizetype hash = prefix.indexOf(u'#');
+    m_headingMode = hash >= 0;
+    QStringList names = m_linkNames;
+    if (m_headingMode) {
+        const QString note = prefix.left(hash);
+        prefix = prefix.mid(hash + 1);
+        const QString path = note.isEmpty() || !m_vault ? m_notePath : m_vault->resolve(note, m_notePath);
+        const Note *n = m_vault ? m_vault->note(path) : nullptr;
+        names.clear();
+        if (n)
+            for (const Heading &h : n->headings)
+                names << h.text;
+    }
+    if (names != m_candidates->stringList())
+        m_candidates->setStringList(names);
     if (prefix != m_completer->completionPrefix())
         m_completer->setCompletionPrefix(prefix);
     if (m_completer->completionCount() == 0) {
@@ -548,8 +556,9 @@ void Editor::insertCompletion(const QString &name)
     const qsizetype open = before.lastIndexOf(u"[["_s);
     if (open < 0)
         return;
+    const qsizetype hash = before.indexOf(u'#', open);
     c.beginEditBlock();
-    c.setPosition(c.block().position() + int(open) + 2, QTextCursor::KeepAnchor);
+    c.setPosition(c.block().position() + int(m_headingMode && hash >= 0 ? hash + 1 : open + 2), QTextCursor::KeepAnchor);
     c.insertText(name);
     if (document()->characterAt(c.position()) == u']' && document()->characterAt(c.position() + 1) == u']')
         c.movePosition(QTextCursor::Right, QTextCursor::MoveAnchor, 2);
@@ -1164,44 +1173,105 @@ void Editor::commitTables()
     flushTableWrites();
 }
 
+void Editor::setCommands(std::function<QAction *(const QString &)> command,
+                         std::function<void(QMenu *, const QString &)> fileActions)
+{
+    m_command = std::move(command);
+    m_fileActions = std::move(fileActions);
+}
+
+// Window shortcuts beat the text edit's own keys (in Qt, Ctrl+K deletes to the end of the line).
+bool Editor::event(QEvent *e)
+{
+    if (e->type() == QEvent::ShortcutOverride) {
+        const QKeySequence key(static_cast<QKeyEvent *>(e)->keyCombination());
+        for (const QAction *a : window()->actions()) {
+            if (a->isEnabled() && a->shortcuts().contains(key)) {
+                e->ignore();
+                return true;
+            }
+        }
+    }
+    return QPlainTextEdit::event(e);
+}
+
 void Editor::contextMenuEvent(QContextMenuEvent *e)
 {
-    QMenu *menu = createStandardContextMenu(e->pos());
-    QAction *first = menu->actions().value(0);
-    if (const QString href = linkAt(cursorForPosition(e->pos())); !href.isEmpty()) {
-        auto *open = new QAction(tr("Open link"), menu);
-        connect(open, &QAction::triggered, this, [this, href] { Q_EMIT linkActivated(href, false); });
-        auto *openTab = new QAction(tr("Open link in new tab"), menu);
-        connect(openTab, &QAction::triggered, this, [this, href] { Q_EMIT linkActivated(href, true); });
-        auto *copy = new QAction(tr("Copy link"), menu);
-        connect(copy, &QAction::triggered, this, [href] { QApplication::clipboard()->setText(PathActions::hrefText(href)); });
-        menu->insertActions(first, {open, openTab, copy});
-        menu->insertSeparator(first);
+    if (!m_command) {
+        QPlainTextEdit::contextMenuEvent(e);
+        return;
     }
-
-    menu->addSeparator();
-    QMenu *format = menu->addMenu(tr("Format"));
-    format->addAction(m_bold);
-    format->addAction(m_italic);
-    format->addAction(tr("Strikethrough"), this, [this] { toggleWrap(u"~~"_s); });
-    format->addAction(tr("Highlight"), this, [this] { toggleWrap(u"=="_s); });
-    format->addAction(tr("Code"), this, [this] { toggleWrap(u"`"_s); });
-    QMenu *insert = menu->addMenu(tr("Insert"));
-    insert->addAction(tr("Table"), this, [this] {
-        insertBlock(u"| Column 1 | Column 2 |\n| --- | --- |\n|  |  |"_s, true);
-    });
-    insert->addAction(tr("Checkbox"), this, &Editor::insertTask);
-    insert->addAction(tr("Link to note…"), this, &Editor::insertWikilink);
-    insert->addAction(tr("Horizontal rule"), this, [this] { insertBlock(u"---"_s, false); });
-
-    const QString selected = textCursor().selectedText().trimmed();
-    if (!selected.isEmpty() && !selected.contains(QChar::ParagraphSeparator)) {
-        menu->addSeparator();
-        const QString shown = selected.size() > 30 ? selected.left(29) + u'…' : selected;
-        menu->addAction(tr("Search vault for “%1”").arg(shown), this, [this, selected] { Q_EMIT searchRequested(selected); });
+    QMenu menu(this);
+    auto add = [&](QMenu *to, const QString &id) {
+        if (QAction *a = m_command(id))
+            to->addAction(a);
+    };
+    const QString href = linkAt(cursorForPosition(e->pos()));
+    if (!href.isEmpty()) {
+        menu.addAction(tr("Open in new tab"), this, [this, href] { Q_EMIT linkActivated(href, true); });
+        menu.addSeparator();
     }
-    menu->exec(e->globalPos());
-    delete menu;
+    add(&menu, u"link.internal"_s);
+    add(&menu, u"link.external"_s);
+    menu.addSeparator();
+    if (!href.isEmpty()) {
+        menu.addAction(tr("Edit link"), this, [this, pos = e->pos()] {
+            // Select the target so typing replaces it.
+            QTextCursor c = cursorForPosition(pos);
+            static const QRegularExpression link(u"\\[\\[([^\\[\\]|#\\n]+)|\\]\\(([^)\\s]+)\\)"_s);
+            const QString line = c.block().text();
+            for (auto it = link.globalMatch(line); it.hasNext();) {
+                const auto m = it.next();
+                const int group = m.capturedLength(1) ? 1 : 2;
+                if (c.positionInBlock() >= m.capturedStart() - 2 && c.positionInBlock() <= m.capturedEnd() + 2) {
+                    c.setPosition(c.block().position() + int(m.capturedStart(group)));
+                    c.setPosition(c.block().position() + int(m.capturedEnd(group)), QTextCursor::KeepAnchor);
+                    setTextCursor(c);
+                    break;
+                }
+            }
+        });
+    } else {
+        QMenu *format = menu.addMenu(tr("Format"));
+        for (const char16_t *id : {u"format.bold", u"format.italic", u"format.strike", u"format.highlight"})
+            add(format, QString::fromUtf16(id));
+        format->addSeparator();
+        add(format, u"format.code"_s);
+        add(format, u"format.comment"_s);
+        format->addSeparator();
+        add(format, u"format.clear"_s);
+    }
+    QMenu *paragraph = menu.addMenu(tr("Paragraph"));
+    for (const char16_t *id : {u"para.bullet", u"para.numbered", u"para.task"})
+        add(paragraph, QString::fromUtf16(id));
+    paragraph->addSeparator();
+    for (int level = 1; level <= 6; ++level)
+        add(paragraph, u"para.h%1"_s.arg(level));
+    add(paragraph, u"para.body"_s);
+    paragraph->addSeparator();
+    add(paragraph, u"para.quote"_s);
+    QMenu *insert = menu.addMenu(tr("Insert"));
+    for (const char16_t *id : {u"insert.table", u"insert.callout", u"insert.rule"})
+        add(insert, QString::fromUtf16(id));
+    insert->addSeparator();
+    add(insert, u"insert.codeblock"_s);
+    menu.addSeparator();
+
+    const bool selection = textCursor().hasSelection();
+    menu.addAction(tr("Cut"), QKeySequence::Cut, this, &QPlainTextEdit::cut)->setEnabled(selection && !isReadOnly());
+    menu.addAction(tr("Copy"), QKeySequence::Copy, this, &QPlainTextEdit::copy)->setEnabled(selection);
+    menu.addAction(tr("Paste"), QKeySequence::Paste, this, &QPlainTextEdit::paste)->setEnabled(canPaste());
+    add(&menu, u"edit.pastePlain"_s);
+    menu.addAction(tr("Select all"), QKeySequence::SelectAll, this, &QPlainTextEdit::selectAll);
+
+    if (href.startsWith(u"wiki:"_s) && m_vault && m_fileActions) {
+        const QString target = QUrl::fromPercentEncoding(href.mid(5).toUtf8()).section(u'#', 0, 0);
+        if (const QString path = m_vault->resolve(target, m_notePath); !path.isEmpty()) {
+            menu.addSeparator();
+            m_fileActions(&menu, path);
+        }
+    }
+    menu.exec(e->globalPos());
 }
 
 // Wraps the selection (or the word at the cursor) in `mark`, or unwraps it if it is already wrapped.
@@ -1255,7 +1325,7 @@ void Editor::toggleWrap(const QString &mark)
 }
 
 // Puts `text` on its own lines with blank lines around it, so Markdown reads it as a block.
-void Editor::insertBlock(const QString &text, bool table)
+void Editor::insertBlock(const QString &text, int cursorAt)
 {
     auto blank = [](const QTextBlock &b) { return b.text().trimmed().isEmpty(); };
     QTextCursor c = textCursor();
@@ -1272,39 +1342,207 @@ void Editor::insertBlock(const QString &text, bool table)
     c.insertText(before + text + after);
     c.endEditBlock();
 
-    const int lines = int(text.count(u'\n')) + 1;
-    const QTextBlock first = document()->findBlock(c.position() - int(after.size()) - int(text.size()));
-    QTextBlock below = document()->findBlockByNumber(first.blockNumber() + lines);
-    moveCursorQuietly(QTextCursor(below.isValid() ? below : document()->lastBlock()));
-    if (!table)
+    const int start = c.position() - int(after.size()) - int(text.size());
+    if (cursorAt >= 0) {
+        c.setPosition(start + cursorAt);
+        setTextCursor(c);
         return;
+    }
+    const QTextBlock first = document()->findBlock(start);
+    const QTextBlock below = document()->findBlockByNumber(first.blockNumber() + int(text.count(u'\n')) + 1);
+    moveCursorQuietly(QTextCursor(below.isValid() ? below : document()->lastBlock()));
+}
+
+void Editor::insertTable()
+{
+    const int at = textCursor().position();
+    insertBlock(u"|     |     |\n| --- | --- |\n|     |     |"_s);
     scanTables();
     for (const Table &t : std::as_const(m_tables))
-        if (t.head == first)
-            t.overlay->focusCell(0, 0, true);
+        if (t.head.position() >= at)
+            return t.overlay->focusCell(0, 0, true);
 }
 
-void Editor::insertTask()
+void Editor::insertCallout()
 {
-    static const QRegularExpression item(u"^(\\s*)([-*+]|\\d+[.)])\\s+(\\[[ xX]\\]\\s)?"_s);
-    const QTextBlock b = textCursor().block();
-    const auto m = item.match(b.text());
-    if (m.hasMatch() && m.capturedLength(3))
-        return;
-    int at = m.hasMatch() ? int(m.capturedEnd(0)) : 0;
-    while (!m.hasMatch() && at < b.text().size() && b.text()[at].isSpace())
-        ++at;
-    QTextCursor t(b);
-    t.setPosition(b.position() + at);
-    t.insertText(m.hasMatch() ? u"[ ] "_s : u"- [ ] "_s);
+    const QString text = u"> [!note]\n> "_s;
+    insertBlock(text, int(text.size()));
 }
 
-void Editor::insertWikilink()
+void Editor::insertCodeBlock()
+{
+    insertBlock(u"```\n\n```"_s, 4);
+}
+
+void Editor::insertRule()
+{
+    insertBlock(u"---"_s);
+}
+
+void Editor::addInternalLink()
 {
     QTextCursor c = textCursor();
+    if (c.hasSelection()) {
+        c.insertText(u"[["_s + c.selectedText() + u"]]"_s);
+        return;
+    }
     c.insertText(u"[[]]"_s);
     c.movePosition(QTextCursor::Left, QTextCursor::MoveAnchor, 2);
     setTextCursor(c);
     setFocus();
     updateCompletion();
+}
+
+void Editor::insertMarkdownLink()
+{
+    QTextCursor c = textCursor();
+    const QString selected = c.selectedText();
+    const bool url = QUrl(selected, QUrl::StrictMode).isValid() && selected.contains(u"://"_s);
+    if (url) {
+        c.insertText(u"[](%1)"_s.arg(selected));
+        c.movePosition(QTextCursor::Left, QTextCursor::MoveAnchor, int(selected.size()) + 3);
+    } else {
+        c.insertText(u"[%1]()"_s.arg(selected));
+        c.movePosition(QTextCursor::Left, QTextCursor::MoveAnchor, selected.isEmpty() ? 3 : 1);
+    }
+    setTextCursor(c);
+}
+
+void Editor::followLinkAtCursor(bool newTab)
+{
+    if (const QString href = linkAt(textCursor()); !href.isEmpty())
+        Q_EMIT linkActivated(href, newTab);
+}
+
+void Editor::pasteAsPlainText()
+{
+    textCursor().insertText(QApplication::clipboard()->text());
+}
+
+void Editor::clearFormatting()
+{
+    QTextCursor c = textCursor();
+    if (!c.hasSelection())
+        c.select(QTextCursor::BlockUnderCursor);
+    QString text = c.selectedText();
+    static const QRegularExpression marks[] = {
+        QRegularExpression(u"\\*\\*(.+?)\\*\\*"_s), QRegularExpression(u"__(.+?)__"_s), QRegularExpression(u"~~(.+?)~~"_s),
+        QRegularExpression(u"==(.+?)=="_s), QRegularExpression(u"%%(.+?)%%"_s), QRegularExpression(u"`([^`]+)`"_s),
+        QRegularExpression(u"(?<![*\\w])\\*(?!\\s)(.+?)(?<!\\s)\\*(?![*\\w])"_s), QRegularExpression(u"(?<![_\\w])_(?!\\s)(.+?)(?<!\\s)_(?![_\\w])"_s)};
+    for (const QRegularExpression &re : marks)
+        text.replace(re, u"\\1"_s);
+    c.insertText(text);
+}
+
+void Editor::setParagraph(Paragraph kind, int level)
+{
+    static const QRegularExpression prefix(u"^(\\s*)(#{1,6}\\s+|>\\s?|[-*+]\\s+\\[.\\]\\s+|[-*+]\\s+|\\d+[.)]\\s+)?"_s);
+    QTextCursor c = textCursor();
+    QTextBlock b = document()->findBlock(c.selectionStart());
+    const QTextBlock last = document()->findBlock(c.selectionEnd());
+    int number = 1;
+    c.beginEditBlock();
+    for (;; b = b.next()) {
+        const auto m = prefix.match(b.text());
+        const QString existing = m.captured(2).trimmed();
+        QString wanted;
+        switch (kind) {
+        case Paragraph::Bullet: wanted = u"- "_s; break;
+        case Paragraph::Numbered: wanted = QString::number(number++) + u". "_s; break;
+        case Paragraph::Task: wanted = u"- [ ] "_s; break;
+        case Paragraph::Heading: wanted = QString(level, u'#') + u' '; break;
+        case Paragraph::Quote: wanted = u"> "_s; break;
+        case Paragraph::Body: break;
+        }
+        // Applying the kind a line already has turns it back into plain text.
+        const bool same = (kind == Paragraph::Numbered && !existing.isEmpty() && existing[0].isDigit())
+                          || (kind == Paragraph::Task && existing.endsWith(u']'))
+                          || (kind == Paragraph::Bullet && (existing == u"-" || existing == u"*" || existing == u"+"))
+                          || (kind != Paragraph::Numbered && existing == wanted.trimmed() && !wanted.isEmpty());
+        if (same)
+            wanted.clear();
+        const bool keepIndent = kind != Paragraph::Heading;
+        QTextCursor line(b);
+        line.setPosition(b.position() + (keepIndent ? int(m.capturedLength(1)) : 0));
+        line.setPosition(b.position() + int(m.capturedEnd(0)), QTextCursor::KeepAnchor);
+        line.insertText(wanted);
+        if (b == last)
+            break;
+    }
+    c.endEditBlock();
+}
+
+// Ctrl+L: a line becomes a task, a task's box is ticked or cleared.
+void Editor::toggleCheckbox()
+{
+    static const QRegularExpression item(u"^(\\s*)([-*+]|\\d+[.)])\\s+(\\[(.)\\]\\s)?"_s);
+    QTextCursor c = textCursor();
+    QTextBlock b = document()->findBlock(c.selectionStart());
+    const QTextBlock last = document()->findBlock(c.selectionEnd());
+    c.beginEditBlock();
+    for (;; b = b.next()) {
+        const auto m = item.match(b.text());
+        QTextCursor t(b);
+        if (m.hasMatch() && m.capturedLength(3)) {
+            t.setPosition(b.position() + int(m.capturedStart(4)));
+            t.setPosition(b.position() + int(m.capturedEnd(4)), QTextCursor::KeepAnchor);
+            t.insertText(m.captured(4) == u" " ? u"x"_s : u" "_s);
+        } else if (m.hasMatch()) {
+            t.setPosition(b.position() + int(m.capturedEnd(0)));
+            t.insertText(u"[ ] "_s);
+        } else {
+            int at = 0;
+            while (at < b.text().size() && b.text()[at].isSpace())
+                ++at;
+            t.setPosition(b.position() + at);
+            t.insertText(u"- [ ] "_s);
+        }
+        if (b == last)
+            break;
+    }
+    c.endEditBlock();
+}
+
+void Editor::deleteParagraph()
+{
+    QTextCursor c = textCursor();
+    const QTextBlock first = document()->findBlock(c.selectionStart());
+    const QTextBlock last = document()->findBlock(c.selectionEnd());
+    int start = first.position();
+    int end = last.position() + last.length() - 1;
+    if (last.next().isValid())
+        ++end;
+    else if (start > 0)
+        --start;
+    c.setPosition(start);
+    c.setPosition(end, QTextCursor::KeepAnchor);
+    c.removeSelectedText();
+    setTextCursor(c);
+}
+
+// Ctrl+; adds a line to the frontmatter (creating it), with the name selected for typing.
+void Editor::addProperty()
+{
+    const QString name = tr("property");
+    QTextCursor c(document());
+    int lineStart = -1;
+    if (document()->firstBlock().text() == u"---") {
+        for (QTextBlock b = document()->firstBlock().next(); b.isValid(); b = b.next()) {
+            if (b.text() == u"---" || b.text() == u"...") {
+                c.setPosition(b.position());
+                c.insertText(name + u": \n"_s);
+                lineStart = b.previous().position();
+                break;
+            }
+        }
+    }
+    if (lineStart < 0) {
+        c.setPosition(0);
+        c.insertText(u"---\n"_s + name + u": \n---\n"_s);
+        lineStart = 4;
+    }
+    c.setPosition(lineStart);
+    c.setPosition(lineStart + int(name.size()), QTextCursor::KeepAnchor);
+    setTextCursor(c);
+    setFocus();
 }

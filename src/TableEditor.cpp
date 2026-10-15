@@ -5,6 +5,7 @@
 
 #include <QAbstractTextDocumentLayout>
 #include <QApplication>
+#include <QCollator>
 #include <QCoreApplication>
 #include <QEvent>
 #include <QHeaderView>
@@ -590,59 +591,98 @@ void TableOverlay::showMenu(const QPoint &pos)
         index = m_grid->currentIndex();
     const int r = qMax(0, index.row());
     const int c = qMax(0, index.column());
+    const int rows = int(m_rows.size());
     const int cols = columnCount();
+    auto withRows = [this](auto edit, int row, int col, bool startEditing = false) {
+        QList<QStringList> copy = m_rows;
+        QStringList delims = m_delims;
+        edit(copy, delims);
+        emitChanged(copy, delims, row, col, startEditing);
+    };
 
     QMenu menu(this);
-    auto insertRow = [this, c](int at) {
-        QList<QStringList> rows = m_rows;
-        rows.insert(at, QStringList(columnCount()));
-        emitChanged(rows, m_delims, at, c, true);
-    };
-    QAction *above = menu.addAction(r > 0 ? tr("Insert row above") : tr("Insert row above (header stays first)"), this,
-                                    [=] { insertRow(r); });
-    above->setEnabled(r > 0);
-    menu.addAction(tr("Insert row below"), this, [=] { insertRow(r + 1); });
-    QAction *delRow = menu.addAction(r > 0 ? tr("Delete row") : tr("Delete row (header stays)"), this, [this, r, c] {
-        QList<QStringList> rows = m_rows;
-        rows.removeAt(r);
-        emitChanged(rows, m_delims, qMin(r, int(rows.size()) - 1), c);
+    QMenu *row = menu.addMenu(tr("Row"));
+    row->addAction(r > 0 ? tr("Add row above") : tr("Add row above (header stays first)"), this, [=] {
+        withRows([r, cols](auto &t, auto &) { t.insert(r, QStringList(cols)); }, r, c, true);
+    })->setEnabled(r > 0);
+    row->addAction(tr("Add row below"), this, [=] {
+        withRows([r, cols](auto &t, auto &) { t.insert(r + 1, QStringList(cols)); }, r + 1, c, true);
     });
-    delRow->setEnabled(r > 0);
-    menu.addSeparator();
+    row->addSeparator();
+    row->addAction(tr("Move row up"), this, [=] { withRows([r](auto &t, auto &) { t.swapItemsAt(r, r - 1); }, r - 1, c); })
+        ->setEnabled(r > 1);
+    row->addAction(tr("Move row down"), this, [=] { withRows([r](auto &t, auto &) { t.swapItemsAt(r, r + 1); }, r + 1, c); })
+        ->setEnabled(r > 0 && r < rows - 1);
+    row->addSeparator();
+    row->addAction(tr("Duplicate row"), this, [=] { withRows([r](auto &t, auto &) { t.insert(r + 1, t[r]); }, r + 1, c); })
+        ->setEnabled(r > 0);
+    row->addAction(r > 0 ? tr("Delete row") : tr("Delete row (header stays)"), this, [=] {
+        withRows([r](auto &t, auto &) { t.removeAt(r); }, qMin(r, rows - 2), c);
+    })->setEnabled(r > 0);
 
-    auto insertCol = [this, r](int at) {
-        QList<QStringList> rows = m_rows;
-        for (QStringList &row : rows)
-            row.insert(at, QString());
-        QStringList delims = m_delims;
-        delims.insert(at, u"---"_s);
-        emitChanged(rows, delims, r, at, true);
+    QMenu *column = menu.addMenu(tr("Column"));
+    auto insertColumn = [](int at) {
+        return [at](QList<QStringList> &t, QStringList &d) {
+            for (QStringList &line : t)
+                line.insert(at, QString());
+            d.insert(at, u"---"_s);
+        };
     };
-    menu.addAction(tr("Insert column left"), this, [=] { insertCol(c); });
-    menu.addAction(tr("Insert column right"), this, [=] { insertCol(c + 1); });
-    QAction *delCol = menu.addAction(cols > 1 ? tr("Delete column") : tr("Delete column (last one stays)"), this, [this, r, c] {
-        QList<QStringList> rows = m_rows;
-        for (QStringList &row : rows)
-            row.removeAt(c);
-        QStringList delims = m_delims;
-        delims.removeAt(c);
-        emitChanged(rows, delims, r, qMin(c, int(delims.size()) - 1));
-    });
-    delCol->setEnabled(cols > 1);
-
-    QMenu *align = menu.addMenu(tr("Align column"));
+    column->addAction(tr("Add column to the left"), this, [=] { withRows(insertColumn(c), r, c, true); });
+    column->addAction(tr("Add column to the right"), this, [=] { withRows(insertColumn(c + 1), r, c + 1, true); });
+    column->addSeparator();
+    auto moveColumn = [](int from, int to) {
+        return [from, to](QList<QStringList> &t, QStringList &d) {
+            for (QStringList &line : t)
+                line.swapItemsAt(from, to);
+            d.swapItemsAt(from, to);
+        };
+    };
+    column->addAction(tr("Move column left"), this, [=] { withRows(moveColumn(c, c - 1), r, c - 1); })->setEnabled(c > 0);
+    column->addAction(tr("Move column right"), this, [=] { withRows(moveColumn(c, c + 1), r, c + 1); })->setEnabled(c < cols - 1);
+    column->addSeparator();
     const Qt::Alignment current = alignment(c);
     const std::pair<QString, Qt::Alignment> options[] = {
-        {tr("Left"), Qt::AlignLeft}, {tr("Center"), Qt::AlignHCenter}, {tr("Right"), Qt::AlignRight}};
+        {tr("Align left"), Qt::AlignLeft}, {tr("Align center"), Qt::AlignHCenter}, {tr("Align right"), Qt::AlignRight}};
     for (const auto &[label, a] : options) {
-        QAction *act = align->addAction(label, this, [this, r, c, a] {
-            QStringList delims = m_delims;
-            delims[c] = a == Qt::AlignHCenter ? u":-:"_s : a == Qt::AlignRight ? u"--:"_s : u":--"_s;
-            emitChanged(m_rows, delims, r, c);
+        QAction *act = column->addAction(label, this, [=] {
+            withRows([c, a](auto &, QStringList &d) {
+                d[c] = a == Qt::AlignHCenter ? u":-:"_s : a == Qt::AlignRight ? u"--:"_s : u":--"_s;
+            }, r, c);
         });
         act->setCheckable(true);
         act->setChecked(current == a);
     }
+    column->addSeparator();
+    column->addAction(tr("Duplicate column"), this, [=] {
+        withRows([c](QList<QStringList> &t, QStringList &d) {
+            for (QStringList &line : t)
+                line.insert(c + 1, line[c]);
+            d.insert(c + 1, d[c]);
+        }, r, c + 1);
+    });
+    column->addAction(cols > 1 ? tr("Delete column") : tr("Delete column (last one stays)"), this, [=] {
+        withRows([c](QList<QStringList> &t, QStringList &d) {
+            for (QStringList &line : t)
+                line.removeAt(c);
+            d.removeAt(c);
+        }, r, qMin(c, cols - 2));
+    })->setEnabled(cols > 1);
+
+    menu.addSeparator();
+    auto sortBy = [=](bool ascending) {
+        withRows([c, ascending](QList<QStringList> &t, auto &) {
+            QCollator collator;
+            collator.setNumericMode(true);
+            collator.setCaseSensitivity(Qt::CaseInsensitive);
+            std::stable_sort(t.begin() + 1, t.end(), [&](const QStringList &x, const QStringList &y) {
+                const int order = collator.compare(x.value(c), y.value(c));
+                return ascending ? order < 0 : order > 0;
+            });
+        }, r, c);
+    };
+    menu.addAction(tr("Sort by column (A to Z)"), this, [=] { sortBy(true); })->setEnabled(rows > 2);
+    menu.addAction(tr("Sort by column (Z to A)"), this, [=] { sortBy(false); })->setEnabled(rows > 2);
     menu.addSeparator();
     menu.addAction(Theme::icon(u"code"_s), tr("Edit as Markdown"), this, &TableOverlay::editSource);
     menu.addAction(tr("Delete table"), this, &TableOverlay::deleteTable);

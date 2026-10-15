@@ -14,6 +14,7 @@
 #include <QKeyEvent>
 #include <QLabel>
 #include <QLineEdit>
+#include <QPushButton>
 #include <QRegularExpression>
 #include <QScrollArea>
 #include <QScrollBar>
@@ -65,6 +66,8 @@ NoteView::NoteView(Vault *vault, QWidget *parent)
     m_crumb->setMinimumWidth(0);
     m_crumb->setSizePolicy(QSizePolicy::Ignored, QSizePolicy::Preferred);
     m_modeButton = toolButton(u"book"_s, QString());
+    auto *more = toolButton(u"more"_s, tr("More options"));
+    connect(more, &QToolButton::clicked, this, [this, more] { Q_EMIT moreRequested(more->mapToGlobal(QPoint(0, more->height()))); });
     auto *headerLayout = new QHBoxLayout(m_header);
     headerLayout->setContentsMargins(8, 6, 8, 0);
     headerLayout->setSpacing(2);
@@ -72,6 +75,7 @@ NoteView::NoteView(Vault *vault, QWidget *parent)
     headerLayout->addWidget(m_forwardButton);
     headerLayout->addWidget(m_crumb, 1);
     headerLayout->addWidget(m_modeButton);
+    headerLayout->addWidget(more);
     connect(m_backButton, &QToolButton::clicked, this, &NoteView::goBack);
     connect(m_forwardButton, &QToolButton::clicked, this, &NoteView::goForward);
     connect(m_modeButton, &QToolButton::clicked, this, [this] { setMode(m_mode == Edit ? Read : Edit); });
@@ -107,13 +111,37 @@ NoteView::NoteView(Vault *vault, QWidget *parent)
     auto *prev = toolButton(u"chevron-up"_s, tr("Previous match (Shift+Enter)"));
     auto *next = toolButton(u"chevron-down"_s, tr("Next match (Enter)"));
     auto *close = toolButton(u"close"_s, tr("Close (Esc)"));
-    auto *findLayout = new QHBoxLayout(m_findBar);
-    findLayout->setContentsMargins(8, 6, 8, 6);
+    auto *findLayout = new QHBoxLayout;
     findLayout->setSpacing(2);
     findLayout->addWidget(m_findEdit, 1);
     findLayout->addWidget(prev);
     findLayout->addWidget(next);
     findLayout->addWidget(close);
+    m_replaceRow = new QWidget(m_findBar);
+    m_replaceEdit = new QLineEdit(m_replaceRow);
+    m_replaceEdit->setPlaceholderText(tr("Replace with"));
+    auto *replaceOne = new QPushButton(tr("Replace"), m_replaceRow);
+    auto *replaceAll = new QPushButton(tr("Replace all"), m_replaceRow);
+    auto *replaceLayout = new QHBoxLayout(m_replaceRow);
+    replaceLayout->setContentsMargins(0, 0, 0, 0);
+    replaceLayout->setSpacing(4);
+    replaceLayout->addWidget(m_replaceEdit, 1);
+    replaceLayout->addWidget(replaceOne);
+    replaceLayout->addWidget(replaceAll);
+    auto *findColumn = new QVBoxLayout;
+    findColumn->setSpacing(6);
+    findColumn->addLayout(findLayout);
+    findColumn->addWidget(m_replaceRow);
+    auto *findOuter = new QVBoxLayout(m_findBar);
+    findOuter->setContentsMargins(8, 6, 8, 6);
+    findOuter->addLayout(findColumn);
+    findLayout->setContentsMargins(0, 0, 0, 0);
+    connect(replaceOne, &QPushButton::clicked, this, [this] { replace(false); });
+    connect(replaceAll, &QPushButton::clicked, this, [this] { replace(true); });
+    connect(m_replaceEdit, &QLineEdit::returnPressed, this, [this] { replace(false); });
+    setTabOrder(m_findEdit, m_replaceEdit);
+    setTabOrder(m_replaceEdit, replaceOne);
+    setTabOrder(replaceOne, replaceAll);
     m_findBar->hide();
 
     auto *layout = new QVBoxLayout(this);
@@ -143,7 +171,6 @@ NoteView::NoteView(Vault *vault, QWidget *parent)
     });
     connect(m_editor, &Editor::linkActivated, this, &NoteView::handleHref);
     connect(m_editor, &Editor::hintChanged, this, &NoteView::hintChanged);
-    connect(m_editor, &Editor::searchRequested, this, &NoteView::searchRequested);
     connect(m_reader, &Reader::openRequested, this, &NoteView::handleHref);
     connect(m_reader, &Reader::imageRequested, this, [this](const QString &file, bool newTab) {
         Q_EMIT linkRequested(m_vault->relativePath(file), newTab);
@@ -501,10 +528,13 @@ void NoteView::jumpToLine(int line)
         applyRatio(m_reader->verticalScrollBar(), double(line) / qMax(1, m_editor->blockCount()));
 }
 
-void NoteView::showFind()
+void NoteView::showFind(bool replace)
 {
     if (!isNote())
         return;
+    if (replace && m_mode == Read)
+        setMode(Edit);
+    m_replaceRow->setVisible(replace);
     const QString selected = m_mode == Edit ? m_editor->textCursor().selectedText() : m_reader->textCursor().selectedText();
     if (!selected.isEmpty() && !selected.contains(QChar::ParagraphSeparator))
         m_findEdit->setText(selected);
@@ -531,6 +561,30 @@ void NoteView::find(bool backward)
     QPalette pal = m_findEdit->palette();
     pal.setColor(QPalette::Base, found ? palette().color(QPalette::Base) : mix(palette().color(QPalette::Base), Qt::red, 0.25));
     m_findEdit->setPalette(pal);
+}
+
+void NoteView::replace(bool all)
+{
+    const QString q = m_findEdit->text();
+    if (q.isEmpty() || m_mode != Edit)
+        return;
+    const QString with = m_replaceEdit->text();
+    if (!all) {
+        QTextCursor c = m_editor->textCursor();
+        if (c.selectedText().compare(q, Qt::CaseInsensitive) == 0)
+            c.insertText(with);
+        find(false);
+        return;
+    }
+    QTextCursor edit(m_editor->document());
+    edit.beginEditBlock();
+    int count = 0;
+    for (QTextCursor hit = m_editor->document()->find(q); !hit.isNull(); hit = m_editor->document()->find(q, hit)) {
+        hit.insertText(with);
+        ++count;
+    }
+    edit.endEditBlock();
+    QToolTip::showText(m_replaceEdit->mapToGlobal(QPoint(0, -m_replaceEdit->height())), tr("%n replaced", nullptr, count), m_replaceEdit);
 }
 
 void NoteView::focusTitle()

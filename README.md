@@ -14,9 +14,11 @@ Built with Qt 6 and C++20. Runs on Linux, Windows and macOS.
   (`#` on its line, `**` or `[[ ]]` only on the word it touches). Lists show bullets,
   tasks show checkboxes you can click, and a click on a link opens it.
   View > Live preview switches to plain source.
-- `[[` autocompletes note names; Enter continues lists; Tab and Shift+Tab indent
-- Right-click in a note to format the selection, insert a table, checkbox, note link or
-  rule, open or copy a link, or search the vault for the selected text
+- `[[` autocompletes note names, `[[#` the headings of a note; Enter continues lists;
+  Tab and Shift+Tab indent
+- Format, Paragraph (lists, headings, quote) and Insert (table, callout, rule, code
+  block) commands in the menu bar, the right-click menu and the command palette
+- Find and replace in the note
 - Paste a screenshot and it is saved into the vault as `Pasted image <timestamp>.png`
 - A new note you leave without a name or any text is removed instead of piling up as
   `Untitled` files
@@ -24,8 +26,8 @@ Built with Qt 6 and C++20. Runs on Linux, Windows and macOS.
 **Tables**
 - Tables are edited as a grid, no pipes to type: click a cell and write
 - Tab in the last cell or the + under the table adds a row; the + on the right adds a column
-- Right-click a cell to insert or delete rows and columns, align a column, or switch that
-  table to its Markdown source
+- Right-click a cell to add, move, duplicate or delete rows and columns, align or sort
+  by a column, or switch that table to its Markdown source
 - Only the rows you change are rewritten; a table padded into neat columns stays padded
 
 **Reading**
@@ -36,10 +38,14 @@ Built with Qt 6 and C++20. Runs on Linux, Windows and macOS.
 **Links and navigation**
 - Renaming or moving a note or folder rewrites every link that points into it
 - Backlinks, outgoing links and outline panels
-- Vault-wide search and a quick switcher
+- Command palette with every command and its shortcut
+- Vault-wide search (`"exact phrase"`, `path:folder`) and a quick switcher
+- File tree toolbar: new note or folder, sort by name, modified or created time,
+  auto-reveal the open note, collapse or expand all
 - Tabs with their own back and forward history, restored on the next start
-- Right-click a file, tab or panel entry to copy its wikilink, vault path, full path or
-  a link that opens it; files can also be duplicated or moved to another folder
+- Right-click a file, folder, tab or panel entry to copy its path or a link to it, make a
+  copy, move it, search inside a folder, or open it in another app; the ⋮ button on a
+  note has the same file commands
 - `serat://open?vault=<name>&file=<path>` links open the note in Serat; clicking one while
   Serat runs reuses the open window
 - Edits made outside the app (sync, git, another editor) show up immediately
@@ -53,17 +59,27 @@ Not yet: graph view, tags pane, properties editor.
 
 | Key | Action |
 |---|---|
+| Ctrl+P | Command palette |
 | Ctrl+O | Quick switcher (Ctrl+Enter opens in a new tab) |
 | Ctrl+N | New note |
 | Ctrl+E | Switch between editing and reading |
 | Ctrl+Shift+E | Live preview on / off |
-| Ctrl+Shift+F | Search the vault |
-| Ctrl+F | Find in note |
+| Ctrl+Shift+F | Search the vault (the selected text becomes the query) |
+| Ctrl+F / Ctrl+H | Find / replace in note |
 | Ctrl+B / Ctrl+I | Bold / italic (selection or the word at the cursor) |
+| Ctrl+/ | Comment (`%%…%%`) |
+| Ctrl+K | Add external link |
+| Ctrl+L | Toggle checkbox |
+| Ctrl+D | Delete paragraph |
+| Ctrl+; | Add file property |
+| Alt+Enter / Ctrl+Enter | Follow the link at the cursor / in a new tab |
+| Ctrl+Shift+V | Paste as plain text |
 | F2 | Rename note |
 | Ctrl+click | Follow a link (Ctrl+Shift+click: in a new tab) |
 | Alt+Left / Alt+Right | Back / forward |
-| Ctrl+Tab, Ctrl+W | Next tab, close tab |
+| Ctrl+T, Ctrl+W | New tab, close tab |
+| Ctrl+Shift+T | Reopen the last closed tab |
+| Ctrl+Tab, Ctrl+1…9 | Next tab, go to tab 1–8 or the last one |
 | Ctrl+\\, Ctrl+Shift+\\ | Show or hide the left / right sidebar |
 | Ctrl+= / Ctrl+- / Ctrl+0 | Zoom |
 

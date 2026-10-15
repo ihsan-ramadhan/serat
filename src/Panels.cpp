@@ -74,6 +74,7 @@ class FsProxy : public QSortFilterProxyModel
 public:
     using QSortFilterProxyModel::QSortFilterProxyModel;
     QString root;
+    FileTree::Sort mode = FileTree::Sort::NameAsc;
 
     QVariant data(const QModelIndex &index, int role) const override
     {
@@ -121,7 +122,20 @@ protected:
             c.setCaseSensitivity(Qt::CaseInsensitive);
             return c;
         }();
-        return collator.compare(fs->fileName(l), fs->fileName(r)) < 0;
+        const int byName = collator.compare(fs->fileName(l), fs->fileName(r));
+        // Folders stay A to Z whatever the order, as in the usual file managers.
+        if (dl)
+            return byName < 0;
+        const QFileInfo a = fs->fileInfo(l), b = fs->fileInfo(r);
+        switch (mode) {
+        case FileTree::Sort::NameAsc: return byName < 0;
+        case FileTree::Sort::NameDesc: return byName > 0;
+        case FileTree::Sort::ModifiedNew: return a.lastModified() > b.lastModified();
+        case FileTree::Sort::ModifiedOld: return a.lastModified() < b.lastModified();
+        case FileTree::Sort::CreatedNew: return a.birthTime() > b.birthTime();
+        case FileTree::Sort::CreatedOld: return a.birthTime() < b.birthTime();
+        }
+        return byName < 0;
     }
 };
 
@@ -207,34 +221,57 @@ void FileTree::showMenu(const QPoint &pos)
         return;
     const QString path = pathAt(indexAt(pos));
     const bool dir = path.isEmpty() || m_vault->isDir(path);
-    const QString parentDir = dir ? path : dirOf(path);
 
     QMenu menu(this);
     if (dir) {
-        menu.addAction(tr("New note"), this, [this, parentDir] { Q_EMIT newNoteRequested(parentDir); });
-        menu.addAction(tr("New folder"), this, [this, parentDir] { Q_EMIT newFolderRequested(parentDir); });
+        menu.addAction(tr("New note"), this, [this, path] { Q_EMIT newNoteRequested(path); });
+        menu.addAction(tr("New folder"), this, [this, path] { Q_EMIT newFolderRequested(path); });
     } else {
         menu.addAction(tr("Open in new tab"), this, [this, path] { Q_EMIT openRequested(path, true); });
+    }
+    if (path.isEmpty()) {
+        menu.exec(viewport()->mapToGlobal(pos));
+        return;
+    }
+    menu.addSeparator();
+    menu.addAction(tr("Make a copy"), this, [this, path] { Q_EMIT duplicateRequested(path); });
+    menu.addAction(dir ? tr("Move folder to...") : tr("Move file to..."), this, [this, path] { Q_EMIT moveToRequested(path); });
+    if (dir)
+        menu.addAction(tr("Search in folder"), this, [this, path] { Q_EMIT searchInFolderRequested(path); });
+    menu.addSeparator();
+    PathActions::addCopyMenu(&menu, *m_vault, path);
+    menu.addSeparator();
+    if (!dir)
         menu.addAction(tr("Open in default app"), this, [this, path] {
             QDesktopServices::openUrl(QUrl::fromLocalFile(m_vault->absolutePath(path)));
         });
-    }
-    if (!path.isEmpty()) {
-        menu.addSeparator();
-        PathActions::addCopyMenu(&menu, *m_vault, path);
-        menu.addSeparator();
-        if (!dir)
-            menu.addAction(tr("Duplicate"), this, [this, path] { Q_EMIT duplicateRequested(path); });
-        menu.addAction(tr("Move to…"), this, [this, path] { Q_EMIT moveToRequested(path); });
-        menu.addAction(tr("Rename…"), this, [this, path] { Q_EMIT renameRequested(path); });
-        menu.addAction(tr("Delete"), this, [this, path] { Q_EMIT deleteRequested(path); });
-    }
-    menu.addSeparator();
-    menu.addAction(tr("Collapse all"), this, &QTreeView::collapseAll);
-    menu.addAction(tr("Show in system explorer"), this, [this, parentDir] {
-        QDesktopServices::openUrl(QUrl::fromLocalFile(m_vault->absolutePath(parentDir)));
+    menu.addAction(tr("Show in system explorer"), this, [this, path, dir] {
+        QDesktopServices::openUrl(QUrl::fromLocalFile(m_vault->absolutePath(dir ? path : dirOf(path))));
     });
+    menu.addSeparator();
+    menu.addAction(tr("Rename..."), this, [this, path] { Q_EMIT renameRequested(path); });
+    menu.addAction(tr("Delete"), this, [this, path] { Q_EMIT deleteRequested(path); });
     menu.exec(viewport()->mapToGlobal(pos));
+}
+
+void FileTree::setSort(Sort sort)
+{
+    static_cast<FsProxy *>(m_proxy)->mode = sort;
+    m_proxy->invalidate();
+    m_proxy->sort(0, Qt::AscendingOrder);
+}
+
+FileTree::Sort FileTree::sortOrder() const
+{
+    return static_cast<FsProxy *>(m_proxy)->mode;
+}
+
+bool FileTree::anyExpanded() const
+{
+    for (int i = 0; i < model()->rowCount(rootIndex()); ++i)
+        if (isExpanded(model()->index(i, 0, rootIndex())))
+            return true;
+    return false;
 }
 
 void FileTree::drawBranches(QPainter *painter, const QRect &rect, const QModelIndex &index) const

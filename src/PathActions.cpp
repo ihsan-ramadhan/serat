@@ -41,25 +41,25 @@ QUrl obsidianUrl(const Vault &vault, const QString &path)
 
 void addCopyMenu(QMenu *menu, const Vault &vault, const QString &path)
 {
-    QMenu *copy = menu->addMenu(QApplication::translate("PathActions", "Copy"));
+    QMenu *copy = menu->addMenu(QApplication::translate("PathActions", "Copy path"));
     auto add = [copy](const QString &label, const QString &text) {
         copy->addAction(label, copy, [text] { QApplication::clipboard()->setText(text); });
     };
     const bool dir = vault.isDir(path);
     if (!dir) {
-        const QString link = u"[["_s + vault.linkText(path) + u"]]"_s;
-        if (Vault::isImage(path))
-            add(QApplication::translate("PathActions", "Embed"), u'!' + link);
-        else
-            add(QApplication::translate("PathActions", "Wikilink"), link);
+        add(QApplication::translate("PathActions", "as Obsidian URL"), obsidianUrl(vault, path).toString(QUrl::FullyEncoded));
+        add(QApplication::translate("PathActions", "as Serat link"), seratUrl(vault, path).toString(QUrl::FullyEncoded));
     }
-    add(QApplication::translate("PathActions", "Path in vault"), path);
-    add(QApplication::translate("PathActions", "Full path"), QDir::toNativeSeparators(vault.absolutePath(path)));
+    add(QApplication::translate("PathActions", "from vault folder"), path);
+    add(QApplication::translate("PathActions", "from system root"), QDir::toNativeSeparators(vault.absolutePath(path)));
     if (dir)
         return;
     copy->addSeparator();
-    add(QApplication::translate("PathActions", "Serat link"), seratUrl(vault, path).toString(QUrl::FullyEncoded));
-    add(QApplication::translate("PathActions", "Obsidian link"), obsidianUrl(vault, path).toString(QUrl::FullyEncoded));
+    const QString link = u"[["_s + vault.linkText(path) + u"]]"_s;
+    if (Vault::isImage(path))
+        add(QApplication::translate("PathActions", "as embed"), u'!' + link);
+    else
+        add(QApplication::translate("PathActions", "as wikilink"), link);
 }
 
 void addOpenActions(QMenu *menu, QWidget *context, const std::function<void(bool newTab)> &open)

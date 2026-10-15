@@ -1,6 +1,7 @@
 #pragma once
 
 #include <QMainWindow>
+#include <QHash>
 #include <QTimer>
 
 class BacklinksPanel;
@@ -9,6 +10,7 @@ class NoteView;
 class OutgoingPanel;
 class OutlinePanel;
 class QLabel;
+class QMenu;
 class QSplitter;
 class QStackedWidget;
 class QTabWidget;
@@ -51,7 +53,11 @@ private:
     void renamePath(const QString &from, const QString &to);
     void movePath(const QString &from, const QString &toDir);
     void deletePath(const QString &path);
-    void quickSwitcher();
+    void quickSwitcher(bool newTab = false);
+    void commandPalette();
+    QWidget *buildFilesPage();
+    void fillNoteMenu(QMenu *menu, NoteView *v, bool tab);
+    void addFileActions(QMenu *menu, const QString &path);
     void searchVault(const QString &text = {});
     void showTabMenu(const QPoint &pos);
     void duplicatePath(const QString &path);
@@ -94,4 +100,9 @@ private:
     QStringList m_candidates;
     double m_fontDelta = 0;
     bool m_livePreview = true;
+    bool m_autoReveal = false;
+    QWidget *m_files = nullptr;
+    QHash<QString, QAction *> m_commands;
+    QStringList m_closedTabs;
+    QStringList m_recentCommands;
 };

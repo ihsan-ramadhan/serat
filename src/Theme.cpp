@@ -8,6 +8,7 @@
 #include <QPainter>
 #include <QPalette>
 #include <QSettings>
+#include <QProxyStyle>
 #include <QStyleFactory>
 #include <QStyleHints>
 #include <QSvgRenderer>
@@ -139,7 +140,7 @@ QPushButton#vaultRow:focus { border: 1px solid %8; }
 
 QToolButton { background: transparent; border: 1px solid transparent; border-radius: 6px; padding: 3px; }
 QToolButton:hover { background: %5; }
-QToolButton:pressed { background: %12; }
+QToolButton:pressed, QToolButton:checked { background: %12; }
 QToolButton:focus { border: 1px solid %8; }
 
 QScrollBar:vertical { background: transparent; width: 10px; margin: 0px; }
@@ -223,6 +224,36 @@ private:
     QByteArray m_svg, m_openSvg;
 };
 
+// Fusion without the desktop icon theme in places that clash with the app's own icons.
+class Style : public QProxyStyle
+{
+public:
+    Style()
+        : QProxyStyle(QStyleFactory::create(u"Fusion"_s))
+    {
+    }
+
+    int styleHint(StyleHint hint, const QStyleOption *option, const QWidget *widget, QStyleHintReturn *ret) const override
+    {
+        if (hint == SH_DialogButtonBox_ButtonsHaveIcons)
+            return 0;
+        return QProxyStyle::styleHint(hint, option, widget, ret);
+    }
+
+    QIcon standardIcon(StandardPixmap icon, const QStyleOption *option, const QWidget *widget) const override
+    {
+        switch (icon) {
+        case SP_LineEditClearButton: return Theme::icon(u"close"_s);
+        case SP_MessageBoxQuestion: return Theme::icon(u"help"_s);
+        case SP_MessageBoxInformation: return Theme::icon(u"info"_s);
+        case SP_MessageBoxWarning:
+        case SP_MessageBoxCritical: return Theme::icon(u"alert"_s);
+        default: break;
+        }
+        return QProxyStyle::standardIcon(icon, option, widget);
+    }
+};
+
 void apply()
 {
     const QString pref = preference();
@@ -237,7 +268,7 @@ void apply()
 void install(QApplication &app)
 {
     g_systemPalette = app.palette();
-    app.setStyle(QStyleFactory::create(u"Fusion"_s));
+    app.setStyle(new Style);
     apply();
     QObject::connect(QGuiApplication::styleHints(), &QStyleHints::colorSchemeChanged, &app, [] { apply(); });
 }

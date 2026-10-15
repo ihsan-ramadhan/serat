@@ -5,7 +5,10 @@
 #include <QTextBlock>
 #include <QTimer>
 
+#include <functional>
+
 class MarkdownHighlighter;
+class QMenu;
 class QCompleter;
 class QStringListModel;
 class TableOverlay;
@@ -27,12 +30,32 @@ public:
     void setLivePreview(bool on);
     void commitTables();
 
+    // Commands, shared with the menu bar and the command palette.
+    enum class Paragraph { Bullet, Numbered, Task, Heading, Body, Quote };
+    void toggleWrap(const QString &mark);
+    void clearFormatting();
+    void setParagraph(Paragraph kind, int level = 0);
+    void toggleCheckbox();
+    void deleteParagraph();
+    void addInternalLink();
+    void insertMarkdownLink();
+    void insertTable();
+    void insertCallout();
+    void insertCodeBlock();
+    void insertRule();
+    void addProperty();
+    void pasteAsPlainText();
+    void followLinkAtCursor(bool newTab);
+    // The context menu shows the window's command actions, plus file actions on vault links.
+    void setCommands(std::function<QAction *(const QString &id)> command,
+                     std::function<void(QMenu *, const QString &path)> fileActions);
+
 Q_SIGNALS:
     void linkActivated(const QString &href, bool newTab);
     void hintChanged(const QString &hint);
-    void searchRequested(const QString &text);
 
 protected:
+    bool event(QEvent *e) override;
     void keyPressEvent(QKeyEvent *e) override;
     void mousePressEvent(QMouseEvent *e) override;
     void mouseMoveEvent(QMouseEvent *e) override;
@@ -58,10 +81,8 @@ private:
         bool checked = false;
         int pos = 0; // task mark offset in the block
     };
-    void toggleWrap(const QString &mark);
-    void insertBlock(const QString &text, bool table);
-    void insertTask();
-    void insertWikilink();
+    // Puts `text` on its own lines; the cursor ends at `cursorAt` within it (-1: the line after it).
+    void insertBlock(const QString &text, int cursorAt = -1);
     void updateRawBlocks();
     void updateTableHint();
     bool previewed(const QTextBlock &block) const;
@@ -97,9 +118,11 @@ private:
     MarkdownHighlighter *m_highlighter;
     QCompleter *m_completer;
     QStringListModel *m_candidates;
+    QStringList m_linkNames;
+    bool m_headingMode = false; // completing the heading after '#'
     QColor m_codeBg;
-    QAction *m_bold;
-    QAction *m_italic;
+    std::function<QAction *(const QString &)> m_command;
+    std::function<void(QMenu *, const QString &)> m_fileActions;
     bool m_live = false;
     int m_rawFrom = -1, m_rawTo = -1;
     int m_colFrom = -1, m_colTo = -1;
