@@ -10,6 +10,7 @@
 
 #include <functional>
 
+class FoldGutter;
 class ImageBlock;
 class MarkdownHighlighter;
 class PropertiesPanel;
@@ -21,6 +22,7 @@ class TableOverlay;
 class Vault;
 
 int readableMargin(int available, int maxWidth = 760, int minMargin = 24);
+void setReadableLineLength(bool on);
 
 class Editor : public QPlainTextEdit
 {
@@ -52,6 +54,17 @@ public:
     void addProperty();
     void pasteAsPlainText();
     void followLinkAtCursor(bool newTab);
+    void setAutoPair(bool brackets, bool markdown);
+    void setFoldingShown(bool gutter, bool guides);
+
+    // Headings, lists and +/- callouts fold; the folded lines stay hidden until unfolded.
+    void toggleFoldAtCursor();
+    void foldAll(bool fold);
+    QList<int> foldedLines() const;
+    // Restores saved folds; callouts written as "[!type]-" start folded.
+    void setFoldedLines(const QList<int> &lines, bool withDefaults = true);
+    // For blocks added to another open note, so its tab does not write over them.
+    void setDocumentLookup(std::function<QTextDocument *(const QString &path)> lookup) { m_documentFor = std::move(lookup); }
     // The context menu shows the window's command actions, plus file actions on vault links.
     void setCommands(std::function<QAction *(const QString &id)> command,
                      std::function<void(QMenu *, const QString &path, bool image)> fileActions);
@@ -59,6 +72,8 @@ public:
 Q_SIGNALS:
     void linkActivated(const QString &href, bool newTab);
     void hintChanged(const QString &hint);
+    void foldsChanged();
+    void hoverLink(const QString &href, const QPoint &globalPos);
 
 protected:
     bool event(QEvent *e) override;
@@ -69,13 +84,20 @@ protected:
     void resizeEvent(QResizeEvent *e) override;
     void paintEvent(QPaintEvent *e) override;
     void changeEvent(QEvent *e) override;
+    void leaveEvent(QEvent *e) override;
+    void dragEnterEvent(QDragEnterEvent *e) override;
+    void dragMoveEvent(QDragMoveEvent *e) override;
+    void dropEvent(QDropEvent *e) override;
     bool canInsertFromMimeData(const QMimeData *source) const override;
     void insertFromMimeData(const QMimeData *source) override;
 
 private:
+    bool autoPair(QChar ch);
     void updateCompletion();
     void insertCompletion(const QString &name);
+    QString blockId(const QString &path, int line);
     bool continueList();
+    void endBlock(QTextCursor c);
     void indentLines(bool outdent);
     QString linkAt(const QTextCursor &cursor) const;
     void updateMargins();
@@ -134,6 +156,15 @@ private:
     QPair<QTextBlock, QTextBlock> calloutAt(const QTextBlock &block) const;
     void paintCalloutHead(QPainter &p, const QTextBlock &block);
 
+    friend class FoldGutter;
+    QTextBlock foldEnd(const QTextBlock &head) const;
+    QSet<int> foldedBlocks();
+    QList<QTextBlock> foldHeads() const;
+    void toggleFold(const QTextBlock &head);
+    void setHoverBlock(const QTextBlock &block);
+    void positionGutter();
+    void paintGuides(QPainter &p, const QTextBlock &block);
+
     Vault *m_vault = nullptr;
     QString m_notePath;
     MarkdownHighlighter *m_highlighter;
@@ -174,4 +205,19 @@ private:
     QList<Image> m_images;
     QTextBlock m_rawImage;
     QHash<QString, QImage> m_icons;
+
+    bool m_pairBrackets = true;
+    bool m_pairMarkdown = true;
+    bool m_showGutter = true;
+    bool m_showGuides = true;
+    QList<QTextCursor> m_folds; // at the start of each folded line; they move with edits
+    FoldGutter *m_gutter;
+    QTextBlock m_hoverBlock;
+    // Completion of aliases ("Alias" -> note path) and of blocks ("[[Note^").
+    QHash<QString, QString> m_aliasPaths;
+    bool m_blockMode = false;
+    QString m_blockPath;
+    QHash<QString, int> m_blockLines;
+    QString m_hoverHref;
+    std::function<QTextDocument *(const QString &)> m_documentFor;
 };

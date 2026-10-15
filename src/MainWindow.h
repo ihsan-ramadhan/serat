@@ -5,18 +5,23 @@
 #include <QTimer>
 
 class BacklinksPanel;
+class Editor;
+class BookmarksPanel;
 class FileTree;
 class NoteView;
 class OutgoingPanel;
 class OutlinePanel;
+class PreviewPopup;
 class QLabel;
 class QMenu;
 class QSplitter;
 class QStackedWidget;
 class QTabWidget;
+class QToolButton;
 class QUrl;
 class QVBoxLayout;
 class SearchPanel;
+class TagsPanel;
 class Vault;
 
 class MainWindow : public QMainWindow
@@ -42,7 +47,13 @@ private:
     NoteView *currentView() const;
     QList<NoteView *> views() const;
     NoteView *createTab();
-    void closeTab(int index, bool saveFirst = true);
+    void closeView(NoteView *v, bool saveFirst = true);
+    void updateTabButton(NoteView *v);
+    QTabWidget *createPane();
+    QList<QTabWidget *> panes() const;
+    QTabWidget *paneOf(NoteView *v) const;
+    void setActivePane(QTabWidget *pane);
+    void splitRight();
     void saveAll();
 
     void openPath(const QString &path, bool newTab, const QString &heading = {}, int line = -1);
@@ -53,15 +64,25 @@ private:
     void renamePath(const QString &from, const QString &to);
     void movePath(const QString &from, const QString &toDir);
     void deletePath(const QString &path);
+    void deletePaths(const QStringList &paths);
+    bool confirmDeletion() const;
     void quickSwitcher(bool newTab = false);
     void commandPalette();
     QWidget *buildFilesPage();
     void fillNoteMenu(QMenu *menu, NoteView *v, bool tab);
     void addFileActions(QMenu *menu, const QString &path, bool deletable = false);
     void searchVault(const QString &text = {});
-    void showTabMenu(const QPoint &pos);
+    void showTabMenu(QTabWidget *pane, const QPoint &pos);
     void duplicatePath(const QString &path);
-    void chooseFolderAndMove(const QString &path);
+    void chooseFolderAndMove(const QStringList &paths);
+    void previewLink(const QString &href, const QPoint &globalPos);
+    void showPreview();
+    QString defaultNoteDir() const;
+    void openDailyNote();
+    void insertTemplate(Editor *editor);
+    void openSettings();
+    void applySettings();
+    void applySettings(NoteView *v);
     void revealInTree(const QString &path);
     QString findVault(const QString &name) const;
     void zoom(double delta);
@@ -86,12 +107,22 @@ private:
     QSplitter *m_split = nullptr;
     QTabWidget *m_left = nullptr;
     QTabWidget *m_right = nullptr;
-    QTabWidget *m_tabs = nullptr;
+    QStackedWidget *m_center = nullptr; // the panes, or the "no note open" page
+    QWidget *m_empty = nullptr;
+    QSplitter *m_panes = nullptr;
+    QTabWidget *m_tabs = nullptr; // the active pane
     FileTree *m_tree = nullptr;
     SearchPanel *m_search = nullptr;
     BacklinksPanel *m_backlinks = nullptr;
     OutgoingPanel *m_outgoing = nullptr;
     OutlinePanel *m_outline = nullptr;
+    TagsPanel *m_tags = nullptr;
+    BookmarksPanel *m_bookmarks = nullptr;
+    PreviewPopup *m_preview = nullptr;
+    QTimer m_previewTimer;
+    QString m_previewHref;
+    QPoint m_previewPos;
+    QToolButton *m_backlinkCount = nullptr;
     QLabel *m_vaultLabel = nullptr;
     QLabel *m_statsLabel = nullptr;
     QList<QAction *> m_vaultActions;

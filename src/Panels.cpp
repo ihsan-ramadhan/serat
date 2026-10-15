@@ -5,6 +5,7 @@
 #include "Theme.h"
 #include "Vault.h"
 
+#include <QActionGroup>
 #include <QApplication>
 #include <QCollator>
 #include <QDesktopServices>
@@ -12,12 +13,20 @@
 #include <QFile>
 #include <QFileInfo>
 #include <QFileSystemModel>
+#include <QHBoxLayout>
+#include <QHeaderView>
+#include <QJsonArray>
+#include <QJsonDocument>
+#include <QJsonObject>
 #include <QLabel>
 #include <QLineEdit>
 #include <QMenu>
 #include <QMimeData>
 #include <QPainter>
+#include <QSettings>
 #include <QSortFilterProxyModel>
+#include <QToolButton>
+#include <QTreeWidgetItemIterator>
 #include <QUrl>
 #include <QVBoxLayout>
 
@@ -173,7 +182,10 @@ FileTree::FileTree(QWidget *parent)
     setContextMenuPolicy(Qt::CustomContextMenu);
 
     connect(this, &QTreeView::customContextMenuRequested, this, &FileTree::showMenu);
+    setSelectionMode(ExtendedSelection);
     connect(this, &QTreeView::clicked, this, [this](const QModelIndex &index) {
+        if (QApplication::keyboardModifiers() & Qt::ShiftModifier)
+            return; // Shift+click picks files for a group action
         if (m_fs->isDir(m_proxy->mapToSource(index)))
             setExpanded(index, !isExpanded(index));
         else
@@ -219,6 +231,29 @@ void FileTree::reveal(const QString &path)
     scrollTo(index);
 }
 
+// Shift+click adds or removes a file from the selection; Ctrl+click stays "open in new tab".
+QItemSelectionModel::SelectionFlags FileTree::selectionCommand(const QModelIndex &index, const QEvent *e) const
+{
+    if (e && (e->type() == QEvent::MouseButtonPress || e->type() == QEvent::MouseButtonRelease)) {
+        const auto *m = static_cast<const QMouseEvent *>(e);
+        if (m->button() == Qt::RightButton && selectionModel()->isSelected(index))
+            return QItemSelectionModel::NoUpdate; // the menu acts on the whole selection
+        if (m->modifiers() & Qt::ShiftModifier)
+            return e->type() == QEvent::MouseButtonPress ? QItemSelectionModel::Toggle | QItemSelectionModel::Rows
+                                                          : QItemSelectionModel::NoUpdate;
+        return QItemSelectionModel::ClearAndSelect | QItemSelectionModel::Rows;
+    }
+    return QTreeView::selectionCommand(index, e);
+}
+
+QStringList FileTree::selectedPaths() const
+{
+    QStringList out;
+    for (const QModelIndex &index : selectionModel()->selectedRows())
+        out << pathAt(index);
+    return out;
+}
+
 void FileTree::showMenu(const QPoint &pos)
 {
     if (!m_vault)
@@ -227,6 +262,13 @@ void FileTree::showMenu(const QPoint &pos)
     const bool dir = path.isEmpty() || m_vault->isDir(path);
 
     QMenu menu(this);
+    if (const QStringList many = selectedPaths(); many.size() > 1 && many.contains(path)) {
+        menu.addAction(tr("Move %n items to...", nullptr, int(many.size())), this, [this, many] { Q_EMIT moveManyRequested(many); });
+        menu.addSeparator();
+        menu.addAction(tr("Delete %n items", nullptr, int(many.size())), this, [this, many] { Q_EMIT deleteManyRequested(many); });
+        menu.exec(viewport()->mapToGlobal(pos));
+        return;
+    }
     if (dir) {
         menu.addAction(tr("New note"), this, [this, path] { Q_EMIT newNoteRequested(path); });
         menu.addAction(tr("New folder"), this, [this, path] { Q_EMIT newFolderRequested(path); });
@@ -240,6 +282,8 @@ void FileTree::showMenu(const QPoint &pos)
     menu.addSeparator();
     menu.addAction(tr("Make a copy"), this, [this, path] { Q_EMIT duplicateRequested(path); });
     menu.addAction(dir ? tr("Move folder to...") : tr("Move file to..."), this, [this, path] { Q_EMIT moveToRequested(path); });
+    if (extraActions)
+        extraActions(&menu, path);
     if (dir)
         menu.addAction(tr("Search in folder"), this, [this, path] { Q_EMIT searchInFolderRequested(path); });
     menu.addSeparator();
@@ -374,25 +418,77 @@ void FileTree::dropEvent(QDropEvent *e)
 SearchPanel::SearchPanel(QWidget *parent)
     : QWidget(parent)
     , m_edit(new QLineEdit(this))
+    , m_case(new QToolButton(this))
     , m_summary(new QLabel(this))
     , m_results(new QTreeWidget(this))
 {
     m_edit->setPlaceholderText(tr("Search vault…"));
     m_edit->setClearButtonEnabled(true);
+    m_edit->setToolTip(tr("Words must all match. Also \"exact phrase\", /regex/, -exclude, OR,\n"
+                          "file:, path:, tag:, line:( ), section:( ), task:, task-todo:, task-done:"));
     m_summary->setContentsMargins(4, 0, 4, 0);
     m_summary->setForegroundRole(QPalette::PlaceholderText);
     setupList(m_results);
 
+    QSettings settings;
+    m_case->setIcon(Theme::icon(u"case"_s));
+    m_case->setCheckable(true);
+    m_case->setChecked(settings.value(u"searchMatchCase"_s, false).toBool());
+    m_case->setToolTip(tr("Match case"));
+    m_sort = static_cast<Sort>(settings.value(u"searchSort"_s, 0).toInt());
+    auto *sort = new QToolButton(this);
+    sort->setIcon(Theme::icon(u"sort"_s));
+    sort->setToolTip(tr("Change sort order"));
+    sort->setPopupMode(QToolButton::InstantPopup);
+    auto *sortMenu = new QMenu(sort);
+    const std::pair<Sort, QString> orders[] = {
+        {Sort::NameAsc, tr("File name (A to Z)")},      {Sort::NameDesc, tr("File name (Z to A)")},
+        {Sort::ModifiedNew, tr("Modified time (new to old)")}, {Sort::ModifiedOld, tr("Modified time (old to new)")},
+        {Sort::CreatedNew, tr("Created time (new to old)")},   {Sort::CreatedOld, tr("Created time (old to new)")}};
+    auto *group = new QActionGroup(sortMenu);
+    for (const auto &[order, label] : orders) {
+        QAction *a = sortMenu->addAction(label, this, [this, order] {
+            m_sort = order;
+            QSettings().setValue(u"searchSort"_s, int(order));
+            rerun();
+        });
+        a->setCheckable(true);
+        a->setChecked(order == m_sort);
+        group->addAction(a);
+        if (order == Sort::NameDesc || order == Sort::ModifiedOld)
+            sortMenu->addSeparator();
+    }
+    sort->setMenu(sortMenu);
+    auto *bookmark = new QToolButton(this);
+    bookmark->setIcon(Theme::icon(u"bookmark"_s));
+    bookmark->setToolTip(tr("Bookmark this search"));
+    connect(bookmark, &QToolButton::clicked, this, [this] {
+        if (!query().isEmpty())
+            Q_EMIT bookmarkRequested(query());
+    });
+
+    auto *options = new QHBoxLayout;
+    options->setContentsMargins(0, 0, 0, 0);
+    options->setSpacing(2);
+    options->addWidget(m_summary, 1);
+    options->addWidget(m_case);
+    options->addWidget(sort);
+    options->addWidget(bookmark);
+
     auto *layout = new QVBoxLayout(this);
     layout->setContentsMargins(6, 6, 6, 0);
     layout->addWidget(m_edit);
-    layout->addWidget(m_summary);
+    layout->addLayout(options);
     layout->addWidget(m_results, 1);
 
     m_timer.setSingleShot(true);
     m_timer.setInterval(200);
     connect(&m_timer, &QTimer::timeout, this, &SearchPanel::rerun);
     connect(m_edit, &QLineEdit::textChanged, &m_timer, qOverload<>(&QTimer::start));
+    connect(m_case, &QToolButton::toggled, this, [this](bool on) {
+        QSettings().setValue(u"searchMatchCase"_s, on);
+        rerun();
+    });
     connect(m_results, &QTreeWidget::itemClicked, this, [this](QTreeWidgetItem *item) {
         Q_EMIT openRequested(item->data(0, PathRole).toString(), item->data(0, LineRole).toInt(), ctrlHeld());
     });
@@ -412,6 +508,11 @@ void SearchPanel::search(const QString &text)
     rerun();
 }
 
+QString SearchPanel::query() const
+{
+    return m_edit->text().trimmed();
+}
+
 void SearchPanel::focusSearch()
 {
     m_edit->setFocus();
@@ -422,32 +523,264 @@ void SearchPanel::rerun()
 {
     m_results->clear();
     m_summary->clear();
-    const QString query = m_edit->text().trimmed();
-    if (!m_vault || query.isEmpty())
+    if (!m_vault || query().isEmpty())
         return;
 
-    const QList<SearchHit> hits = m_vault->search(query);
-    QTreeWidgetItem *file = nullptr;
-    int files = 0;
+    const QList<SearchHit> hits = m_vault->search(query(), 500, m_case->isChecked());
+    QStringList files;
+    QHash<QString, QList<const SearchHit *>> byFile;
     for (const SearchHit &hit : hits) {
-        if (!file || file->data(0, PathRole).toString() != hit.path) {
-            file = new QTreeWidgetItem(m_results, {Vault::baseName(hit.path)});
-            file->setData(0, PathRole, hit.path);
-            file->setData(0, LineRole, -1);
-            file->setToolTip(0, hit.path);
-            QFont f = file->font(0);
-            f.setBold(true);
-            file->setFont(0, f);
-            ++files;
+        if (!byFile.contains(hit.path))
+            files << hit.path;
+        byFile[hit.path] << &hit;
+    }
+    QCollator collator;
+    collator.setNumericMode(true);
+    collator.setCaseSensitivity(Qt::CaseInsensitive);
+    QHash<QString, QFileInfo> info;
+    if (m_sort != Sort::NameAsc && m_sort != Sort::NameDesc)
+        for (const QString &f : std::as_const(files))
+            info.insert(f, QFileInfo(m_vault->absolutePath(f)));
+    std::sort(files.begin(), files.end(), [&](const QString &a, const QString &b) {
+        const QFileInfo fa = info.value(a), fb = info.value(b);
+        switch (m_sort) {
+        case Sort::NameDesc: return collator.compare(Vault::baseName(a), Vault::baseName(b)) > 0;
+        case Sort::ModifiedNew: return fa.lastModified() > fb.lastModified();
+        case Sort::ModifiedOld: return fa.lastModified() < fb.lastModified();
+        case Sort::CreatedNew: return fa.birthTime() > fb.birthTime();
+        case Sort::CreatedOld: return fa.birthTime() < fb.birthTime();
+        default: return collator.compare(Vault::baseName(a), Vault::baseName(b)) < 0;
         }
-        if (hit.line < 0)
-            continue;
-        auto *line = new QTreeWidgetItem(file, {hit.text.left(240)});
-        line->setData(0, PathRole, hit.path);
-        line->setData(0, LineRole, hit.line);
+    });
+    for (const QString &path : std::as_const(files)) {
+        auto *file = new QTreeWidgetItem(m_results, {Vault::baseName(path)});
+        file->setData(0, PathRole, path);
+        file->setData(0, LineRole, -1);
+        file->setToolTip(0, path);
+        QFont f = file->font(0);
+        f.setBold(true);
+        file->setFont(0, f);
+        for (const SearchHit *hit : byFile.value(path)) {
+            if (hit->line < 0)
+                continue;
+            auto *line = new QTreeWidgetItem(file, {hit->text.left(240)});
+            line->setData(0, PathRole, hit->path);
+            line->setData(0, LineRole, hit->line);
+        }
     }
     m_results->expandAll();
-    m_summary->setText(files ? tr("%n file(s)", nullptr, files) : tr("No matches"));
+    m_summary->setText(files.isEmpty() ? tr("No matches") : files.size() == 1 ? tr("1 file") : tr("%1 files").arg(files.size()));
+}
+
+TagsPanel::TagsPanel(QWidget *parent)
+    : QTreeWidget(parent)
+{
+    setupList(this);
+    setColumnCount(2);
+    header()->setStretchLastSection(false);
+    header()->setSectionResizeMode(0, QHeaderView::Stretch);
+    header()->setSectionResizeMode(1, QHeaderView::ResizeToContents);
+    connect(this, &QTreeWidget::itemClicked, this, [this](QTreeWidgetItem *item) {
+        if (const QString tag = item->data(0, PathRole).toString(); !tag.isEmpty())
+            Q_EMIT searchRequested(u"tag:#"_s + tag);
+    });
+}
+
+void TagsPanel::showFor(const Vault *vault)
+{
+    QSet<QString> open;
+    for (QTreeWidgetItemIterator it(this); *it; ++it)
+        if ((*it)->isExpanded())
+            open.insert((*it)->data(0, PathRole).toString());
+    clear();
+    QMap<QString, int> counts; // full tag -> notes, including the notes of nested tags
+    if (vault) {
+        for (const Note &n : vault->notes()) {
+            QSet<QString> seen;
+            for (const QString &tag : n.tags) {
+                const QStringList parts = tag.split(u'/', Qt::SkipEmptyParts);
+                for (int i = 1; i <= parts.size(); ++i)
+                    seen.insert(parts.mid(0, i).join(u'/'));
+            }
+            for (const QString &t : std::as_const(seen))
+                ++counts[t];
+        }
+    }
+    if (counts.isEmpty()) {
+        placeholder(this, tr("No tags found."));
+        return;
+    }
+    QCollator collator;
+    collator.setCaseSensitivity(Qt::CaseInsensitive);
+    QStringList tags = counts.keys();
+    std::sort(tags.begin(), tags.end(), [&](const QString &a, const QString &b) { return collator.compare(a, b) < 0; });
+    QHash<QString, QTreeWidgetItem *> items;
+    for (const QString &tag : std::as_const(tags)) {
+        const qsizetype slash = tag.lastIndexOf(u'/');
+        QTreeWidgetItem *parent = slash < 0 ? nullptr : items.value(tag.left(slash));
+        auto *item = parent ? new QTreeWidgetItem(parent) : new QTreeWidgetItem(this);
+        item->setText(0, u'#' + tag.mid(slash + 1));
+        item->setText(1, QString::number(counts.value(tag)));
+        item->setTextAlignment(1, Qt::AlignRight | Qt::AlignVCenter);
+        item->setForeground(1, palette().color(QPalette::PlaceholderText));
+        item->setData(0, PathRole, tag);
+        item->setToolTip(0, u'#' + tag);
+        item->setExpanded(open.contains(tag));
+        items.insert(tag, item);
+    }
+}
+
+BookmarksPanel::BookmarksPanel(QWidget *parent)
+    : QTreeWidget(parent)
+{
+    setupList(this);
+    setIndentation(0);
+    connect(this, &QTreeWidget::itemClicked, this, [this](QTreeWidgetItem *item) {
+        const int i = item->data(0, LineRole).toInt();
+        if (i < 0 || i >= m_items.size())
+            return;
+        const Bookmark &b = m_items[i];
+        if (b.type == u"search")
+            Q_EMIT searchRequested(b.value);
+        else
+            Q_EMIT openRequested(b.value, ctrlHeld());
+    });
+    connect(this, &QWidget::customContextMenuRequested, this, &BookmarksPanel::showMenu);
+}
+
+void BookmarksPanel::setVault(Vault *vault, const QString &settingsGroup)
+{
+    if (m_vault)
+        disconnect(m_vault, nullptr, this, nullptr);
+    m_vault = vault;
+    m_group = settingsGroup;
+    m_items.clear();
+    QSettings settings;
+    settings.beginGroup(m_group);
+    if (settings.contains(u"bookmarks"_s)) {
+        for (const QVariant &v : settings.value(u"bookmarks"_s).toList()) {
+            const QVariantMap m = v.toMap();
+            m_items.append({m.value(u"type"_s).toString(), m.value(u"value"_s).toString()});
+        }
+    } else {
+        QFile f(vault->root() + u"/.obsidian/bookmarks.json"_s);
+        if (f.open(QIODevice::ReadOnly)) {
+            const QJsonArray items = QJsonDocument::fromJson(f.readAll()).object().value(u"items"_s).toArray();
+            for (const QJsonValue &v : items) {
+                const QJsonObject o = v.toObject();
+                const QString type = o.value(u"type"_s).toString();
+                if (type == u"file" || type == u"folder")
+                    m_items.append({type, o.value(u"path"_s).toString()});
+                else if (type == u"search")
+                    m_items.append({type, o.value(u"query"_s).toString()});
+            }
+        }
+    }
+    connect(vault, &Vault::renamed, this, &BookmarksPanel::renamed);
+    rebuild();
+}
+
+bool BookmarksPanel::has(const QString &path) const
+{
+    return std::any_of(m_items.cbegin(), m_items.cend(), [&](const Bookmark &b) { return b.type != u"search" && b.value == path; });
+}
+
+void BookmarksPanel::toggle(const QString &path)
+{
+    if (has(path))
+        m_items.removeIf([&](const Bookmark &b) { return b.type != u"search" && b.value == path; });
+    else
+        m_items.append({m_vault && m_vault->isDir(path) ? u"folder"_s : u"file"_s, path});
+    save();
+    rebuild();
+}
+
+void BookmarksPanel::addSearch(const QString &query)
+{
+    if (std::none_of(m_items.cbegin(), m_items.cend(), [&](const Bookmark &b) { return b.type == u"search" && b.value == query; }))
+        m_items.append({u"search"_s, query});
+    save();
+    rebuild();
+}
+
+void BookmarksPanel::save() const
+{
+    QVariantList list;
+    for (const Bookmark &b : m_items)
+        list << QVariantMap{{u"type"_s, b.type}, {u"value"_s, b.value}};
+    QSettings settings;
+    settings.beginGroup(m_group);
+    settings.setValue(u"bookmarks"_s, list);
+}
+
+void BookmarksPanel::rebuild()
+{
+    clear();
+    if (m_items.isEmpty()) {
+        placeholder(this, tr("No bookmarks yet. Use Bookmark in a file's menu or the search panel."));
+        return;
+    }
+    for (int i = 0; i < m_items.size(); ++i) {
+        const Bookmark &b = m_items[i];
+        const QString name = b.type == u"search" ? b.value : b.type == u"folder" ? b.value.section(u'/', -1) : Vault::baseName(b.value);
+        auto *item = new QTreeWidgetItem(this, {name});
+        item->setIcon(0, Theme::icon(b.type == u"search" ? u"search"_s : b.type == u"folder" ? u"folder"_s : u"file"_s));
+        item->setData(0, LineRole, i);
+        item->setToolTip(0, b.value);
+        if (b.type != u"search" && m_vault && !m_vault->exists(b.value))
+            item->setForeground(0, palette().color(QPalette::PlaceholderText));
+    }
+}
+
+void BookmarksPanel::showMenu(const QPoint &pos)
+{
+    const QTreeWidgetItem *item = itemAt(pos);
+    if (!item || !(item->flags() & Qt::ItemIsEnabled))
+        return;
+    const int i = item->data(0, LineRole).toInt();
+    const Bookmark b = m_items.value(i);
+    QMenu menu(this);
+    if (b.type == u"file")
+        PathActions::addOpenActions(&menu, this, [this, b](bool newTab) { Q_EMIT openRequested(b.value, newTab); });
+    if (i > 0)
+        menu.addAction(tr("Move up"), this, [this, i] {
+            m_items.swapItemsAt(i, i - 1);
+            save();
+            rebuild();
+        });
+    if (i + 1 < m_items.size())
+        menu.addAction(tr("Move down"), this, [this, i] {
+            m_items.swapItemsAt(i, i + 1);
+            save();
+            rebuild();
+        });
+    menu.addSeparator();
+    menu.addAction(tr("Remove bookmark"), this, [this, i] {
+        m_items.removeAt(i);
+        save();
+        rebuild();
+    });
+    menu.exec(viewport()->mapToGlobal(pos));
+}
+
+void BookmarksPanel::renamed(const QString &from, const QString &to)
+{
+    bool changed = false;
+    for (Bookmark &b : m_items) {
+        if (b.type == u"search")
+            continue;
+        if (b.value == from) {
+            b.value = to;
+            changed = true;
+        } else if (b.value.startsWith(from + u'/')) {
+            b.value = to + b.value.mid(from.size());
+            changed = true;
+        }
+    }
+    if (changed) {
+        save();
+        rebuild();
+    }
 }
 
 BacklinksPanel::BacklinksPanel(QWidget *parent)
@@ -471,9 +804,16 @@ void BacklinksPanel::showFor(const Vault *vault, const QString &path)
 {
     clear();
     m_vault = vault;
-    if (!vault || path.isEmpty())
+    m_sources = 0;
+    if (!vault || path.isEmpty()) {
+        placeholder(this, tr("Open a note to see what links to it."));
         return;
+    }
     const auto links = vault->backlinks(path);
+    QSet<QString> sources;
+    for (const auto &link : links)
+        sources.insert(link.first);
+    m_sources = int(sources.size());
     if (links.isEmpty()) {
         placeholder(this, tr("No backlinks found."));
         return;
@@ -522,8 +862,10 @@ void OutgoingPanel::showFor(const Vault *vault, const QString &path)
     m_vault = vault;
     m_path = path;
     const Note *note = vault ? vault->note(path) : nullptr;
-    if (!note)
+    if (!note) {
+        placeholder(this, tr("Open a note to see its links."));
         return;
+    }
     QStringList seen;
     for (const Link &l : note->links) {
         if (l.target.isEmpty())
@@ -564,8 +906,10 @@ OutlinePanel::OutlinePanel(QWidget *parent)
 void OutlinePanel::showFor(const Note *note)
 {
     clear();
-    if (!note)
+    if (!note) {
+        placeholder(this, tr("Open a note to see its headings."));
         return;
+    }
     QList<QPair<int, QTreeWidgetItem *>> stack;
     for (const Heading &h : note->headings) {
         while (!stack.isEmpty() && stack.last().first >= h.level)

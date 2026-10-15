@@ -7,11 +7,15 @@
 #include <QApplication>
 #include <QClipboard>
 #include <QContextMenuEvent>
+#include <QGuiApplication>
 #include <QMenu>
+#include <QMouseEvent>
+#include <QScreen>
 #include <QScrollBar>
 #include <QTextCursor>
 #include <QTextImageFormat>
 #include <QUrlQuery>
+#include <QVBoxLayout>
 
 using namespace Qt::StringLiterals;
 
@@ -25,6 +29,18 @@ Reader::Reader(QWidget *parent)
     setOpenExternalLinks(false);
     setWordWrapMode(QTextOption::WrapAtWordBoundaryOrAnywhere);
     setHorizontalScrollBarPolicy(Qt::ScrollBarAlwaysOff);
+}
+
+void Reader::mouseMoveEvent(QMouseEvent *e)
+{
+    QTextBrowser::mouseMoveEvent(e);
+    QString href = e->modifiers() & Qt::ControlModifier ? anchorAt(e->position().toPoint()) : QString();
+    if (!href.startsWith(u"wiki:"_s))
+        href.clear();
+    if (href != m_hover) {
+        m_hover = href;
+        Q_EMIT hoverLink(href, e->globalPosition().toPoint());
+    }
 }
 
 int Reader::contentWidth() const
@@ -93,4 +109,39 @@ void Reader::contextMenuEvent(QContextMenuEvent *e)
     }
     menu->exec(e->globalPos());
     delete menu;
+}
+
+PreviewPopup::PreviewPopup(QWidget *parent)
+    : QFrame(parent, Qt::ToolTip | Qt::FramelessWindowHint)
+    , m_reader(new Reader(this))
+{
+    setObjectName(u"preview"_s);
+    setAttribute(Qt::WA_ShowWithoutActivating);
+    auto *layout = new QVBoxLayout(this);
+    layout->setContentsMargins(1, 1, 1, 1);
+    layout->addWidget(m_reader);
+    resize(460, 340);
+}
+
+void PreviewPopup::popup(const QString &html, const QString &anchor, const QPoint &globalPos)
+{
+    m_reader->setHtml(html);
+    if (!anchor.isEmpty())
+        m_reader->scrollToAnchor(anchor);
+    QPoint at = globalPos + QPoint(12, 16);
+    if (const QScreen *screen = QGuiApplication::screenAt(globalPos)) {
+        const QRect area = screen->availableGeometry();
+        if (at.x() + width() > area.right())
+            at.setX(area.right() - width());
+        if (at.y() + height() > area.bottom())
+            at.setY(globalPos.y() - height() - 8);
+    }
+    move(at);
+    show();
+}
+
+void PreviewPopup::leaveEvent(QEvent *e)
+{
+    QFrame::leaveEvent(e);
+    hide();
 }

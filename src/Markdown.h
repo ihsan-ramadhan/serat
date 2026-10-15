@@ -1,6 +1,7 @@
 #pragma once
 
 #include <QPalette>
+#include <QSet>
 #include <QStringList>
 
 class Vault;
@@ -12,6 +13,7 @@ struct RenderOptions {
     QPalette palette;
     bool dark = false;
     int depth = 0;          // embed nesting
+    QSet<int> toggledCallouts; // foldable callouts clicked open or shut, by order in the note
 };
 
 struct RenderResult {
@@ -19,7 +21,7 @@ struct RenderResult {
     QStringList codeBlocks; // referenced by "copy:<index>" links
 };
 
-// Links in the HTML: wiki:<target>[#heading], task:<utf8 offset>, copy:<n> and plain URLs.
+// Links in the HTML: wiki:<target>[#heading], task:<utf8 offset>, copy:<n>, callout:<n> and plain URLs.
 RenderResult renderMarkdown(const QString &text, const RenderOptions &opt);
 QString renderTableCell(const QString &cell, const RenderOptions &opt);
 QString markdownStyleSheet(const QPalette &pal, double basePointSize);

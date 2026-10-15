@@ -148,3 +148,65 @@ bool QuickSwitcher::eventFilter(QObject *obj, QEvent *e)
     }
     return QDialog::eventFilter(obj, e);
 }
+
+QString pickItem(QWidget *parent, const QString &title, const QString &placeholder, const QStringList &items)
+{
+    QDialog dlg(parent);
+    dlg.setWindowTitle(title);
+    dlg.resize(520, 380);
+    auto *edit = new QLineEdit(&dlg);
+    edit->setPlaceholderText(placeholder);
+    auto *list = new QListWidget(&dlg);
+    list->setObjectName(u"switcher"_s);
+    auto *layout = new QVBoxLayout(&dlg);
+    layout->addWidget(edit);
+    layout->addWidget(list, 1);
+    auto refilter = [&] {
+        list->clear();
+        QList<QPair<int, QString>> ranked;
+        for (const QString &item : items)
+            if (const int score = fuzzyScore(edit->text().trimmed(), item); score >= 0)
+                ranked.append({score, item});
+        std::stable_sort(ranked.begin(), ranked.end(), [](const auto &a, const auto &b) { return a.first > b.first; });
+        for (const auto &[score, item] : std::as_const(ranked))
+            list->addItem(item);
+        list->setCurrentRow(0);
+    };
+    QString chosen;
+    QObject::connect(edit, &QLineEdit::textChanged, &dlg, refilter);
+    QObject::connect(list, &QListWidget::itemActivated, &dlg, [&](QListWidgetItem *item) {
+        chosen = item->text();
+        dlg.accept();
+    });
+    QObject::connect(edit, &QLineEdit::returnPressed, &dlg, [&] {
+        if (list->currentItem()) {
+            chosen = list->currentItem()->text();
+            dlg.accept();
+        }
+    });
+    // Up and Down in the filter move through the list.
+    class Keys : public QObject
+    {
+    public:
+        explicit Keys(QListWidget *list)
+            : m_list(list)
+        {
+        }
+        bool eventFilter(QObject *, QEvent *e) override
+        {
+            if (e->type() != QEvent::KeyPress)
+                return false;
+            const int key = static_cast<QKeyEvent *>(e)->key();
+            if (key != Qt::Key_Up && key != Qt::Key_Down && key != Qt::Key_PageUp && key != Qt::Key_PageDown)
+                return false;
+            QApplication::sendEvent(m_list, e);
+            return true;
+        }
+
+    private:
+        QListWidget *m_list;
+    } keys(list);
+    edit->installEventFilter(&keys);
+    refilter();
+    return dlg.exec() == QDialog::Accepted ? chosen : QString();
+}

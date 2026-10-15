@@ -2,6 +2,7 @@
 
 #include <QPixmap>
 #include <QTimer>
+#include <QSet>
 #include <QWidget>
 
 class Editor;
@@ -27,7 +28,9 @@ public:
     void open(const QString &path, bool pushHistory = true);
     // Autosave passes false so an open table cell editor stays open.
     bool save(bool commitTables = true);
+    // Takes in a change made outside Serat, merged with unsaved edits when they do not overlap.
     void reloadFromDisk();
+    bool hasUnsavedChanges() const;
     // A new note left without a name or text is removed instead of kept.
     void markNew() { m_newPath = m_path; }
     bool discardIfUntouched();
@@ -35,6 +38,9 @@ public:
     void resetTitle();
 
     Mode mode() const { return m_mode; }
+    // Links followed from a pinned tab open in a new tab.
+    bool isPinned() const { return m_pinned; }
+    void setPinned(bool on) { m_pinned = on; }
     void setMode(Mode mode);
     bool canGoBack() const { return !m_back.isEmpty(); }
     bool canGoForward() const { return !m_forward.isEmpty(); }
@@ -51,6 +57,8 @@ public:
     void setLivePreview(bool on);
     void setLinkCandidates(const QStringList &names);
     void refreshRender();
+    // Margins and overlays again, after the readable line length setting changed.
+    void relayout();
     QString statsText() const;
 
 Q_SIGNALS:
@@ -61,6 +69,9 @@ Q_SIGNALS:
     void modeChanged();
     void hintChanged(const QString &hint);
     void moreRequested(const QPoint &globalPos);
+    void hoverLink(const QString &href, const QPoint &globalPos);
+    void saved();
+    void notice(const QString &message);
 
 protected:
     void resizeEvent(QResizeEvent *e) override;
@@ -78,6 +89,9 @@ private:
     void updateMargins();
     void scaleImage();
     void updateHeader();
+    QString foldsKey() const;
+    void storeFolds();
+    QList<int> savedFolds() const;
 
     Vault *m_vault;
     QString m_path;
@@ -85,9 +99,11 @@ private:
     QString m_newPath;
     bool m_crlf = false;
     bool m_loading = false;
+    bool m_pinned = false;
     Mode m_mode = Edit;
     QStringList m_back, m_forward;
     QStringList m_codeBlocks;
+    QSet<int> m_openCallouts;
     QFont m_font;
 
     QWidget *m_header;

@@ -4,6 +4,7 @@
 #include "MarkdownHighlighter.h"
 #include "PathActions.h"
 #include "Properties.h"
+#include "Settings.h"
 #include "TableEditor.h"
 #include "Theme.h"
 #include "Vault.h"
@@ -16,6 +17,7 @@
 #include <QCompleter>
 #include <QDateTime>
 #include <QDir>
+#include <QDropEvent>
 #include <QFile>
 #include <QFileInfo>
 #include <QImage>
@@ -26,6 +28,7 @@
 #include <QPointer>
 #include <QScopedValueRollback>
 #include <QPainter>
+#include <QRandomGenerator>
 #include <QTextLayout>
 #include <QRegularExpression>
 #include <QScrollBar>
@@ -141,16 +144,93 @@ private:
     QPixmap m_scaled;
 };
 
+namespace {
+bool g_readable = true;
+}
+
+void setReadableLineLength(bool on)
+{
+    g_readable = on;
+}
+
 int readableMargin(int available, int maxWidth, int minMargin)
 {
-    return qMax(minMargin, (available - maxWidth) / 2);
+    return g_readable ? qMax(minMargin, (available - maxWidth) / 2) : minMargin;
 }
+
+// Fold arrows in the left margin, beside the lines they fold.
+class FoldGutter : public QWidget
+{
+public:
+    explicit FoldGutter(Editor *editor)
+        : QWidget(editor)
+        , m_editor(editor)
+    {
+        setMouseTracking(true);
+        setCursor(Qt::PointingHandCursor);
+    }
+
+protected:
+    QTextBlock blockAt(int y) const
+    {
+        const QPointF offset = m_editor->contentOffset();
+        for (QTextBlock b = m_editor->firstVisibleBlock(); b.isValid(); b = b.next()) {
+            if (!b.isVisible())
+                continue;
+            const QRectF r = m_editor->blockBoundingGeometry(b).translated(offset);
+            if (r.top() > height())
+                break;
+            if (y >= r.top() && y < r.bottom())
+                return b;
+        }
+        return {};
+    }
+    void paintEvent(QPaintEvent *) override
+    {
+        QPainter p(this);
+        const QPointF offset = m_editor->contentOffset();
+        const QSet<int> folded = [this] {
+            QSet<int> out;
+            for (const QTextBlock &b : m_editor->foldHeads())
+                out.insert(b.blockNumber());
+            return out;
+        }();
+        for (QTextBlock b = m_editor->firstVisibleBlock(); b.isValid(); b = b.next()) {
+            if (!b.isVisible())
+                continue;
+            const QRectF r = m_editor->blockBoundingGeometry(b).translated(offset);
+            if (r.top() > height())
+                break;
+            const bool isFolded = folded.contains(b.blockNumber());
+            if (!isFolded && b != m_editor->m_hoverBlock)
+                continue;
+            if (!isFolded && !m_editor->foldEnd(b).isValid())
+                continue;
+            const double lineHeight = b.layout() && b.layout()->lineCount() ? b.layout()->lineAt(0).height() : r.height();
+            const int side = 14;
+            Theme::icon(isFolded ? u"chevron-right"_s : u"chevron-down"_s)
+                .paint(&p, QRect((width() - side) / 2, int(r.top() + (lineHeight - side) / 2), side, side));
+        }
+    }
+    void mouseMoveEvent(QMouseEvent *e) override { m_editor->setHoverBlock(blockAt(int(e->position().y()))); }
+    void leaveEvent(QEvent *) override { m_editor->setHoverBlock({}); }
+    void mousePressEvent(QMouseEvent *e) override
+    {
+        const QTextBlock b = blockAt(int(e->position().y()));
+        if (b.isValid())
+            m_editor->toggleFold(b);
+    }
+
+private:
+    Editor *m_editor;
+};
 
 Editor::Editor(QWidget *parent)
     : QPlainTextEdit(parent)
     , m_highlighter(new MarkdownHighlighter(document()))
     , m_completer(new QCompleter(this))
     , m_candidates(new QStringListModel(this))
+    , m_gutter(new FoldGutter(this))
 {
     setFrameShape(QFrame::NoFrame);
     setBackgroundRole(QPalette::Base);
@@ -177,6 +257,7 @@ Editor::Editor(QWidget *parent)
             m_tableTimer.start();
     });
     connect(this, &QPlainTextEdit::updateRequest, this, &Editor::positionTables);
+    connect(this, &QPlainTextEdit::updateRequest, m_gutter, [this] { m_gutter->update(); });
     connect(this, &QPlainTextEdit::cursorPositionChanged, this, &Editor::onCursorMoved);
     connect(this, &QPlainTextEdit::cursorPositionChanged, this, &Editor::updateRawBlocks);
     connect(this, &QPlainTextEdit::selectionChanged, this, &Editor::updateRawBlocks);
@@ -189,7 +270,7 @@ void Editor::setLinkCandidates(const QStringList &names)
     if (names == m_linkNames)
         return;
     m_linkNames = names;
-    if (!m_headingMode)
+    if (!m_headingMode && !m_blockMode)
         m_candidates->setStringList(names);
     if (m_completer->popup()->isVisible())
         updateCompletion();
@@ -242,6 +323,15 @@ void Editor::updateMargins()
     const int scroll = verticalScrollBar()->isVisible() ? verticalScrollBar()->width() : 0;
     const int margin = readableMargin(width() - 2 * frameWidth() - scroll);
     setViewportMargins(margin, 4, margin, 0);
+    positionGutter();
+}
+
+void Editor::positionGutter()
+{
+    const QRect vp = viewport()->geometry();
+    m_gutter->setGeometry(vp.left() - 22, vp.top(), 20, vp.height());
+    m_gutter->setVisible(m_showGutter && vp.left() >= 22);
+    m_gutter->update();
 }
 
 void Editor::paintEvent(QPaintEvent *e)
@@ -250,6 +340,8 @@ void Editor::paintEvent(QPaintEvent *e)
         QPainter p(viewport());
         const QPointF offset = contentOffset();
         for (QTextBlock b = firstVisibleBlock(); b.isValid(); b = b.next()) {
+            if (!b.isVisible())
+                continue; // folded lines can number in the thousands
             const QRectF r = blockBoundingGeometry(b).translated(offset);
             if (r.top() > viewport()->height())
                 break;
@@ -262,6 +354,10 @@ void Editor::paintEvent(QPaintEvent *e)
         const bool dark = palette().color(QPalette::Base).lightness() < 128;
         const double left = document()->documentMargin();
         for (QTextBlock b = m_live ? firstVisibleBlock() : QTextBlock(); b.isValid();) {
+            if (!b.isVisible()) {
+                b = b.next();
+                continue;
+            }
             const QRectF r = blockBoundingGeometry(b).translated(offset);
             if (r.top() > viewport()->height())
                 break;
@@ -270,9 +366,12 @@ void Editor::paintEvent(QPaintEvent *e)
                 b = b.next();
                 continue;
             }
-            if (m_highlighter->hidesMarkup(first.blockNumber())) {
+            if (first.isVisible() && m_highlighter->hidesMarkup(first.blockNumber())) {
+                QTextBlock shown = last;
+                while (shown != first && !shown.isVisible())
+                    shown = shown.previous();
                 const double top = blockBoundingGeometry(first).translated(offset).top() - 2;
-                const double bottom = blockBoundingGeometry(last).translated(offset).bottom() + 2;
+                const double bottom = blockBoundingGeometry(shown).translated(offset).bottom() + 2;
                 const QColor color(calloutStyle(calloutHeadRe().match(first.text()).captured(1)).color);
                 p.setBrush(mix(palette().color(QPalette::Base), color, dark ? 0.14 : 0.09));
                 p.drawRoundedRect(QRectF(left, top, viewport()->width() - 2 * left, bottom - top), 6, 6);
@@ -281,6 +380,28 @@ void Editor::paintEvent(QPaintEvent *e)
         }
     }
     QPlainTextEdit::paintEvent(e);
+    if (!m_folds.isEmpty()) {
+        QPainter p(viewport());
+        p.setRenderHint(QPainter::Antialiasing);
+        const QColor muted = palette().color(QPalette::PlaceholderText);
+        for (const QTextBlock &head : foldHeads()) {
+            QTextLayout *layout = head.layout();
+            if (!head.isVisible() || !layout || layout->lineCount() == 0)
+                continue;
+            const QRectF r = blockBoundingGeometry(head).translated(contentOffset());
+            if (r.bottom() < 0 || r.top() > viewport()->height())
+                continue;
+            const QTextLine line = layout->lineAt(layout->lineCount() - 1);
+            const QFontMetricsF fm(font());
+            const QRectF pill(r.left() + line.x() + line.naturalTextWidth() + fm.height() * 0.4,
+                              r.top() + line.y() + (line.height() - fm.height()) / 2, fm.horizontalAdvance(u"···"_s) + 10, fm.height());
+            p.setPen(Qt::NoPen);
+            p.setBrush(mix(palette().color(QPalette::Base), palette().color(QPalette::Text), 0.08));
+            p.drawRoundedRect(pill, 4, 4);
+            p.setPen(muted);
+            p.drawText(pill, Qt::AlignCenter, u"···"_s);
+        }
+    }
     if (!m_live)
         return;
 
@@ -291,10 +412,14 @@ void Editor::paintEvent(QPaintEvent *e)
     const QColor bar = mix(pal.color(QPalette::Base), pal.color(QPalette::Text), 0.25);
     const QPointF offset = contentOffset();
     for (QTextBlock b = firstVisibleBlock(); b.isValid(); b = b.next()) {
+        if (!b.isVisible())
+            continue;
         if (blockBoundingGeometry(b).translated(offset).top() > viewport()->height())
             break;
         if (!previewed(b))
             continue;
+        if (m_showGuides)
+            paintGuides(p, b);
         if (b.userState() > 0 && (b.userState() & BlockState::Callout))
             paintCalloutHead(p, b);
         for (const Deco &d : decorations(b)) {
@@ -464,6 +589,11 @@ QString Editor::clickedLink(const QPoint &pos) const
 
 void Editor::keyPressEvent(QKeyEvent *e)
 {
+    // Undo is not typing: a property or table change it reverts keeps its panel or grid.
+    if (e->matches(QKeySequence::Undo) || e->matches(QKeySequence::Redo)) {
+        QPlainTextEdit::keyPressEvent(e);
+        return;
+    }
     const QScopedValueRollback typing(m_inKeyPress, true);
     if (m_completer->popup()->isVisible()) {
         switch (e->key()) {
@@ -517,24 +647,13 @@ void Editor::keyPressEvent(QKeyEvent *e)
         indentLines(true);
         return;
     }
-    if (e->text() == u"[") {
-        if (c.hasSelection()) {
-            c.insertText(u'[' + c.selectedText() + u']');
-        } else {
-            c.insertText(u"[]"_s);
-            c.movePosition(QTextCursor::Left);
-            setTextCursor(c);
-        }
+    if (e->text().size() == 1 && !(mods & (Qt::ControlModifier | Qt::AltModifier)) && autoPair(e->text()[0])) {
         updateCompletion();
         return;
     }
-    if (e->text() == u"]" && !c.hasSelection() && next == u']') {
-        c.movePosition(QTextCursor::Right);
-        setTextCursor(c);
-        updateCompletion();
-        return;
-    }
-    if (e->key() == Qt::Key_Backspace && mods == Qt::NoModifier && !c.hasSelection() && prev == u'[' && next == u']') {
+    static const QHash<QChar, QChar> pairs{{u'[', u']'}, {u'(', u')'}, {u'{', u'}'}, {u'"', u'"'}, {u'`', u'`'}};
+    if (e->key() == Qt::Key_Backspace && mods == Qt::NoModifier && !c.hasSelection() && pairs.value(prev) == next
+        && !next.isNull() && (prev == u'[' || m_pairBrackets)) {
         c.beginEditBlock();
         c.deletePreviousChar();
         c.deleteChar();
@@ -545,6 +664,55 @@ void Editor::keyPressEvent(QKeyEvent *e)
 
     QPlainTextEdit::keyPressEvent(e);
     updateCompletion();
+}
+
+// Wraps a selection (kept selected, so "[" twice makes a wikilink) or pairs a bracket, quote or backtick.
+bool Editor::autoPair(QChar ch)
+{
+    static const QHash<QChar, QChar> close{{u'[', u']'}, {u'(', u')'}, {u'{', u'}'}, {u'"', u'"'}, {u'`', u'`'},
+                                           {u'*', u'*'}, {u'_', u'_'}, {u'~', u'~'}, {u'=', u'='}};
+    const bool bracket = ch == u'(' || ch == u'{' || ch == u'"';
+    const bool markdown = ch == u'*' || ch == u'_' || ch == u'~' || ch == u'=' || ch == u'`';
+    QTextCursor c = textCursor();
+    if (c.hasSelection()) {
+        if (!(ch == u'[' || (bracket && m_pairBrackets) || (markdown && m_pairMarkdown)))
+            return false;
+        const int start = c.selectionStart(), end = c.selectionEnd();
+        c.beginEditBlock();
+        c.setPosition(end);
+        c.insertText(close.value(ch));
+        c.setPosition(start);
+        c.insertText(QString(ch));
+        c.endEditBlock();
+        c.setPosition(start + 1);
+        c.setPosition(end + 1, QTextCursor::KeepAnchor);
+        setTextCursor(c);
+        return true;
+    }
+    const QChar prev = document()->characterAt(c.position() - 1);
+    const QChar next = document()->characterAt(c.position());
+    const bool stepOver = (ch == u']' && next == u']') || (m_pairBrackets && (ch == u')' || ch == u'}' || ch == u'"') && next == ch)
+                          || (m_pairMarkdown && ch == u'`' && next == u'`');
+    if (stepOver) {
+        c.movePosition(QTextCursor::Right);
+        setTextCursor(c);
+        return true;
+    }
+    const bool before = next.isNull() || next.isSpace() || next == u')' || next == u']' || next == u'}';
+    const bool pair = ch == u'[' || (bracket && m_pairBrackets && before && !(ch == u'"' && prev.isLetterOrNumber()))
+                      || (ch == u'`' && m_pairMarkdown && before && !prev.isLetterOrNumber() && prev != u'`');
+    if (!pair)
+        return false;
+    c.insertText(QString(ch) + close.value(ch));
+    c.movePosition(QTextCursor::Left);
+    setTextCursor(c);
+    return true;
+}
+
+void Editor::setAutoPair(bool brackets, bool markdown)
+{
+    m_pairBrackets = brackets;
+    m_pairMarkdown = markdown;
 }
 
 bool Editor::continueList()
@@ -561,10 +729,7 @@ bool Editor::continueList()
             if (!m.captured(1).isEmpty()) {
                 indentLines(true);
             } else {
-                c.select(QTextCursor::BlockUnderCursor);
-                c.movePosition(QTextCursor::StartOfBlock);
-                c.movePosition(QTextCursor::EndOfBlock, QTextCursor::KeepAnchor);
-                c.removeSelectedText();
+                endBlock(c);
             }
             return true;
         }
@@ -579,9 +744,7 @@ bool Editor::continueList()
     static const QRegularExpression quote(u"^(\\s*>[> ]*)"_s);
     if (const auto m = quote.match(line); m.hasMatch() && col >= m.capturedEnd()) {
         if (line.mid(m.capturedEnd()).trimmed().isEmpty()) {
-            c.movePosition(QTextCursor::StartOfBlock);
-            c.movePosition(QTextCursor::EndOfBlock, QTextCursor::KeepAnchor);
-            c.removeSelectedText();
+            endBlock(c);
             return true;
         }
         c.insertText(u'\n' + m.captured(1));
@@ -590,6 +753,22 @@ bool Editor::continueList()
         return true;
     }
     return false;
+}
+
+// Ends a list or quote at an empty item, leaving a blank line so the next text is not part of it.
+void Editor::endBlock(QTextCursor c)
+{
+    c.beginEditBlock();
+    c.movePosition(QTextCursor::StartOfBlock);
+    c.movePosition(QTextCursor::EndOfBlock, QTextCursor::KeepAnchor);
+    c.removeSelectedText();
+    const QTextBlock next = c.block().next();
+    if (next.isValid() && next.text().trimmed().isEmpty())
+        c.setPosition(next.position());
+    else
+        c.insertText(u"\n"_s);
+    c.endEditBlock();
+    setTextCursor(c);
 }
 
 void Editor::indentLines(bool outdent)
@@ -649,19 +828,67 @@ void Editor::updateCompletion()
         popup->hide();
         return;
     }
-    // [[#Heading in this note, [[Note#Heading in another one.
+    // [[#Heading or [[Note#Heading, [[^block or [[Note^block, otherwise note names and aliases.
+    const qsizetype caret = prefix.indexOf(u'^');
     const qsizetype hash = prefix.indexOf(u'#');
-    m_headingMode = hash >= 0;
+    m_blockMode = caret >= 0;
+    m_headingMode = !m_blockMode && hash >= 0;
     QStringList names = m_linkNames;
-    if (m_headingMode) {
-        const QString note = prefix.left(hash);
+    auto target = [this](QString note) {
+        if (note.endsWith(u'#'))
+            note.chop(1);
+        return note.isEmpty() || !m_vault ? m_notePath : m_vault->resolve(note, m_notePath);
+    };
+    if (m_blockMode) {
+        m_blockPath = target(prefix.left(caret));
+        prefix = prefix.mid(caret + 1);
+        names.clear();
+        m_blockLines.clear();
+        QStringList lines;
+        if (QTextDocument *doc = m_blockPath == m_notePath ? document() : m_documentFor ? m_documentFor(m_blockPath) : nullptr) {
+            for (QTextBlock b = doc->begin(); b.isValid(); b = b.next())
+                lines << b.text();
+        } else if (const Note *n = m_vault ? m_vault->note(m_blockPath) : nullptr) {
+            lines = n->text.split(u'\n');
+        }
+        static const QRegularExpression skip(u"^\\s*(```|~~~|---|\\|?\\s*-{3,})"_s);
+        static const QRegularExpression id(u"\\s\\^[A-Za-z0-9-]+\\s*$"_s);
+        bool fence = false, front = lines.value(0) == u"---";
+        for (int i = front ? 1 : 0; i < lines.size(); ++i) {
+            const QString t = lines[i].trimmed();
+            if (front) {
+                front = t != u"---";
+                continue;
+            }
+            if (t.startsWith(u"```"_s) || t.startsWith(u"~~~"_s))
+                fence = !fence;
+            if (fence || t.isEmpty() || skip.match(lines[i]).hasMatch()
+                || (m_blockPath == m_notePath && i == c.blockNumber()))
+                continue;
+            QString shown = QString(t).remove(id);
+            if (shown.size() > 90)
+                shown = shown.left(89) + u'…';
+            if (!m_blockLines.contains(shown)) {
+                m_blockLines.insert(shown, i);
+                names << shown;
+            }
+        }
+    } else if (m_headingMode) {
+        const QString path = target(prefix.left(hash));
         prefix = prefix.mid(hash + 1);
-        const QString path = note.isEmpty() || !m_vault ? m_notePath : m_vault->resolve(note, m_notePath);
         const Note *n = m_vault ? m_vault->note(path) : nullptr;
         names.clear();
         if (n)
             for (const Heading &h : n->headings)
                 names << h.text;
+    } else if (m_vault) {
+        m_aliasPaths.clear();
+        for (const Note &n : m_vault->notes())
+            for (const QString &alias : n.aliases)
+                if (!m_aliasPaths.contains(alias) && !m_linkNames.contains(alias)) {
+                    m_aliasPaths.insert(alias, n.path);
+                    names << alias;
+                }
     }
     if (names != m_candidates->stringList())
         m_candidates->setStringList(names);
@@ -686,15 +913,62 @@ void Editor::insertCompletion(const QString &name)
     if (open < 0)
         return;
     const qsizetype hash = before.indexOf(u'#', open);
+    int from = int(open + 2);
+    QString text = name;
+    if (m_blockMode) {
+        const int line = m_blockLines.value(name, -1);
+        if (line < 0 || !m_vault)
+            return;
+        const QString id = blockId(m_blockPath, line);
+        if (id.isEmpty())
+            return;
+        c = textCursor(); // blockId() may have edited this note
+        const QString note = m_blockPath == m_notePath ? QString() : m_vault->linkText(m_blockPath);
+        text = note + u"#^"_s + id;
+    } else if (m_headingMode && hash >= 0) {
+        from = int(hash + 1);
+    } else if (m_aliasPaths.contains(name) && !m_linkNames.contains(name) && m_vault) {
+        text = m_vault->linkText(m_aliasPaths.value(name)) + u'|' + name;
+    }
+    const int lineStart = c.block().position();
     c.beginEditBlock();
-    c.setPosition(c.block().position() + int(m_headingMode && hash >= 0 ? hash + 1 : open + 2), QTextCursor::KeepAnchor);
-    c.insertText(name);
+    c.setPosition(lineStart + from, QTextCursor::KeepAnchor);
+    c.insertText(text);
     if (document()->characterAt(c.position()) == u']' && document()->characterAt(c.position() + 1) == u']')
         c.movePosition(QTextCursor::Right, QTextCursor::MoveAnchor, 2);
     else
         c.insertText(u"]]"_s);
     c.endEditBlock();
     setTextCursor(c);
+}
+
+// The "^id" at the end of `line` in `path`, added there when the line has none.
+QString Editor::blockId(const QString &path, int line)
+{
+    static const QRegularExpression existing(u"\\s\\^([A-Za-z0-9-]+)\\s*$"_s);
+    QString id;
+    for (int i = 0; i < 6; ++i)
+        id += QChar(u"abcdefghijklmnopqrstuvwxyz0123456789"[QRandomGenerator::global()->bounded(36)]);
+    QTextDocument *doc = path == m_notePath ? document() : m_documentFor ? m_documentFor(path) : nullptr;
+    if (doc) {
+        QTextBlock b = doc->findBlockByNumber(line);
+        if (const auto m = existing.match(b.text()); m.hasMatch())
+            return m.captured(1);
+        QTextCursor t(b);
+        t.movePosition(QTextCursor::EndOfBlock);
+        t.insertText(u" ^"_s + id);
+        return id;
+    }
+    QStringList lines = m_vault->readText(path).split(u'\n');
+    if (line >= lines.size())
+        return {};
+    if (const auto m = existing.match(lines[line]); m.hasMatch())
+        return m.captured(1);
+    const bool cr = lines[line].endsWith(u'\r');
+    if (cr)
+        lines[line].chop(1);
+    lines[line] += u" ^"_s + id + (cr ? u"\r"_s : QString());
+    return m_vault->writeNote(path, lines.join(u'\n')) ? id : QString();
 }
 
 QString Editor::linkAt(const QTextCursor &cursor) const
@@ -773,6 +1047,14 @@ void Editor::mouseMoveEvent(QMouseEvent *e)
                 hand = hand || (d.kind == Deco::Task && d.rect.adjusted(-3, 0, 3, 0).contains(e->position()));
     }
     viewport()->setCursor(hand ? Qt::PointingHandCursor : Qt::IBeamCursor);
+    setHoverBlock(cursorForPosition(pos).block());
+    QString href = e->modifiers() & Qt::ControlModifier ? linkAt(cursorForPosition(pos)) : QString();
+    if (!href.startsWith(u"wiki:"_s))
+        href.clear();
+    if (href != m_hoverHref) {
+        m_hoverHref = href;
+        Q_EMIT hoverLink(href, e->globalPosition().toPoint());
+    }
     QPlainTextEdit::mouseMoveEvent(e);
 }
 
@@ -788,7 +1070,9 @@ QString Editor::attach(const QString &absolutePath)
         return {};
     QString rel = m_vault->relativePath(fi.absoluteFilePath());
     if (rel.startsWith(u"../"_s) || QFileInfo(rel).isAbsolute()) {
-        rel = m_vault->uniquePath(fi.fileName());
+        const QString dir = Settings::attachmentDir(*m_vault, m_notePath);
+        QDir().mkpath(m_vault->absolutePath(dir));
+        rel = m_vault->uniquePath(dir.isEmpty() ? fi.fileName() : dir + u'/' + fi.fileName());
         if (!QFile::copy(fi.absoluteFilePath(), m_vault->absolutePath(rel)))
             return {};
         m_vault->rescan();
@@ -803,27 +1087,33 @@ void Editor::insertFromMimeData(const QMimeData *source)
         const QImage img = qvariant_cast<QImage>(source->imageData());
         if (!img.isNull()) {
             const QString name = u"Pasted image "_s + QDateTime::currentDateTime().toString(u"yyyyMMddHHmmss"_s) + u".png"_s;
-            const QString rel = m_vault->uniquePath(name);
+            const QString dir = Settings::attachmentDir(*m_vault, m_notePath);
+            QDir().mkpath(m_vault->absolutePath(dir));
+            const QString rel = m_vault->uniquePath(dir.isEmpty() ? name : dir + u'/' + name);
             if (img.save(m_vault->absolutePath(rel), "PNG")) {
                 m_vault->rescan();
-                textCursor().insertText(u"![["_s + rel + u"]]"_s);
+                textCursor().insertText(u"![["_s + m_vault->linkText(rel) + u"]]"_s);
                 return;
             }
         }
     }
-    if (m_vault && source->hasUrls()) {
+    const QList<QUrl> urls = source->urls();
+    if (m_vault && !urls.isEmpty() && std::all_of(urls.cbegin(), urls.cend(), [](const QUrl &u) { return u.isLocalFile(); })) {
         QStringList links;
-        for (const QUrl &url : source->urls()) {
-            if (!url.isLocalFile()) {
-                links.clear();
-                break;
-            }
-            const QString l = attach(url.toLocalFile());
-            if (!l.isEmpty())
+        for (const QUrl &url : urls)
+            if (const QString l = attach(url.toLocalFile()); !l.isEmpty())
                 links << l;
-        }
         if (!links.isEmpty()) {
             textCursor().insertText(links.join(u'\n'));
+            return;
+        }
+    }
+    // A URL pasted over selected text links that text.
+    if (const QString url = source->text().trimmed(); textCursor().hasSelection() && source->hasText()
+        && QUrl(url).scheme().startsWith(u"http"_s) && !url.contains(u' ') && !url.contains(u'\n')) {
+        const QString selected = textCursor().selectedText();
+        if (!selected.contains(QChar::ParagraphSeparator) && !QUrl(selected.trimmed()).scheme().startsWith(u"http"_s)) {
+            textCursor().insertText(u"[%1](%2)"_s.arg(selected, url));
             return;
         }
     }
@@ -832,6 +1122,38 @@ void Editor::insertFromMimeData(const QMimeData *source)
         return;
     }
     QPlainTextEdit::insertFromMimeData(source);
+}
+
+// Files dragged from the tree are linked, not moved.
+void Editor::dragEnterEvent(QDragEnterEvent *e)
+{
+    QPlainTextEdit::dragEnterEvent(e);
+    if (e->mimeData()->hasUrls()) {
+        e->setDropAction(Qt::CopyAction);
+        e->accept();
+    }
+}
+
+void Editor::dragMoveEvent(QDragMoveEvent *e)
+{
+    QPlainTextEdit::dragMoveEvent(e);
+    if (e->mimeData()->hasUrls()) {
+        e->setDropAction(Qt::CopyAction);
+        e->accept();
+    }
+}
+
+void Editor::dropEvent(QDropEvent *e)
+{
+    if (!e->mimeData()->hasUrls()) {
+        QPlainTextEdit::dropEvent(e);
+        return;
+    }
+    setTextCursor(cursorForPosition(e->position().toPoint()));
+    insertFromMimeData(e->mimeData());
+    e->setDropAction(Qt::CopyAction);
+    e->accept();
+    setFocus();
 }
 
 int Editor::tableIndex(const TableOverlay *overlay) const
@@ -867,6 +1189,7 @@ void Editor::scanTables()
     m_tableBusy = true;
 
     const auto fenced = fencedOrFrontmatter;
+    const QSet<int> folded = foldedBlocks();
     // Table boundaries follow md4c so the editor agrees with the reading view.
     static const QRegularExpression heading(u"^ {0,3}#{1,6}(\\s|$)"_s);
     static const QRegularExpression rule(u"^ {0,3}([-*_])( *\\1){2,} *$"_s);
@@ -898,6 +1221,10 @@ void Editor::scanTables()
             while (e.isValid() && continues(e)) {
                 ++lines;
                 e = e.next();
+            }
+            if (folded.contains(b.blockNumber())) {
+                b = e;
+                continue;
             }
             const bool typing = inRange(cursorBlock, b, lines) && inRange(m_typedBlock, b, lines);
             const bool chosen = m_rawTable.isValid() && b == m_rawTable && inRange(textCursor().blockNumber(), b, lines);
@@ -971,20 +1298,34 @@ void Editor::scanTables()
     }
 
     scanProperties(covered);
+    for (const int n : folded)
+        covered.insert(n);
     scanImages(covered);
 
+    // One relayout for every line shown or hidden; one per line made typing in a long fold sluggish.
+    int dirtyFrom = -1, dirtyTo = -1;
+    auto setShown = [&](QTextBlock b, bool shown) {
+        if (b.isVisible() == shown)
+            return;
+        b.setVisible(shown);
+        dirtyFrom = dirtyFrom < 0 ? b.position() : qMin(dirtyFrom, b.position());
+        dirtyTo = qMax(dirtyTo, b.position() + b.length());
+    };
     for (QTextBlock b = document()->begin(); b.isValid(); b = b.next()) {
+        if (folded.contains(b.blockNumber())) {
+            setShown(b, false);
+            continue;
+        }
         if (covered.contains(b.blockNumber()))
             continue;
-        if (!b.isVisible()) {
-            b.setVisible(true);
-            document()->markContentsDirty(b.position(), b.length());
-        }
+        setShown(b, true);
         if (auto *d = static_cast<TableLineData *>(b.userData()); d && d->pixelSize) {
             d->pixelSize = 0;
             m_highlighter->rehighlightBlock(b);
         }
     }
+    if (dirtyFrom >= 0)
+        document()->markContentsDirty(dirtyFrom, dirtyTo - dirtyFrom);
     m_tableBusy = false;
     layoutTables();
     updateTableHint();
@@ -1103,6 +1444,20 @@ void Editor::onCursorMoved()
         return;
     const QTextCursor c = textCursor();
     const int n = c.block().blockNumber();
+    if (!c.block().isVisible() && !m_folds.isEmpty()) {
+        const qsizetype before = m_folds.size();
+        m_folds.removeIf([this, n](const QTextCursor &fold) {
+            const QTextBlock head = fold.block();
+            const QTextBlock end = foldEnd(head);
+            return end.isValid() && n > head.blockNumber() && n <= end.blockNumber();
+        });
+        if (m_folds.size() != before) {
+            scanTables();
+            ensureCursorVisible();
+            Q_EMIT foldsChanged();
+            return;
+        }
+    }
     bool rescan = false;
     if (m_rawImage.isValid() && c.block() != m_rawImage) {
         m_rawImage = QTextBlock();
@@ -1988,4 +2343,224 @@ void Editor::paintCalloutHead(QPainter &p, const QTextBlock &block)
     p.setPen(QColor(style.color));
     p.drawText(QRectF(x, lineRect.top(), r.width() - x, lineRect.height()), Qt::AlignLeft | Qt::AlignVCenter,
                type.left(1).toUpper() + type.mid(1).toLower());
+}
+
+// Last line a fold starting at `head` would hide, or an invalid block when `head` does not fold.
+QTextBlock Editor::foldEnd(const QTextBlock &head) const
+{
+    static const QRegularExpression heading(u"^(#{1,6})[ \\t]"_s);
+    if (!head.isValid() || fencedOrFrontmatter(head))
+        return {};
+    const QString text = head.text();
+    QTextBlock last = head;
+    if (const auto m = heading.match(text); m.hasMatch()) {
+        const int level = int(m.capturedLength(1));
+        for (QTextBlock b = head.next(); b.isValid(); b = b.next()) {
+            const auto h = heading.match(b.text());
+            if (h.hasMatch() && h.capturedLength(1) <= level && !fencedOrFrontmatter(b))
+                break;
+            last = b;
+        }
+        while (last != head && last.text().trimmed().isEmpty())
+            last = last.previous();
+    } else if (const auto m = calloutHeadRe().match(text); m.hasMatch()) {
+        if (!QRegularExpression(u"\\][+-]"_s).match(text).hasMatch())
+            return {};
+        last = calloutAt(head).second;
+    } else if (listRe().match(text).hasMatch()) {
+        auto indent = [](const QString &t) {
+            int w = 0;
+            for (const QChar ch : t) {
+                if (ch == u'\t')
+                    w += 4;
+                else if (ch == u' ')
+                    ++w;
+                else
+                    break;
+            }
+            return w;
+        };
+        const int own = indent(text);
+        for (QTextBlock b = head.next(); b.isValid(); b = b.next()) {
+            if (b.text().trimmed().isEmpty())
+                continue;
+            if (indent(b.text()) <= own)
+                break;
+            last = b;
+        }
+    }
+    return last.isValid() && last != head ? last : QTextBlock();
+}
+
+QList<QTextBlock> Editor::foldHeads() const
+{
+    QList<QTextBlock> out;
+    for (const QTextCursor &c : m_folds)
+        if (!c.isNull() && c.positionInBlock() == 0)
+            out << c.block();
+    return out;
+}
+
+// Block numbers hidden by folds; folds whose line no longer folds are dropped.
+QSet<int> Editor::foldedBlocks()
+{
+    QSet<int> out;
+    QList<QTextCursor> kept;
+    for (const QTextCursor &c : std::as_const(m_folds)) {
+        const QTextBlock end = c.isNull() || c.positionInBlock() != 0 ? QTextBlock() : foldEnd(c.block());
+        if (!end.isValid())
+            continue;
+        kept << c;
+        for (int n = c.block().blockNumber() + 1; n <= end.blockNumber(); ++n)
+            out.insert(n);
+    }
+    m_folds = kept;
+    return out;
+}
+
+void Editor::toggleFold(const QTextBlock &head)
+{
+    const qsizetype before = m_folds.size();
+    m_folds.removeIf([&](const QTextCursor &c) { return c.block() == head && c.positionInBlock() == 0; });
+    if (m_folds.size() == before) {
+        if (!foldEnd(head).isValid())
+            return;
+        QTextCursor c(head);
+        c.setKeepPositionOnInsert(true);
+        m_folds.append(c);
+    }
+    if (const int n = textCursor().blockNumber(); n > head.blockNumber() && n <= foldEnd(head).blockNumber())
+        moveCursorQuietly(QTextCursor(head));
+    scanTables();
+    m_gutter->update();
+    Q_EMIT foldsChanged();
+}
+
+// Folds or unfolds the line under the cursor, or else the heading or list item it sits in.
+void Editor::toggleFoldAtCursor()
+{
+    const QTextBlock b = textCursor().block();
+    for (QTextBlock h = b; h.isValid(); h = h.previous()) {
+        const QTextBlock end = foldEnd(h);
+        const bool folded = foldHeads().contains(h);
+        if ((h == b && (folded || end.isValid())) || (!folded && end.isValid() && end.blockNumber() >= b.blockNumber())) {
+            toggleFold(h);
+            return;
+        }
+    }
+}
+
+void Editor::foldAll(bool fold)
+{
+    m_folds.clear();
+    if (fold) {
+        QSet<int> inside;
+        for (QTextBlock b = document()->begin(); b.isValid(); b = b.next()) {
+            if (inside.contains(b.blockNumber()))
+                continue;
+            if (const QTextBlock end = foldEnd(b); end.isValid()) {
+                QTextCursor c(b);
+                c.setKeepPositionOnInsert(true);
+                m_folds.append(c);
+                for (int n = b.blockNumber() + 1; n <= end.blockNumber(); ++n)
+                    inside.insert(n);
+            }
+        }
+        if (inside.contains(textCursor().blockNumber())) {
+            QTextBlock b = textCursor().block();
+            while (inside.contains(b.blockNumber()))
+                b = b.previous();
+            moveCursorQuietly(QTextCursor(b));
+        }
+    }
+    scanTables();
+    m_gutter->update();
+    Q_EMIT foldsChanged();
+}
+
+QList<int> Editor::foldedLines() const
+{
+    QList<int> out;
+    for (const QTextBlock &b : foldHeads())
+        out << b.blockNumber();
+    std::sort(out.begin(), out.end());
+    return out;
+}
+
+void Editor::setFoldedLines(const QList<int> &lines, bool withDefaults)
+{
+    m_folds.clear();
+    static const QRegularExpression collapsed(u"^\\s*>\\s*\\[![\\w-]+\\]-"_s);
+    for (QTextBlock b = document()->begin(); b.isValid(); b = b.next()) {
+        const bool wanted = lines.contains(b.blockNumber()) || (withDefaults && collapsed.match(b.text()).hasMatch());
+        if (wanted && foldEnd(b).isValid()) {
+            QTextCursor c(b);
+            c.setKeepPositionOnInsert(true);
+            m_folds.append(c);
+        }
+    }
+    scanTables();
+    m_gutter->update();
+}
+
+void Editor::setFoldingShown(bool gutter, bool guides)
+{
+    m_showGutter = gutter;
+    m_showGuides = guides;
+    positionGutter();
+    viewport()->update();
+}
+
+void Editor::setHoverBlock(const QTextBlock &block)
+{
+    if (block == m_hoverBlock)
+        return;
+    m_hoverBlock = block;
+    m_gutter->update();
+}
+
+void Editor::leaveEvent(QEvent *e)
+{
+    setHoverBlock({});
+    QPlainTextEdit::leaveEvent(e);
+}
+
+// Thin lines down from each parent bullet through its nested items.
+void Editor::paintGuides(QPainter &p, const QTextBlock &block)
+{
+    static const QRegularExpression item(u"^(\\s*)([-*+]|\\d+[.)])\\s"_s);
+    const auto own = item.match(block.text());
+    const QString lead = own.hasMatch() ? own.captured(1) : QString();
+    if (lead.isEmpty())
+        return;
+    auto width = [](const QString &ws) {
+        int w = 0;
+        for (const QChar ch : ws)
+            w += ch == u'\t' ? 4 : 1;
+        return w;
+    };
+    int level = width(lead);
+    const QRectF r = blockBoundingGeometry(block).translated(contentOffset());
+    const QColor color = mix(palette().color(QPalette::Base), palette().color(QPalette::Text), 0.18);
+    int guard = 0;
+    for (QTextBlock b = block.previous(); b.isValid() && level > 0 && guard < 200; b = b.previous(), ++guard) {
+        const auto m = item.match(b.text());
+        if (!m.hasMatch()) {
+            if (b.text().trimmed().isEmpty() || width(b.text().left(b.text().size() - b.text().trimmed().size())) > 0)
+                continue;
+            break;
+        }
+        const int w = width(m.captured(1));
+        if (w >= level)
+            continue;
+        level = w;
+        QTextLayout *layout = b.layout();
+        if (!layout || layout->lineCount() == 0)
+            continue;
+        const QRectF parent = blockBoundingGeometry(b).translated(contentOffset());
+        const int at = int(m.capturedStart(2));
+        const QTextLine line = layout->lineAt(0);
+        const double x = parent.left() + (line.cursorToX(at) + line.cursorToX(at + 1)) / 2;
+        p.fillRect(QRectF(qRound(x), r.top(), 1, r.height()), color);
+    }
 }

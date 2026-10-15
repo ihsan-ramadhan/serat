@@ -4,20 +4,26 @@
 #include "Markdown.h"
 #include "Reader.h"
 #include "Theme.h"
+#include "TextMerge.h"
 #include "Vault.h"
 
 #include <QApplication>
 #include <QClipboard>
+#include <QCryptographicHash>
+#include <QDateTime>
 #include <QDesktopServices>
 #include <QFile>
 #include <QHBoxLayout>
 #include <QKeyEvent>
 #include <QLabel>
 #include <QLineEdit>
+#include <QLocale>
 #include <QPushButton>
 #include <QRegularExpression>
+#include <QResizeEvent>
 #include <QScrollArea>
 #include <QScrollBar>
+#include <QSettings>
 #include <QShortcut>
 #include <QStackedWidget>
 #include <QStyle>
@@ -170,6 +176,9 @@ NoteView::NoteView(Vault *vault, QWidget *parent)
             m_saveTimer.start();
     });
     connect(m_editor, &Editor::linkActivated, this, &NoteView::handleHref);
+    connect(m_editor, &Editor::hoverLink, this, &NoteView::hoverLink);
+    connect(m_reader, &Reader::hoverLink, this, &NoteView::hoverLink);
+    connect(m_editor, &Editor::foldsChanged, this, &NoteView::storeFolds);
     connect(m_editor, &Editor::hintChanged, this, &NoteView::hintChanged);
     connect(m_reader, &Reader::openRequested, this, &NoteView::handleHref);
     connect(m_reader, &Reader::imageRequested, this, [this](const QString &file, bool newTab) {
@@ -249,6 +258,8 @@ void NoteView::load(const QString &path)
         m_crlf = m_diskText.contains(u"\r\n"_s);
         m_loading = true;
         m_editor->setPlainText(m_crlf ? QString(m_diskText).replace(u"\r\n"_s, u"\n"_s) : m_diskText);
+        m_editor->setFoldedLines(savedFolds());
+        m_openCallouts.clear();
         m_loading = false;
         m_title->setReadOnly(false);
         if (m_mode == Read) {
@@ -266,6 +277,35 @@ void NoteView::load(const QString &path)
     updateHeader();
     Q_EMIT pathChanged();
     Q_EMIT statsChanged();
+}
+
+// Folds are remembered per note, keyed by a hash because paths make poor settings keys.
+QString NoteView::foldsKey() const
+{
+    return QString::fromLatin1(QCryptographicHash::hash((m_vault->root() + u'\n' + m_path).toUtf8(), QCryptographicHash::Sha1).toHex());
+}
+
+void NoteView::storeFolds()
+{
+    QSettings settings;
+    settings.beginGroup(u"folds"_s);
+    QVariantList lines;
+    for (const int line : m_editor->foldedLines())
+        lines << line;
+    if (lines.isEmpty())
+        settings.remove(foldsKey());
+    else
+        settings.setValue(foldsKey(), lines);
+}
+
+QList<int> NoteView::savedFolds() const
+{
+    QSettings settings;
+    settings.beginGroup(u"folds"_s);
+    QList<int> out;
+    for (const QVariant &v : settings.value(foldsKey()).toList())
+        out << v.toInt();
+    return out;
 }
 
 void NoteView::updateHeader()
@@ -303,6 +343,8 @@ bool NoteView::save(bool commitTables)
     if (!m_vault->writeNote(m_path, t))
         return false;
     m_diskText = t;
+    storeFolds(); // line numbers as they are in the saved text
+    Q_EMIT saved();
     return true;
 }
 
@@ -329,27 +371,43 @@ void NoteView::reloadFromDisk()
     const QString text = m_vault->readText(m_path);
     if (text == m_diskText)
         return;
-    QString current = editorText();
-    if (m_crlf)
-        current.replace(u'\n', u"\r\n"_s);
-    if (current != m_diskText)
-        return; // unsaved local edits win; they are written on the next save
-
+    const QString base = QString(m_diskText).replace(u"\r\n"_s, u"\n"_s);
+    const QString theirs = QString(text).replace(u"\r\n"_s, u"\n"_s);
+    const QString ours = editorText();
+    const bool edited = ours != base;
+    QString merged;
+    if (edited && !TextMerge::merge(base, ours, theirs, &merged)) {
+        // Both sides changed the same text: ours stays in the note, theirs is kept as a copy.
+        const QString dir = m_path.section(u'/', 0, -2);
+        const QString name = u"%1 (conflict %2).md"_s.arg(Vault::baseName(m_path), QDateTime::currentDateTime().toString(u"yyyy-MM-dd HHmm"_s));
+        const QString copy = m_vault->createNote(m_vault->uniquePath(dir.isEmpty() ? name : dir + u'/' + name), text);
+        m_diskText = text;
+        m_saveTimer.start();
+        Q_EMIT notice(copy.isEmpty() ? tr("“%1” was changed outside Serat while you were editing it; your version is kept.").arg(Vault::baseName(m_path))
+                                     : tr("“%1” was changed outside Serat while you were editing it. Your version is kept; the other one is in “%2”.")
+                                           .arg(Vault::baseName(m_path), Vault::baseName(copy)));
+        return;
+    }
+    // Only the stretch that changed is replaced, so the cursor, folds and undo history stay put.
+    const TextMerge::Change change = TextMerge::between(ours, edited ? merged : theirs);
     m_diskText = text;
     m_crlf = text.contains(u"\r\n"_s);
-    const int pos = m_editor->textCursor().position();
-    const int scroll = m_editor->verticalScrollBar()->value();
-    m_loading = true;
+    m_loading = !edited;
     QTextCursor c(m_editor->document());
-    c.select(QTextCursor::Document);
-    c.insertText(m_crlf ? QString(text).replace(u"\r\n"_s, u"\n"_s) : text);
+    c.setPosition(change.from);
+    c.setPosition(change.to, QTextCursor::KeepAnchor);
+    c.insertText(change.text);
     m_loading = false;
-    c.setPosition(qMin(pos, m_editor->document()->characterCount() - 1));
-    m_editor->setTextCursor(c);
-    m_editor->verticalScrollBar()->setValue(scroll);
+    if (edited)
+        m_saveTimer.start();
     if (m_mode == Read)
         render();
     Q_EMIT statsChanged();
+}
+
+bool NoteView::hasUnsavedChanges() const
+{
+    return isNote() && editorText() != QString(m_diskText).replace(u"\r\n"_s, u"\n"_s);
 }
 
 void NoteView::pathRenamed(const QString &from, const QString &to)
@@ -422,6 +480,7 @@ void NoteView::render()
     opt.contentWidth = qMax(200, m_reader->contentWidth());
     opt.palette = palette();
     opt.dark = palette().color(QPalette::Base).lightness() < 128;
+    opt.toggledCallouts = m_openCallouts;
     const RenderResult result = renderMarkdown(editorText(), opt);
     m_codeBlocks = result.codeBlocks;
 
@@ -430,6 +489,14 @@ void NoteView::render()
     m_reader->document()->setDefaultStyleSheet(markdownStyleSheet(palette(), m_font.pointSizeF()));
     m_reader->setHtml(result.html);
     m_reader->verticalScrollBar()->setValue(scroll);
+}
+
+void NoteView::relayout()
+{
+    for (QWidget *w : {static_cast<QWidget *>(m_editor), static_cast<QWidget *>(m_reader)}) {
+        QResizeEvent e(w->size(), w->size());
+        QApplication::sendEvent(w, &e);
+    }
 }
 
 void NoteView::refreshRender()
@@ -451,6 +518,13 @@ void NoteView::handleHref(const QString &href, bool newTab)
     }
     if (scheme == u"task") {
         toggleTask(href.mid(5).toInt());
+        return;
+    }
+    if (scheme == u"callout") {
+        const int index = href.mid(8).toInt();
+        if (!m_openCallouts.remove(index))
+            m_openCallouts.insert(index);
+        render();
         return;
     }
     if (scheme == u"copy") {
@@ -492,6 +566,13 @@ void NoteView::toggleTask(int offset)
 
 void NoteView::jumpToHeading(const QString &heading)
 {
+    if (heading.startsWith(u'^')) {
+        const QRegularExpression id(u"\\s\\^"_s + QRegularExpression::escape(heading.mid(1)) + u"\\s*$"_s);
+        for (QTextBlock b = m_editor->document()->begin(); b.isValid(); b = b.next())
+            if (id.match(b.text()).hasMatch())
+                return jumpToLine(b.blockNumber());
+        return;
+    }
     const QString want = headingAnchor(heading);
     if (m_mode == Read && isNote()) {
         m_reader->scrollToAnchor(want);
@@ -518,7 +599,9 @@ void NoteView::jumpToLine(int line)
     // Reading view: find the rendered text of that line.
     static const QRegularExpression prefix(u"^\\s*(#{1,6}\\s+|>\\s*|[-*+]\\s+(\\[[ xX]\\]\\s+)?|\\d+[.)]\\s+)*"_s);
     static const QRegularExpression markup(u"[*_`~=\\[\\]]"_s);
+    static const QRegularExpression blockId(u"\\s\\^[A-Za-z0-9-]+\\s*$"_s);
     QString snippet = m_editor->document()->findBlockByNumber(line).text();
+    snippet.remove(blockId);
     snippet.remove(prefix);
     snippet.remove(markup);
     snippet = snippet.trimmed().left(40);
@@ -634,7 +717,10 @@ QString NoteView::statsText() const
     qsizetype words = 0;
     for (auto it = word.globalMatch(text); it.hasNext(); it.next())
         ++words;
-    return tr("%Ln word(s)", nullptr, int(words)) + u"  ·  "_s + tr("%Ln character(s)", nullptr, int(text.size()));
+    const QLocale locale;
+    const QString w = words == 1 ? tr("1 word") : tr("%1 words").arg(locale.toString(words));
+    const QString c = text.size() == 1 ? tr("1 character") : tr("%1 characters").arg(locale.toString(text.size()));
+    return w + u"  ·  "_s + c;
 }
 
 void NoteView::resizeEvent(QResizeEvent *e)

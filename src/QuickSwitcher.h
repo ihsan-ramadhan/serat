@@ -7,6 +7,8 @@ class QListWidget;
 class Vault;
 
 int fuzzyScore(const QString &query, const QString &text);
+// A filterable list in a dialog; returns the chosen item, or nothing when dismissed.
+QString pickItem(QWidget *parent, const QString &title, const QString &placeholder, const QStringList &items);
 
 class QuickSwitcher : public QDialog
 {

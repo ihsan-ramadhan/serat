@@ -1,5 +1,9 @@
 #include "Vault.h"
 
+#include "Frontmatter.h"
+#include "SearchQuery.h"
+
+#include <QCoreApplication>
 #include <QDateTime>
 #include <QDir>
 #include <QFile>
@@ -201,6 +205,10 @@ Note Vault::parse(const QString &path, const QString &text)
     int fenceLen = 0;
     int lineNo = 0;
     qsizetype lineStart = 0;
+    QStringList frontmatter;
+    static const QRegularExpression blockId(u"\\s\\^([A-Za-z0-9-]+)\\s*$"_s);
+    static const QRegularExpression tag(u"(?<![\\w#/&\\]])#([\\w/-]*[^\\W\\d_][\\w/-]*|[\\w/-]*_[\\w/-]*)"_s,
+                                        QRegularExpression::UseUnicodePropertiesOption);
     const qsizetype len = text.size();
 
     while (lineStart <= len) {
@@ -215,6 +223,18 @@ Note Vault::parse(const QString &path, const QString &text)
             inFrontmatter = true;
         } else if (inFrontmatter && (line == u"---" || line == u"...")) {
             inFrontmatter = false;
+            for (const Frontmatter::Property &p : Frontmatter::parse(frontmatter)) {
+                if (p.key.isEmpty())
+                    continue;
+                n.properties << p.key;
+                if (p.key == u"tags")
+                    for (const QString &t : p.items)
+                        n.tags << (t.startsWith(u'#') ? t.mid(1) : t);
+                else if (p.key == u"aliases")
+                    n.aliases << p.items;
+            }
+        } else if (inFrontmatter) {
+            frontmatter << line.toString();
         } else {
             QStringView body = line;
             int indent = 0;
@@ -250,6 +270,12 @@ Note Vault::parse(const QString &path, const QString &text)
                     }
                 }
 
+                if (const auto m = blockId.matchView(line); m.hasMatch())
+                    n.blocks.insert(m.captured(1), lineNo);
+                static const QRegularExpression notTags(u"(`+).*?\\1|\\[\\[[^\\]]*\\]\\]|\\]\\([^)]*\\)"_s);
+                const QString plain = line.toString().replace(notTags, u" "_s);
+                for (auto it = tag.globalMatch(plain); it.hasNext();)
+                    n.tags << it.next().captured(1);
                 qsizetype i = 0;
                 while (i < line.size()) {
                     const QChar c = line[i];
@@ -293,7 +319,45 @@ Note Vault::parse(const QString &path, const QString &text)
         ++lineNo;
         lineStart = nl + 1;
     }
+    n.tags.removeDuplicates();
     return n;
+}
+
+namespace {
+const QString &forbiddenChars()
+{
+    static const QString chars = u"\\/:*?\"<>|#^[]"_s;
+    return chars;
+}
+}
+
+QString Vault::nameProblem(const QString &name)
+{
+    if (name.trimmed().isEmpty())
+        return QCoreApplication::translate("Vault", "The name is empty.");
+    for (const QChar c : name)
+        if (forbiddenChars().contains(c))
+            return QCoreApplication::translate("Vault", "Names cannot contain any of these characters:\n%1").arg(forbiddenChars());
+    if (name.startsWith(u'.'))
+        return QCoreApplication::translate("Vault", "Names cannot start with a dot; files like that are hidden.");
+    if (name.endsWith(u'.') || name.endsWith(u' '))
+        return QCoreApplication::translate("Vault", "Names cannot end with a dot or a space.");
+    if (name.toUtf8().size() > 200)
+        return QCoreApplication::translate("Vault", "The name is too long; keep it under 200 characters.");
+    return {};
+}
+
+QString Vault::safeName(const QString &name)
+{
+    QString out;
+    for (const QChar c : name)
+        out += forbiddenChars().contains(c) ? QChar(u'-') : c;
+    out = out.trimmed();
+    while (out.startsWith(u'.'))
+        out.remove(0, 1);
+    while (out.endsWith(u'.'))
+        out.chop(1);
+    return out.isEmpty() ? u"Untitled"_s : out;
 }
 
 QString Vault::resolve(const QString &target, const QString &from) const
@@ -363,55 +427,25 @@ QList<QPair<QString, Link>> Vault::backlinks(const QString &path) const
     return out;
 }
 
-QList<SearchHit> Vault::search(const QString &query, int limit) const
+QList<SearchHit> Vault::search(const QString &query, int limit, bool matchCase) const
 {
     QList<SearchHit> hits;
-    // Words, "quoted phrases" and path:folder (also path:"a folder") narrowing the files.
-    static const QRegularExpression token(u"(path:)?(?:\"([^\"]*)\"|(\\S+))"_s, QRegularExpression::CaseInsensitiveOption);
-    QStringList terms;
-    QString pathFilter;
-    for (auto it = token.globalMatch(query); it.hasNext();) {
-        const auto m = it.next();
-        const QString value = (m.capturedLength(2) || m.captured(0).endsWith(u'"') ? m.captured(2) : m.captured(3)).toLower();
-        if (m.capturedLength(1))
-            pathFilter = value;
-        else if (!value.isEmpty())
-            terms << value;
-    }
-    if (terms.isEmpty() && pathFilter.isEmpty())
+    const SearchQuery q(query, matchCase);
+    if (q.isEmpty())
         return hits;
-
     for (const QString &f : m_files) {
         const Note *n = note(f);
-        if (!n)
+        if (!n || !q.matches(*n))
             continue;
-        const QString lowerText = n->text.toLower();
-        const QString lowerPath = f.toLower();
-        if (!pathFilter.isEmpty() && !lowerPath.contains(pathFilter))
-            continue;
-        if (terms.isEmpty()) {
+        const QList<int> lines = q.hitLines(*n);
+        if (lines.isEmpty())
             hits.append({f, -1, {}});
-            continue;
+        const QStringList text = lines.isEmpty() ? QStringList() : n->text.split(u'\n');
+        for (const int line : lines) {
+            hits.append({f, line, text[line].trimmed()});
+            if (hits.size() >= limit)
+                return hits;
         }
-        const bool all = std::all_of(terms.cbegin(), terms.cend(), [&](const QString &t) {
-            return lowerText.contains(t) || lowerPath.contains(t);
-        });
-        if (!all)
-            continue;
-
-        bool lineHit = false;
-        const QStringList lines = n->text.split(u'\n');
-        for (int i = 0; i < lines.size(); ++i) {
-            const QString l = lines[i].toLower();
-            if (std::any_of(terms.cbegin(), terms.cend(), [&](const QString &t) { return l.contains(t); })) {
-                hits.append({f, i, lines[i].trimmed()});
-                lineHit = true;
-                if (hits.size() >= limit)
-                    return hits;
-            }
-        }
-        if (!lineHit)
-            hits.append({f, -1, {}});
     }
     return hits;
 }
@@ -453,6 +487,7 @@ bool Vault::createFolder(const QString &path)
 
 bool Vault::writeNote(const QString &path, const QString &text)
 {
+    QDir().mkpath(absolutePath(dirOf(path)));
     QSaveFile f(absolutePath(path));
     if (!f.open(QIODevice::WriteOnly) || f.write(text.toUtf8()) < 0 || !f.commit())
         return false;

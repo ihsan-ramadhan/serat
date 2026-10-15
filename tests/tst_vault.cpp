@@ -1,5 +1,8 @@
 #include "Frontmatter.h"
 #include "Markdown.h"
+#include "SearchQuery.h"
+#include "Settings.h"
+#include "TextMerge.h"
 #include "Vault.h"
 
 #include <QDir>
@@ -157,6 +160,86 @@ private Q_SLOTS:
     void headingAnchorsIgnoreMarkup()
     {
         QCOMPARE(headingAnchor(u"**Sumber** per tabel (tahap lanjutan)"_s), headingAnchor(u"Sumber per tabel (tahap lanjutan)"_s));
+    }
+
+    void searchOperators()
+    {
+        const Note a = Vault::parse(u"work/plan.md"_s, u"---\ntags: [project/alpha]\n---\n# Goals\nShip the Editor\n- [ ] write docs\n- [x] fix bug #urgent\n# Notes\nrandom words ^ref1\n"_s);
+        const Note b = Vault::parse(u"home/list.md"_s, u"Buy milk\n- [ ] call mom\n"_s);
+        auto hits = [&](const QString &q, bool matchCase = false) {
+            const SearchQuery query(q, matchCase);
+            QStringList out;
+            for (const Note *n : {&a, &b})
+                if (query.matches(*n))
+                    out << n->path;
+            return out.join(u',');
+        };
+        QCOMPARE(a.tags, QStringList({u"project/alpha"_s, u"urgent"_s}));
+        QCOMPARE(a.blocks.value(u"ref1"_s), 8);
+        QCOMPARE(hits(u"editor"_s), u"work/plan.md"_s);
+        QCOMPARE(hits(u"editor"_s, true), QString());
+        QCOMPARE(hits(u"tag:#project"_s), u"work/plan.md"_s);
+        QCOMPARE(hits(u"tag:urgent"_s), u"work/plan.md"_s);
+        QCOMPARE(hits(u"tag:proj"_s), QString());
+        QCOMPARE(hits(u"path:home"_s), u"home/list.md"_s);
+        QCOMPARE(hits(u"file:plan"_s), u"work/plan.md"_s);
+        QCOMPARE(hits(u"task-todo:call"_s), u"home/list.md"_s);
+        QCOMPARE(hits(u"task-done:(fix bug)"_s), u"work/plan.md"_s);
+        QCOMPARE(hits(u"task:docs"_s), u"work/plan.md"_s);
+        QCOMPARE(hits(u"line:(ship editor)"_s), u"work/plan.md"_s);
+        QCOMPARE(hits(u"line:(ship docs)"_s), QString());
+        QCOMPARE(hits(u"section:(goals docs)"_s), u"work/plan.md"_s);
+        QCOMPARE(hits(u"section:(goals random)"_s), QString());
+        QCOMPARE(hits(u"milk OR docs"_s), u"work/plan.md,home/list.md"_s);
+        QCOMPARE(hits(u"-milk"_s), u"work/plan.md"_s);
+        QCOMPARE(hits(u"call -milk"_s), QString());
+        QCOMPARE(hits(u"/b[au]y/"_s), u"home/list.md"_s);
+        QCOMPARE(hits(u"\"buy milk\""_s), u"home/list.md"_s);
+        QCOMPARE(SearchQuery(u"task-todo:"_s).hitLines(a), QList<int>{5});
+        QCOMPARE(hits(u"milk OR"_s), u"home/list.md"_s);
+        QCOMPARE(hits(u"OR milk"_s), u"home/list.md"_s);
+        QVERIFY(SearchQuery(u"()"_s).isEmpty());
+        QCOMPARE(hits(u"path:(work plan)"_s), u"work/plan.md"_s);
+        QCOMPARE(hits(u"path:(work milk)"_s), QString());
+        QCOMPARE(hits(u"tag:(nothing OR urgent)"_s), u"work/plan.md"_s);
+        QCOMPARE(SearchQuery(u"tag:urgent"_s).hitLines(a), QList<int>{6});
+        RenderOptions opt;
+        QVERIFY(renderMarkdown(u"_penting_ ^abc"_s, opt).html.contains(u"<i>penting</i>"_s));
+        QVERIFY(!renderMarkdown(u"_penting_ ^abc"_s, opt).html.contains(u"abc"_s));
+    }
+
+    void momentFormats()
+    {
+        const QDateTime t(QDate(2026, 3, 7), QTime(14, 5, 9));
+        QCOMPARE(Settings::formatMoment(t, u"YYYY-MM-DD"_s), u"2026-03-07"_s);
+        QCOMPARE(Settings::formatMoment(t, u"YYYY/MM/[Week] ww/D.M.YY"_s), u"2026/03/Week 10/7.3.26"_s);
+        QCOMPARE(Settings::formatMoment(t, u"HH:mm:ss h:mm A Do"_s), u"14:05:09 2:05 PM 7th"_s);
+        Settings::Templates formats{{}, u"DD/MM"_s, u"HH.mm"_s};
+        QCOMPARE(Settings::applyTemplate(u"# {{title}}\n{{date}} {{time}} {{date:YYYY}} {{ date : [Q]Q }}"_s, u"Plan"_s, formats, t),
+                 u"# Plan\n07/03 14.05 2026 Q1"_s);
+    }
+
+    void mergeOutsideChanges()
+    {
+        QString out;
+        const QString base = u"one\ntwo\nthree\n"_s;
+        QVERIFY(TextMerge::merge(base, u"one!\ntwo\nthree\n"_s, u"one\ntwo\nthree\nfour\n"_s, &out));
+        QCOMPARE(out, u"one!\ntwo\nthree\nfour\n"_s);
+        QVERIFY(TextMerge::merge(base, base + u"mine"_s, base + u"theirs\n"_s, &out));
+        QCOMPARE(out, base + u"theirs\nmine"_s);
+        QVERIFY(TextMerge::merge(base, u"one\nTWO\nthree\n"_s, base, &out));
+        QCOMPARE(out, u"one\nTWO\nthree\n"_s);
+        QVERIFY(!TextMerge::merge(base, u"one\nmine\nthree\n"_s, u"one\ntheirs\nthree\n"_s, &out));
+    }
+
+    void fileNames()
+    {
+        QVERIFY(Vault::nameProblem(u"Plan 🎉 ü"_s).isEmpty());
+        for (const QString &bad : {u""_s, u"  "_s, u"a/b"_s, u"a:b"_s, u".hidden"_s, u"end."_s, u"end "_s, QString(201, u'x')})
+            QVERIFY2(!Vault::nameProblem(bad).isEmpty(), qPrintable(bad));
+        QCOMPARE(Vault::safeName(u"2026:10:15"_s), u"2026-10-15"_s);
+        QCOMPARE(Vault::safeName(u"..x.."_s), u"x"_s);
+        QCOMPARE(Vault::safeName(u"???"_s), u"---"_s);
     }
 
     void frontmatterParse()

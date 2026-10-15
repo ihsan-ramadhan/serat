@@ -66,6 +66,61 @@ namespace {
 constexpr char LoneTilde = '\x1a';
 // md4c would read "![[x]]" as an image, so the '!' becomes a marker the renderer embeds.
 constexpr char EmbedMark = '\x1e';
+// Bytes of %%comments%% and ^block-ids; dropped from the output so task offsets stay valid.
+constexpr char Hidden = '\x1d';
+
+// Marks %%comments%% and trailing ^block-ids outside code as Hidden; a line that is only hidden becomes blank.
+void hideComments(QByteArray &utf8)
+{
+    bool fence = false, comment = false;
+    qsizetype start = 0;
+    while (start <= utf8.size()) {
+        qsizetype end = utf8.indexOf('\n', start);
+        if (end < 0)
+            end = utf8.size();
+        const QByteArray line = utf8.mid(start, end - start);
+        const QByteArray trimmed = line.trimmed();
+        if (!comment && (trimmed.startsWith("```") || trimmed.startsWith("~~~"))) {
+            fence = !fence;
+        } else if (!fence) {
+            bool any = false, visible = false;
+            for (qsizetype i = start; i < end; ++i) {
+                if (!comment && utf8[i] == '`') {
+                    const qsizetype close = utf8.indexOf('`', i + 1);
+                    if (close > 0 && close < end) {
+                        i = close;
+                        visible = true;
+                        continue;
+                    }
+                }
+                if (utf8[i] == '%' && i + 1 < end && utf8[i + 1] == '%') {
+                    comment = !comment;
+                    utf8[i] = utf8[i + 1] = Hidden;
+                    ++i;
+                    any = true;
+                    continue;
+                }
+                if (comment) {
+                    utf8[i] = Hidden;
+                    any = true;
+                } else if (!QChar::isSpace(uchar(utf8[i]))) {
+                    visible = true;
+                }
+            }
+            static const QRegularExpression id(u"\\s\\^[A-Za-z0-9-]+\\s*$"_s);
+            if (const auto m = id.match(QString::fromLatin1(line)); m.hasMatch() && !comment) {
+                // From the '^' on; the space before it stays so a closing '_' still closes.
+                for (qsizetype i = start + m.capturedStart() + 1; i < start + m.capturedEnd(); ++i)
+                    utf8[i] = Hidden;
+                any = true;
+            }
+            if (any && !visible)
+                for (qsizetype i = start; i < end; ++i)
+                    utf8[i] = ' ';
+        }
+        start = end + 1;
+    }
+}
 
 QString fromMd(const MD_CHAR *text, MD_SIZE size, bool keepEmbedMark = false)
 {
@@ -120,10 +175,27 @@ CalloutStyle calloutStyle(const QString &type)
 
 namespace {
 
-// Up to the next heading of the same or higher level; the whole text if `heading` is missing.
+// Up to the next heading of the same or higher level, or the block holding "^id"; all of it if missing.
 QString sectionOf(const QString &text, const QString &heading)
 {
     const QStringList lines = text.split(u'\n');
+    if (heading.startsWith(u'^')) {
+        const QRegularExpression id(u"\\s\\^"_s + QRegularExpression::escape(heading.mid(1)) + u"\\s*$"_s);
+        static const QRegularExpression item(u"^\\s*([-*+]|\\d+[.)])\\s"_s);
+        for (int i = 0; i < lines.size(); ++i) {
+            if (!id.match(lines[i]).hasMatch())
+                continue;
+            if (item.match(lines[i]).hasMatch())
+                return lines[i].trimmed();
+            int first = i, last = i;
+            while (first > 0 && !lines[first - 1].trimmed().isEmpty())
+                --first;
+            while (last + 1 < lines.size() && !lines[last + 1].trimmed().isEmpty())
+                ++last;
+            return lines.mid(first, last - first + 1).join(u'\n');
+        }
+        return text;
+    }
     const QString want = headingAnchor(heading);
     static const QRegularExpression h(u"^(#{1,6})\\s+(.*)$"_s);
     int level = 0;
@@ -174,6 +246,7 @@ public:
         m_baseOffset = int(prefixBytes.size());
 
         QByteArray utf8 = text.toUtf8();
+        hideComments(utf8);
         for (qsizetype i = 0; i < utf8.size(); ++i) {
             if (utf8[i] == '~' && (i == 0 || utf8[i - 1] != '~') && (i + 1 == utf8.size() || utf8[i + 1] != '~'))
                 utf8[i] = LoneTilde;
@@ -194,7 +267,7 @@ public:
             return static_cast<Renderer *>(u)->onText(t, fromMd(s, n, t == MD_TEXT_NORMAL));
         };
         md_parse(utf8.constData(), MD_SIZE(utf8.size()), &parser, this);
-        return m_out.replace(QChar(EmbedMark), u'!');
+        return m_out.replace(QChar(EmbedMark), u'!').remove(QChar(Hidden));
     }
 
 private:
@@ -539,8 +612,18 @@ private:
         const QString bg = mix(m_base, QColor(style.color), m_opt.dark ? 0.14 : 0.09).name();
         const QString icon = u"<img src=\"icon:%1?color=%2\" width=\"18\" height=\"18\" align=\"middle\">"_s.arg(
             style.icon, QString::fromLatin1(QUrl::toPercentEncoding(style.color)));
-        const QString head = u"<p style=\"color:%1;\"><b>%2&nbsp;&nbsp;%3</b></p>"_s.arg(style.color, icon, title);
-        m_out += box(style.color, bg, head + rest);
+        QString head = u"<b>%1&nbsp;&nbsp;%2</b>"_s.arg(icon, title);
+        if (!m.captured(2).isEmpty()) {
+            const int index = m_callouts++;
+            const bool open = (m.captured(2) == u"+") != (m_opt.depth == 0 && m_opt.toggledCallouts.contains(index));
+            if (!open)
+                rest.clear();
+            const QString chevron = open ? u"\u25BE"_s : u"\u25B8"_s;
+            head += u"&nbsp;&nbsp;"_s + chevron;
+            if (m_opt.depth == 0)
+                head = u"<a href=\"callout:%1\" style=\"color:%2; text-decoration:none;\">%3</a>"_s.arg(index).arg(style.color, head);
+        }
+        m_out += box(style.color, bg, u"<p style=\"color:%1;\">%2</p>"_s.arg(style.color, head) + rest);
     }
 
     void finishCode()
@@ -567,6 +650,7 @@ private:
     QColor m_text, m_base;
     QString m_codeBg, m_border, m_muted, m_mark;
 
+    int m_callouts = 0; // foldable ones seen so far
     bool m_inCode = false;
     QString m_codeLang, m_codeBuf;
     int m_imgDepth = 0;

@@ -296,6 +296,10 @@ void MarkdownHighlighter::highlightInline(const QString &text, int from)
         inlineMarkup(int(m.capturedEnd()) - 2, 2, int(m.capturedStart()), int(m.capturedEnd()));
     });
     each(html, [&](const QRegularExpressionMatch &m) { apply(int(m.capturedStart()), int(m.capturedLength()), m_html); });
+    static const QRegularExpression comment(u"%%.*?%%"_s);
+    static const QRegularExpression blockId(u"\\s\\^[A-Za-z0-9-]+\\s*$"_s);
+    each(comment, [&](const QRegularExpressionMatch &m) { apply(int(m.capturedStart()), int(m.capturedLength()), m_markup); });
+    each(blockId, [&](const QRegularExpressionMatch &m) { apply(int(m.capturedStart()), int(m.capturedLength()), m_markup); });
     each(url, [&](const QRegularExpressionMatch &m) { apply(int(m.capturedStart()), int(m.capturedLength()), m_link); });
     each(mdlink, [&](const QRegularExpressionMatch &m) {
         apply(int(m.capturedStart()), int(m.capturedLength()), m_markup);

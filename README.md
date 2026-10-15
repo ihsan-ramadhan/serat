@@ -14,21 +14,31 @@ Built with Qt 6 and C++20. Runs on Linux, Windows and macOS.
   (`#` on its line, `**` or `[[ ]]` only on the word it touches). Lists show bullets,
   tasks show checkboxes you can click, and a click on a link opens it.
   View > Live preview switches to plain source.
-- `[[` autocompletes note names, `[[#` the headings of a note; Enter continues lists;
-  Tab and Shift+Tab indent
+- `[[` autocompletes note names and aliases, `[[#` the headings of a note and `[[^` its
+  paragraphs (adding a `^id` to the one you pick); Enter continues lists; Tab and
+  Shift+Tab indent
+- Brackets, quotes and backticks close themselves; with text selected, `*`, `_`, `~`, `=`
+  or a backtick wraps it, and `[` twice makes it a link. Pasting a URL over selected text
+  turns it into a link, and dropping a file from the tree links it.
+- Fold headings, lists and callouts with the arrow beside them (folds are remembered per
+  note); nested lists get indentation guides
 - Format, Paragraph (lists, headings, quote) and Insert (table, callout, rule, code
   block) commands in the menu bar, the right-click menu and the command palette
 - Properties: the frontmatter shows as rows you edit in place, with a type per property
   (text, list, number, checkbox, date, date and time), tags and aliases as removable
   pills, and Ctrl+; to add one. Unchanged lines are written back as they were, and YAML
   the panel cannot edit safely stays read-only; right-click > Edit source opens the text.
-- Callouts show as coloured boxes with their icon and title; images (`![[x.png|200]]`,
+- Callouts show as coloured boxes with their icon and title (`[!note]-` starts folded);
+  images (`![[x.png|200]]`,
   `![](path)`) show in place. Moving the cursor into either reveals the Markdown.
   Right-click an image to copy, open, rename, move or delete it.
 - Find and replace in the note
-- Paste a screenshot and it is saved into the vault as `Pasted image <timestamp>.png`
-- A new note you leave without a name or any text is removed instead of piling up as
-  `Untitled` files
+- Paste a screenshot and it is saved as `Pasted image <timestamp>.png`, in the attachment
+  folder chosen in Settings
+- Daily notes (Go > Open today's daily note, or the calendar button above the file tree)
+  and templates (Insert > Insert template) with `{{title}}`, `{{date}}` and `{{time}}`
+- A new note you leave without any text (from Ctrl+N, the quick switcher or a link to a note
+  that did not exist yet) is removed instead of piling up as empty files
 
 **Tables**
 - Tables are edited as a grid, no pipes to type: click a cell and write
@@ -40,28 +50,40 @@ Built with Qt 6 and C++20. Runs on Linux, Windows and macOS.
 **Reading**
 - Reading view with tables, nested and task lists, callouts, code blocks with a copy
   button, properties, and embedded images and notes (`![[x.png]]`, `![[note#Heading]]`)
-- Click a checkbox in the reading view to tick it in the file
+- Click a checkbox in the reading view to tick it in the file; click a foldable callout's
+  title to open or close it. `%%comments%%` and `^block-ids` are not shown.
 
 **Links and navigation**
 - Renaming or moving a note or folder rewrites every link that points into it
-- Backlinks, outgoing links and outline panels
+- Backlinks, outgoing links, tags and outline panels; the status bar counts backlinks
+- Hold Ctrl over a link to preview the note it points to
+- Bookmarks for notes, folders and searches
 - Command palette with every command and its shortcut
-- Vault-wide search (`"exact phrase"`, `path:folder`) and a quick switcher
+- Vault-wide search with `"exact phrase"`, `/regex/`, `-exclude`, `OR`, `file:`, `path:`,
+  `tag:`, `line:( )`, `section:( )`, `task:`, `task-todo:` and `task-done:`, match case
+  and sort order; and a quick switcher
 - File tree toolbar: new note or folder, sort by name, modified or created time,
   auto-reveal the open note, collapse or expand all; open folders stay open the next time
   the vault is opened
-- Tabs with their own back and forward history, restored on the next start
+- Tabs with their own back and forward history, restored on the next start; split the
+  view to the right, and pin a tab so links from it open in a new tab
+- Shift+click files in the tree to move or delete several at once
 - Right-click a file, folder, tab or panel entry to copy its path or a link to it, make a
   copy, move it, search inside a folder, or open it in another app; the ⋮ button on a
   note has the same file commands
 - `serat://open?vault=<name>&file=<path>` links open the note in Serat; clicking one while
   Serat runs reuses the open window
-- Edits made outside the app (sync, git, another editor) show up immediately
+- Edits made outside the app (sync, git, another editor) show up immediately and are merged
+  with what you are typing; if both change the same text, yours stays and the other version
+  is kept next to it as `<note> (conflict <date>).md`. A note deleted outside the app while
+  it has unsaved changes is written back instead of closed.
 
-**Look**
+**Look and settings**
 - Light and dark theme that follows the system, or set it under View > Theme
+- Settings (Ctrl+,) for the editor helpers, readable line length, where new notes and
+  attachments go, daily notes and templates
 
-Not yet: graph view, tags pane.
+Not yet: graph view.
 
 ## Shortcuts
 
@@ -82,6 +104,9 @@ Not yet: graph view, tags pane.
 | Ctrl+; | Add file property |
 | Alt+Enter / Ctrl+Enter | Follow the link at the cursor / in a new tab |
 | Ctrl+Shift+V | Paste as plain text |
+| Ctrl+Shift+[ | Fold or unfold the current heading, list or callout |
+| Ctrl+hover | Preview the linked note |
+| Ctrl+, | Settings |
 | F2 | Rename note |
 | Ctrl+click | Follow a link (Ctrl+Shift+click: in a new tab) |
 | Alt+Left / Alt+Right | Back / forward |
@@ -158,10 +183,12 @@ Serat follows how [Obsidian](https://obsidian.md) stores a vault: the `[[wikilin
 `![[embed]]` syntax, callouts, the link resolution rules and the "Pasted image" file
 names. A vault can move between the two apps without changes, and the copy menu also
 offers an `obsidian://` link for a note. The welcome screen lists vaults registered in
-Obsidian, and Serat reads `.obsidian/app.json` only to honour its "confirm file
-deletion" setting; it never writes inside `.obsidian/`. Serat is an independent
-project, contains no Obsidian code, and is not affiliated with or endorsed by Obsidian
-or Dynalist Inc. "Obsidian" is a trademark of its owners.
+Obsidian. Until you change them in Serat's own settings, Serat takes the attachment folder,
+new note location and deletion prompt from `.obsidian/app.json`, the daily note and
+template settings from `daily-notes.json` and `templates.json`, and the first bookmarks
+from `bookmarks.json`; it reads these files and never writes inside `.obsidian/`. Serat
+is an independent project, contains no Obsidian code, and is not affiliated with or
+endorsed by Obsidian or Dynalist Inc. "Obsidian" is a trademark of its owners.
 
 Built on:
 

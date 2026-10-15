@@ -113,6 +113,13 @@ QSplitter::handle { background: %4; }
 QStatusBar { background: %1; color: %7; border-top: 1px solid %4; }
 QStatusBar::item { border: none; }
 QStatusBar QLabel { color: %7; padding: 0px 8px; }
+QStatusBar QToolButton#statusButton { color: %7; padding: 0px 8px; border-radius: 4px; font-weight: 400; }
+QStatusBar QToolButton#statusButton:hover { color: %6; }
+QLabel#emptyTitle { color: %7; font-size: 15pt; }
+QPushButton#emptyAction { background: transparent; border: none; color: %8; padding: 4px 8px; }
+QPushButton#emptyAction:hover { text-decoration: underline; }
+QPushButton#emptyAction:focus { border: 1px solid %8; }
+QFrame#preview { background: %2; border: 1px solid %4; border-radius: 8px; }
 
 QTreeView, QListView { background: %1; border: none; show-decoration-selected: 0; selection-background-color: %9; selection-color: %6; }
 QTreeView::item, QListView::item { padding: 3px 4px; border-radius: 5px; }
@@ -126,6 +133,11 @@ QLineEdit { background: %2; color: %6; border: 1px solid %4; border-radius: 6px;
             selection-background-color: %9; selection-color: %6; }
 QLineEdit:focus { border: 1px solid %8; }
 QPlainTextEdit, QTextBrowser { selection-background-color: %9; selection-color: %6; }
+
+QCheckBox { spacing: 8px; }
+QCheckBox::indicator { width: 14px; height: 14px; border: 1px solid %7; border-radius: 4px; background: %2; }
+QCheckBox::indicator:hover { border: 1px solid %6; }
+QCheckBox::indicator:checked { background: %8; border: 1px solid %8; image: url(:/icons/%13.svg); }
 
 QPushButton { background: %3; color: %6; border: 1px solid %4; border-radius: 6px; padding: 6px 14px; }
 QPushButton:hover { background: %5; }
@@ -170,7 +182,7 @@ QFrame#pill { background: %3; border: 1px solid %4; border-radius: 10px; }
 QToolButton#pillRemove { padding: 1px; border-radius: 7px; }
 )"_s.arg(c.window.name(), c.base.name(), c.raised.name(), c.border.name(), c.hover.name(), c.text.name(),
            c.muted.name(), c.accent.name(), c.selection.name())
-        .arg(scroll, scrollHover, pressed);
+        .arg(scroll, scrollHover, pressed, c.dark ? u"check-mark"_s : u"check-mark-light"_s);
 }
 
 // A dark platform palette wins when the portal reports no preference.

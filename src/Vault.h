@@ -27,6 +27,10 @@ struct Note {
     QString text;
     QList<Link> links;
     QList<Heading> headings;
+    QStringList tags;          // without '#', from the frontmatter and the text
+    QStringList aliases;
+    QHash<QString, int> blocks; // "^id" at the end of a line -> that line
+    QStringList properties;    // frontmatter keys
 };
 
 struct SearchHit {
@@ -57,7 +61,7 @@ public:
     // Shortest link text that resolves back to `path`.
     QString linkText(const QString &path) const;
     QList<QPair<QString, Link>> backlinks(const QString &path) const;
-    QList<SearchHit> search(const QString &query, int limit = 500) const;
+    QList<SearchHit> search(const QString &query, int limit = 500, bool matchCase = false) const;
 
     QString uniquePath(const QString &wanted) const;
     QString createNote(const QString &path, const QString &text = {});
@@ -72,6 +76,10 @@ public:
     static bool isNote(const QString &path) { return path.endsWith(QLatin1String(".md"), Qt::CaseInsensitive); }
     static bool isImage(const QString &path);
     static QString baseName(const QString &path);
+    // Why `name` cannot be a file or folder name, or an empty string when it can.
+    static QString nameProblem(const QString &name);
+    // `name` with characters that cannot be in a file name replaced by '-'.
+    static QString safeName(const QString &name);
 
 public Q_SLOTS:
     void rescan();

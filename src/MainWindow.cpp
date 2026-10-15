@@ -2,10 +2,14 @@
 
 #include "CommandPalette.h"
 #include "Editor.h"
+#include "Markdown.h"
 #include "NoteView.h"
 #include "Panels.h"
 #include "PathActions.h"
 #include "QuickSwitcher.h"
+#include "Reader.h"
+#include "Settings.h"
+#include "SettingsDialog.h"
 #include "Theme.h"
 #include "Vault.h"
 
@@ -136,6 +140,7 @@ MainWindow::MainWindow(QWidget *parent)
 {
     buildUi();
     buildActions();
+    setReadableLineLength(Settings::app(u"readableWidth"_s, true).toBool());
 
     QSettings s;
     m_fontDelta = s.value(u"fontDelta"_s, 0.0).toDouble();
@@ -167,41 +172,55 @@ void MainWindow::buildUi()
         }
         return w;
     };
-    m_left = panelTabs({{buildFilesPage(), u"folder", tr("Files")}, {m_search, u"search", tr("Search (Ctrl+Shift+F)")}});
+    m_bookmarks = new BookmarksPanel;
+    m_left = panelTabs({{buildFilesPage(), u"folder", tr("Files")},
+                        {m_search, u"search", tr("Search (Ctrl+Shift+F)")},
+                        {m_bookmarks, u"bookmark", tr("Bookmarks")}});
 
-    m_tabs = new QTabWidget;
-    m_tabs->setDocumentMode(true);
-    m_tabs->tabBar()->setObjectName(u"notes"_s);
-    m_tabs->tabBar()->setDrawBase(false);
-    m_tabs->setMovable(true);
-    m_tabs->setElideMode(Qt::ElideRight);
-    m_tabs->setUsesScrollButtons(true);
-    m_tabs->tabBar()->setExpanding(false);
-    m_tabs->tabBar()->installEventFilter(this);
-    m_tabs->tabBar()->setContextMenuPolicy(Qt::CustomContextMenu);
-    connect(m_tabs->tabBar(), &QWidget::customContextMenuRequested, this, &MainWindow::showTabMenu);
-    auto *plus = new QToolButton;
-    plus->setIcon(Theme::icon(u"file-plus"_s));
-    plus->setIconSize(QSize(18, 18));
-    plus->setAutoRaise(true);
-    plus->setToolTip(tr("New note (Ctrl+N)"));
-    auto *corner = new QWidget;
-    auto *cornerLayout = new QHBoxLayout(corner);
-    cornerLayout->setContentsMargins(0, 0, 6, 4); // aligns with the tab titles
-    cornerLayout->addWidget(plus, 0, Qt::AlignVCenter);
-    m_tabs->setCornerWidget(corner, Qt::TopRightCorner);
-    connect(plus, &QToolButton::clicked, this, [this] { newNote({}); });
+    m_panes = new QSplitter;
+    m_panes->setChildrenCollapsible(false);
+    m_panes->setHandleWidth(1);
+    m_tabs = createPane();
 
     m_backlinks = new BacklinksPanel;
     m_outgoing = new OutgoingPanel;
     m_outline = new OutlinePanel;
+    m_tags = new TagsPanel;
     m_right = panelTabs({{m_backlinks, u"backlinks", tr("Backlinks")},
                          {m_outgoing, u"outgoing", tr("Outgoing links")},
+                         {m_tags, u"tag", tr("Tags")},
                          {m_outline, u"outline", tr("Outline")}});
+    m_preview = new PreviewPopup(this);
+    m_previewTimer.setSingleShot(true);
+    m_previewTimer.setInterval(300);
+    connect(&m_previewTimer, &QTimer::timeout, this, &MainWindow::showPreview);
 
     m_split = new QSplitter;
     m_split->addWidget(m_left);
-    m_split->addWidget(m_tabs);
+    m_empty = new QWidget;
+    m_empty->setObjectName(u"emptyState"_s);
+    auto *emptyLayout = new QVBoxLayout(m_empty);
+    auto *emptyTitle = new QLabel(tr("No note is open"));
+    emptyTitle->setObjectName(u"emptyTitle"_s);
+    emptyLayout->addStretch();
+    emptyLayout->addWidget(emptyTitle, 0, Qt::AlignHCenter);
+    emptyLayout->addSpacing(10);
+    auto emptyAction = [this, emptyLayout](const QString &text, auto fn) {
+        auto *b = new QPushButton(text);
+        b->setObjectName(u"emptyAction"_s);
+        b->setFlat(true);
+        b->setCursor(Qt::PointingHandCursor);
+        connect(b, &QPushButton::clicked, this, fn);
+        emptyLayout->addWidget(b, 0, Qt::AlignHCenter);
+    };
+    emptyAction(tr("Create new note (Ctrl+N)"), [this] { newNote(defaultNoteDir()); });
+    emptyAction(tr("Go to file (Ctrl+O)"), [this] { quickSwitcher(); });
+    emptyAction(tr("Open today's daily note"), [this] { openDailyNote(); });
+    emptyLayout->addStretch(2);
+    m_center = new QStackedWidget;
+    m_center->addWidget(m_panes);
+    m_center->addWidget(m_empty);
+    m_split->addWidget(m_center);
     m_split->addWidget(m_right);
     m_split->setStretchFactor(1, 1);
     m_split->setChildrenCollapsible(false);
@@ -255,9 +274,22 @@ void MainWindow::buildUi()
     m_statsLabel = new QLabel;
     statusBar()->setSizeGripEnabled(false);
     statusBar()->addWidget(m_vaultLabel);
+    m_backlinkCount = new QToolButton;
+    m_backlinkCount->setObjectName(u"statusButton"_s);
+    m_backlinkCount->setToolTip(tr("Show backlinks"));
+    m_backlinkCount->setFocusPolicy(Qt::NoFocus);
+    connect(m_backlinkCount, &QToolButton::clicked, this, [this] {
+        m_right->show();
+        m_right->setCurrentWidget(m_backlinks);
+    });
+    statusBar()->addPermanentWidget(m_backlinkCount);
     statusBar()->addPermanentWidget(m_statsLabel);
 
-    connect(m_tabs, &QTabWidget::currentChanged, this, &MainWindow::onCurrentChanged);
+    connect(qApp, &QApplication::focusChanged, this, [this](QWidget *, QWidget *now) {
+        for (QTabWidget *pane : panes())
+            if (now && pane != m_tabs && pane->isAncestorOf(now))
+                setActivePane(pane);
+    });
 
     connect(m_tree, &FileTree::openRequested, this, [this](const QString &p, bool newTab) { openPath(p, newTab); });
     connect(m_tree, &FileTree::newNoteRequested, this, &MainWindow::newNote);
@@ -265,7 +297,24 @@ void MainWindow::buildUi()
     connect(m_tree, &FileTree::renameRequested, this, &MainWindow::promptRename);
     connect(m_tree, &FileTree::deleteRequested, this, &MainWindow::deletePath);
     connect(m_tree, &FileTree::moveRequested, this, &MainWindow::movePath);
-    connect(m_tree, &FileTree::moveToRequested, this, &MainWindow::chooseFolderAndMove);
+    connect(m_tree, &FileTree::moveToRequested, this, [this](const QString &path) { chooseFolderAndMove({path}); });
+    connect(m_tree, &FileTree::moveManyRequested, this, &MainWindow::chooseFolderAndMove);
+    connect(m_tree, &FileTree::deleteManyRequested, this, &MainWindow::deletePaths);
+    m_tree->extraActions = [this](QMenu *menu, const QString &path) {
+        menu->addAction(m_bookmarks->has(path) ? tr("Remove bookmark") : tr("Bookmark"), this, [this, path] { m_bookmarks->toggle(path); });
+    };
+    connect(m_bookmarks, &BookmarksPanel::openRequested, this, [this](const QString &path, bool newTab) {
+        if (m_vault && m_vault->isDir(path))
+            revealInTree(path);
+        else
+            openPath(path, newTab);
+    });
+    connect(m_bookmarks, &BookmarksPanel::searchRequested, this, [this](const QString &q) { searchVault(q); });
+    connect(m_search, &SearchPanel::bookmarkRequested, this, [this](const QString &q) {
+        m_bookmarks->addSearch(q);
+        statusBar()->showMessage(tr("Search bookmarked"), 3000);
+    });
+    connect(m_tags, &TagsPanel::searchRequested, this, [this](const QString &q) { searchVault(q); });
     connect(m_tree, &FileTree::duplicateRequested, this, &MainWindow::duplicatePath);
     connect(m_tree, &FileTree::searchInFolderRequested, this, [this](const QString &dir) { searchVault(u"path:\""_s + dir + u"/\" "_s); });
     connect(m_search, &SearchPanel::openRequested, this,
@@ -316,7 +365,7 @@ void MainWindow::buildActions()
     };
 
     QMenu *file = menuBar()->addMenu(tr("&File"));
-    add(file, u"file.new"_s, tr("New note"), QKeySequence::New, [this] { newNote({}); });
+    add(file, u"file.new"_s, tr("New note"), QKeySequence::New, [this] { newNote(defaultNoteDir()); });
     add(file, u"file.newFolder"_s, tr("New folder…"), {}, [this] { newFolder({}); });
     file->addSeparator();
     add(file, u"vault.open"_s, tr("Open vault…"), QKeySequence(u"Ctrl+Shift+O"_s), [this] {
@@ -329,7 +378,7 @@ void MainWindow::buildActions()
     file->addSeparator();
     add(file, u"file.copy"_s, tr("Make a copy of the current file"), {}, withView([this](NoteView *v) { duplicatePath(v->path()); }));
     add(file, u"file.move"_s, tr("Move current file to another folder…"), {},
-        withView([this](NoteView *v) { chooseFolderAndMove(v->path()); }));
+        withView([this](NoteView *v) { chooseFolderAndMove({v->path()}); }));
     QMenu *copyPath = file->addMenu(tr("Copy current file path"));
     auto copy = [this, withView](auto text) {
         return withView([this, text](NoteView *v) { QApplication::clipboard()->setText(text(*m_vault, v->path())); });
@@ -347,12 +396,14 @@ void MainWindow::buildActions()
         QDesktopServices::openUrl(QUrl::fromLocalFile(QFileInfo(m_vault->absolutePath(v->path())).absolutePath()));
     }));
     add(file, u"file.reveal"_s, tr("Reveal current file in navigation"), {}, withView([this](NoteView *v) { revealInTree(v->path()); }));
+    add(file, u"file.bookmark"_s, tr("Bookmark current file"), {}, withView([this](NoteView *v) { m_bookmarks->toggle(v->path()); }));
     add(file, u"file.delete"_s, tr("Delete current file"), {}, withView([this](NoteView *v) { deletePath(v->path()); }));
     file->addSeparator();
     add(file, u"file.save"_s, tr("Save"), QKeySequence::Save, [this] { saveAll(); });
+    add(file, u"app.settings"_s, tr("Settings…"), QKeySequence(u"Ctrl+,"_s), [this] { openSettings(); }, false);
     add(file, u"tab.close"_s, tr("Close tab"), QKeySequence(u"Ctrl+W"_s), [this] {
-        if (m_tabs->count())
-            closeTab(m_tabs->currentIndex());
+        if (NoteView *v = currentView())
+            closeView(v);
     });
     file->addSeparator();
     add(file, u"app.quit"_s, tr("Quit"), QKeySequence::Quit, [this] { close(); }, false);
@@ -406,6 +457,14 @@ void MainWindow::buildActions()
     add(insert, u"insert.rule"_s, tr("Horizontal rule"), {}, withEditor([](Editor *e) { e->insertRule(); }));
     add(insert, u"insert.codeblock"_s, tr("Code block"), {}, withEditor([](Editor *e) { e->insertCodeBlock(); }));
     insert->addSeparator();
+    add(insert, u"insert.template"_s, tr("Insert template…"), {}, withEditor([this](Editor *e) { insertTemplate(e); }));
+    add(insert, u"insert.date"_s, tr("Insert current date"), {}, withEditor([this](Editor *e) {
+        e->insertPlainText(Settings::formatMoment(QDateTime::currentDateTime(), Settings::templates(*m_vault).dateFormat));
+    }));
+    add(insert, u"insert.time"_s, tr("Insert current time"), {}, withEditor([this](Editor *e) {
+        e->insertPlainText(Settings::formatMoment(QDateTime::currentDateTime(), Settings::templates(*m_vault).timeFormat));
+    }));
+    insert->addSeparator();
     add(insert, u"insert.property"_s, tr("Add file property"), QKeySequence(u"Ctrl+;"_s), [this] {
         // Unlike the other editor commands this one also runs from inside the properties panel.
         if (NoteView *v = currentView(); v && v->isNote() && v->mode() == NoteView::Edit)
@@ -413,6 +472,7 @@ void MainWindow::buildActions()
     });
 
     QMenu *go = menuBar()->addMenu(tr("&Go"));
+    add(go, u"daily.today"_s, tr("Open today's daily note"), {}, [this] { openDailyNote(); });
     add(go, u"app.palette"_s, tr("Command palette"), QKeySequence(u"Ctrl+P"_s), [this] { commandPalette(); });
     add(go, u"app.switcher"_s, tr("Quick switcher"), QKeySequence(u"Ctrl+O"_s), [this] { quickSwitcher(); });
     add(go, u"app.search"_s, tr("Search vault"), QKeySequence(u"Ctrl+Shift+F"_s), [this] {
@@ -476,6 +536,16 @@ void MainWindow::buildActions()
     live->setChecked(m_livePreview);
     live->setToolTip(tr("Hide Markdown markup except where the cursor is"));
     view->addSeparator();
+    add(view, u"fold.toggle"_s, tr("Toggle fold"), QKeySequence(u"Ctrl+Shift+["_s), withEditor([](Editor *e) { e->toggleFoldAtCursor(); }));
+    add(view, u"fold.all"_s, tr("Fold all headings and lists"), {}, withEditor([](Editor *e) { e->foldAll(true); }));
+    add(view, u"fold.none"_s, tr("Unfold all headings and lists"), {}, withEditor([](Editor *e) { e->foldAll(false); }));
+    view->addSeparator();
+    add(view, u"pane.splitRight"_s, tr("Split right"), {}, [this] { splitRight(); });
+    add(view, u"tab.pin"_s, tr("Pin or unpin tab"), {}, withView([this](NoteView *v) {
+        v->setPinned(!v->isPinned());
+        updateTabButton(v);
+    }));
+    view->addSeparator();
     add(view, u"view.left"_s, tr("Toggle left sidebar"), QKeySequence(u"Ctrl+\\"_s), [this] { m_left->setVisible(!m_left->isVisible()); });
     add(view, u"view.right"_s, tr("Toggle right sidebar"), QKeySequence(u"Ctrl+Shift+\\"_s), [this] { m_right->setVisible(!m_right->isVisible()); });
     view->addSeparator();
@@ -511,8 +581,8 @@ void MainWindow::showWelcome()
             v->discardIfUntouched();
         saveAll();
         saveSession();
-        while (m_tabs->count())
-            closeTab(0, false);
+        for (NoteView *v : views())
+            closeView(v, false);
         m_vault->deleteLater();
         m_vault = nullptr;
         QSettings().remove(u"lastVault"_s);
@@ -588,6 +658,7 @@ void MainWindow::openVault(const QString &path)
         a->setEnabled(true);
     m_tree->setVault(m_vault);
     m_search->setVault(m_vault);
+    m_bookmarks->setVault(m_vault, vaultKey());
     m_vaultLabel->setText(m_vault->name());
     m_pages->setCurrentWidget(m_split);
 
@@ -599,13 +670,15 @@ void MainWindow::openVault(const QString &path)
     s.setValue(u"recentVaults"_s, recentVaults.mid(0, 10));
 
     restoreSession();
+    if (Settings::vault(*m_vault, u"dailyOnStartup"_s, {}, {}, false).toBool())
+        openDailyNote();
     onVaultChanged();
     onCurrentChanged();
 }
 
 QString MainWindow::vaultKey() const
 {
-    return u"vault-"_s + QString::fromLatin1(QCryptographicHash::hash(m_vault->root().toUtf8(), QCryptographicHash::Sha1).toHex().left(16));
+    return Settings::vaultGroup(*m_vault);
 }
 
 void MainWindow::saveSession()
@@ -616,15 +689,24 @@ void MainWindow::saveSession()
     s.setValue(u"fontDelta"_s, m_fontDelta);
     if (!m_vault)
         return;
-    QStringList tabs, modes;
-    for (NoteView *v : views()) {
-        tabs << v->path();
-        modes << QString::number(v->mode());
+    QVariantList saved;
+    for (QTabWidget *pane : panes()) {
+        QStringList tabs, modes, pinned;
+        for (int i = 0; i < pane->count(); ++i) {
+            auto *v = qobject_cast<NoteView *>(pane->widget(i));
+            tabs << v->path();
+            modes << QString::number(v->mode());
+            if (v->isPinned())
+                pinned << v->path();
+        }
+        saved << QVariantMap{{u"tabs"_s, tabs}, {u"modes"_s, modes}, {u"pinned"_s, pinned}, {u"current"_s, pane->currentIndex()}};
     }
     s.beginGroup(vaultKey());
-    s.setValue(u"tabs"_s, tabs);
-    s.setValue(u"modes"_s, modes);
-    s.setValue(u"current"_s, m_tabs->currentIndex());
+    s.remove(u"tabs"_s);
+    s.remove(u"modes"_s);
+    s.remove(u"current"_s);
+    s.setValue(u"panes"_s, saved);
+    s.setValue(u"activePane"_s, panes().indexOf(m_tabs));
     s.setValue(u"recent"_s, m_recent);
     s.setValue(u"leftVisible"_s, m_left->isVisible());
     s.setValue(u"rightVisible"_s, m_right->isVisible());
@@ -639,26 +721,40 @@ void MainWindow::restoreSession()
     m_recent = s.value(u"recent"_s).toStringList();
     m_left->setVisible(s.value(u"leftVisible"_s, true).toBool());
     m_right->setVisible(s.value(u"rightVisible"_s, true).toBool());
-    const QStringList tabs = s.value(u"tabs"_s).toStringList();
-    const QStringList modes = s.value(u"modes"_s).toStringList();
-    const int current = s.value(u"current"_s, 0).toInt();
+    QVariantList saved = s.value(u"panes"_s).toList();
+    if (saved.isEmpty() && s.contains(u"tabs"_s))
+        saved << QVariantMap{{u"tabs"_s, s.value(u"tabs"_s)}, {u"modes"_s, s.value(u"modes"_s)}, {u"current"_s, s.value(u"current"_s)}};
+    const int active = s.value(u"activePane"_s, 0).toInt();
     m_tree->setExpandedFolders(s.value(u"expandedFolders"_s).toStringList());
     s.endGroup();
 
-    for (qsizetype i = 0; i < tabs.size(); ++i) {
-        if (!m_vault->exists(tabs[i]))
+    QTabWidget *activePane = nullptr;
+    for (int p = 0; p < saved.size(); ++p) {
+        const QVariantMap pane = saved[p].toMap();
+        const QStringList tabs = pane.value(u"tabs"_s).toStringList();
+        const QStringList modes = pane.value(u"modes"_s).toStringList();
+        const QStringList pinned = pane.value(u"pinned"_s).toStringList();
+        if (std::none_of(tabs.cbegin(), tabs.cend(), [this](const QString &t) { return m_vault->exists(t); }))
             continue;
-        NoteView *v = createTab();
-        v->setMode(modes.value(i).toInt() == NoteView::Read ? NoteView::Read : NoteView::Edit);
-        v->open(tabs[i], false);
+        if (m_tabs->count())
+            m_tabs = createPane();
+        for (qsizetype i = 0; i < tabs.size(); ++i) {
+            if (!m_vault->exists(tabs[i]))
+                continue;
+            NoteView *v = createTab();
+            v->setMode(modes.value(i).toInt() == NoteView::Read ? NoteView::Read : NoteView::Edit);
+            v->open(tabs[i], false);
+            if (pinned.contains(tabs[i])) {
+                v->setPinned(true);
+                updateTabButton(v);
+            }
+        }
+        m_tabs->setCurrentIndex(qBound(0, pane.value(u"current"_s).toInt(), m_tabs->count() - 1));
+        if (p == active)
+            activePane = m_tabs;
     }
-    if (m_tabs->count() == 0) {
-        const QStringList &files = m_vault->files();
-        const auto first = std::find_if(files.cbegin(), files.cend(), [](const QString &f) { return Vault::isNote(f); });
-        if (first != files.cend())
-            openPath(*first, true);
-    }
-    m_tabs->setCurrentIndex(qBound(0, current, m_tabs->count() - 1));
+    m_tabs = activePane ? activePane : panes().first();
+    onCurrentChanged();
 }
 
 void MainWindow::closeEvent(QCloseEvent *e)
@@ -672,16 +768,100 @@ void MainWindow::closeEvent(QCloseEvent *e)
 
 bool MainWindow::eventFilter(QObject *obj, QEvent *e)
 {
-    if (obj == m_tabs->tabBar() && e->type() == QEvent::MouseButtonRelease) {
+    auto *bar = qobject_cast<QTabBar *>(obj);
+    QTabWidget *pane = bar ? qobject_cast<QTabWidget *>(bar->parentWidget()) : nullptr;
+    if (pane && e->type() == QEvent::MouseButtonPress)
+        setActivePane(pane);
+    if (pane && e->type() == QEvent::MouseButtonRelease) {
         auto *me = static_cast<QMouseEvent *>(e);
         if (me->button() == Qt::MiddleButton) {
-            const int i = m_tabs->tabBar()->tabAt(me->position().toPoint());
-            if (i >= 0)
-                closeTab(i);
+            if (auto *v = qobject_cast<NoteView *>(pane->widget(bar->tabAt(me->position().toPoint()))))
+                closeView(v);
             return true;
         }
     }
     return QMainWindow::eventFilter(obj, e);
+}
+
+QTabWidget *MainWindow::createPane()
+{
+    auto *pane = new QTabWidget;
+    pane->setDocumentMode(true);
+    pane->tabBar()->setObjectName(u"notes"_s);
+    pane->tabBar()->setDrawBase(false);
+    pane->setMovable(true);
+    pane->setElideMode(Qt::ElideRight);
+    pane->setUsesScrollButtons(true);
+    pane->tabBar()->setExpanding(false);
+    pane->tabBar()->installEventFilter(this);
+    pane->tabBar()->setContextMenuPolicy(Qt::CustomContextMenu);
+    connect(pane->tabBar(), &QWidget::customContextMenuRequested, this, [this, pane](const QPoint &pos) {
+        setActivePane(pane);
+        showTabMenu(pane, pos);
+    });
+    auto *plus = new QToolButton;
+    plus->setIcon(Theme::icon(u"file-plus"_s));
+    plus->setIconSize(QSize(18, 18));
+    plus->setAutoRaise(true);
+    plus->setToolTip(tr("New note (Ctrl+N)"));
+    auto *corner = new QWidget;
+    auto *cornerLayout = new QHBoxLayout(corner);
+    cornerLayout->setContentsMargins(0, 0, 6, 4); // aligns with the tab titles
+    cornerLayout->addWidget(plus, 0, Qt::AlignVCenter);
+    pane->setCornerWidget(corner, Qt::TopRightCorner);
+    connect(plus, &QToolButton::clicked, this, [this, pane] {
+        setActivePane(pane);
+        newNote(defaultNoteDir());
+    });
+    connect(pane, &QTabWidget::currentChanged, this, [this, pane] {
+        if (pane == m_tabs)
+            onCurrentChanged();
+    });
+    m_panes->addWidget(pane);
+    return pane;
+}
+
+QList<QTabWidget *> MainWindow::panes() const
+{
+    QList<QTabWidget *> out;
+    for (int i = 0; i < m_panes->count(); ++i)
+        if (auto *pane = qobject_cast<QTabWidget *>(m_panes->widget(i)))
+            out << pane;
+    return out;
+}
+
+QTabWidget *MainWindow::paneOf(NoteView *v) const
+{
+    for (QTabWidget *pane : panes())
+        if (pane->indexOf(v) >= 0)
+            return pane;
+    return nullptr;
+}
+
+void MainWindow::setActivePane(QTabWidget *pane)
+{
+    if (pane == m_tabs)
+        return;
+    m_tabs = pane;
+    onCurrentChanged();
+}
+
+// Opens the current note again in a new pane to the right.
+void MainWindow::splitRight()
+{
+    NoteView *from = currentView();
+    QTabWidget *pane = createPane();
+    m_panes->insertWidget(m_panes->indexOf(m_tabs) + 1, pane);
+    QList<int> sizes;
+    for (int i = 0; i < m_panes->count(); ++i)
+        sizes << 1000;
+    m_panes->setSizes(sizes);
+    m_tabs = pane;
+    NoteView *v = createTab();
+    if (from)
+        v->open(from->path(), false);
+    onCurrentChanged();
+    v->focusContent();
 }
 
 NoteView *MainWindow::currentView() const
@@ -692,9 +872,10 @@ NoteView *MainWindow::currentView() const
 QList<NoteView *> MainWindow::views() const
 {
     QList<NoteView *> out;
-    for (int i = 0; i < m_tabs->count(); ++i)
-        if (auto *v = qobject_cast<NoteView *>(m_tabs->widget(i)))
-            out << v;
+    for (QTabWidget *pane : panes())
+        for (int i = 0; i < pane->count(); ++i)
+            if (auto *v = qobject_cast<NoteView *>(pane->widget(i)))
+                out << v;
     return out;
 }
 
@@ -704,6 +885,7 @@ NoteView *MainWindow::createTab()
     v->applyFont(noteFont());
     v->setLivePreview(m_livePreview);
     v->setLinkCandidates(m_candidates);
+    applySettings(v);
     connect(v, &NoteView::linkRequested, this, [this, v](const QString &target, bool newTab) {
         openLink(target, v->path(), newTab);
     });
@@ -716,12 +898,27 @@ NoteView *MainWindow::createTab()
         renamePath(path, join(dirOf(path), name + ext));
         v->resetTitle();
     });
+    connect(v, &NoteView::hoverLink, this, &MainWindow::previewLink);
+    connect(v, &NoteView::notice, this, [this](const QString &message) { statusBar()->showMessage(message, 15000); });
+    // The same note open in another pane takes up what this one saved.
+    connect(v, &NoteView::saved, this, [this, v] {
+        for (NoteView *other : views())
+            if (other != v && other->path() == v->path())
+                other->reloadFromDisk();
+    });
+    v->editor()->setDocumentLookup([this](const QString &path) -> QTextDocument * {
+        for (NoteView *other : views())
+            if (other->path() == path && other->isNote())
+                return other->editor()->document();
+        return nullptr;
+    });
     connect(v, &NoteView::pathChanged, this, [this, v] {
-        const int i = m_tabs->indexOf(v);
-        if (i < 0)
+        QTabWidget *pane = paneOf(v);
+        if (!pane)
             return;
-        m_tabs->setTabText(i, Vault::isNote(v->path()) ? Vault::baseName(v->path()) : v->path().section(u'/', -1));
-        m_tabs->setTabToolTip(i, v->path());
+        const int i = pane->indexOf(v);
+        pane->setTabText(i, Vault::isNote(v->path()) ? Vault::baseName(v->path()) : v->path().section(u'/', -1));
+        pane->setTabToolTip(i, v->path());
         if (v == currentView())
             onCurrentChanged();
     });
@@ -748,30 +945,55 @@ NoteView *MainWindow::createTab()
         if (v == currentView())
             updateStatus();
     });
-    const int index = m_tabs->addTab(v, QString());
-    auto *close = new QToolButton;
-    close->setIcon(Theme::icon(u"close"_s));
-    close->setIconSize(QSize(14, 14));
-    close->setAutoRaise(true);
-    close->setFocusPolicy(Qt::NoFocus);
-    close->setToolTip(tr("Close tab (Ctrl+W)"));
-    connect(close, &QToolButton::clicked, this, [this, v] { closeTab(m_tabs->indexOf(v)); });
-    m_tabs->tabBar()->setTabButton(index, QTabBar::RightSide, close);
+    m_tabs->addTab(v, QString());
+    updateTabButton(v);
     return v;
 }
 
-void MainWindow::closeTab(int index, bool saveFirst)
+// A pinned tab shows a pin instead of the close button; clicking it unpins.
+void MainWindow::updateTabButton(NoteView *v)
 {
-    auto *v = qobject_cast<NoteView *>(m_tabs->widget(index));
-    if (!v)
+    QTabWidget *pane = paneOf(v);
+    if (!pane)
+        return;
+    auto *button = new QToolButton;
+    button->setIcon(Theme::icon(v->isPinned() ? u"pin"_s : u"close"_s));
+    button->setIconSize(QSize(14, 14));
+    button->setAutoRaise(true);
+    button->setFocusPolicy(Qt::NoFocus);
+    button->setToolTip(v->isPinned() ? tr("Unpin") : tr("Close tab (Ctrl+W)"));
+    connect(button, &QToolButton::clicked, this, [this, v] {
+        if (v->isPinned()) {
+            v->setPinned(false);
+            updateTabButton(v);
+        } else {
+            closeView(v);
+        }
+    });
+    pane->tabBar()->setTabButton(pane->indexOf(v), QTabBar::RightSide, button);
+}
+
+void MainWindow::closeView(NoteView *v, bool saveFirst)
+{
+    QTabWidget *pane = paneOf(v);
+    if (!pane)
         return;
     if (saveFirst && !v->discardIfUntouched()) {
         v->save();
         m_closedTabs.removeAll(v->path());
         m_closedTabs << v->path();
     }
-    m_tabs->removeTab(index);
+    pane->removeTab(pane->indexOf(v));
     v->deleteLater();
+    if (pane->count() == 0 && panes().size() > 1) {
+        pane->hide();
+        pane->setParent(nullptr);
+        pane->deleteLater();
+        if (pane == m_tabs) {
+            m_tabs = panes().first();
+            onCurrentChanged();
+        }
+    }
 }
 
 void MainWindow::saveAll()
@@ -789,7 +1011,7 @@ void MainWindow::openPath(const QString &path, bool newTab, const QString &headi
         return;
     }
     NoteView *v = currentView();
-    if (newTab || !v)
+    if (newTab || !v || (v->isPinned() && v->path() != path))
         v = createTab();
     v->open(path);
     m_tabs->setCurrentWidget(v);
@@ -821,28 +1043,32 @@ void MainWindow::openLink(const QString &target, const QString &from, bool newTa
             QMessageBox::information(this, tr("Not found"), tr("“%1” is not in this vault.").arg(name));
             return;
         }
-        // Like Obsidian's default: new notes from links go to the vault root.
-        const QString rel = name.endsWith(u".md"_s, Qt::CaseInsensitive) ? name : name + u".md"_s;
+        const QString file = name.endsWith(u".md"_s, Qt::CaseInsensitive) ? name : name + u".md"_s;
+        const QString rel = file.contains(u'/') ? file : join(defaultNoteDir(), file);
+        if (const QString problem = Vault::nameProblem(Vault::baseName(rel)); !problem.isEmpty()) {
+            QMessageBox::warning(this, tr("Could not create note"), problem);
+            return;
+        }
         path = m_vault->createNote(rel);
         if (path.isEmpty()) {
             QMessageBox::warning(this, tr("Could not create note"), tr("Could not create “%1”.").arg(rel));
             return;
         }
+        openPath(path, newTab, heading);
+        // Left empty, a note made by following a link is removed again, like any new note.
+        if (NoteView *v = currentView(); v && v->path() == path)
+            v->markNew();
+        return;
     }
     openPath(path, newTab, heading);
 }
 
 bool MainWindow::validName(const QString &name)
 {
-    static const QString forbidden = u"\\/:*?\"<>|#^[]"_s;
-    for (const QChar c : name) {
-        if (forbidden.contains(c)) {
-            QMessageBox::warning(this, tr("Invalid name"),
-                                 tr("Names cannot contain any of these characters:\n%1").arg(forbidden));
-            return false;
-        }
-    }
-    return !name.trimmed().isEmpty() && !name.startsWith(u'.');
+    const QString problem = Vault::nameProblem(name);
+    if (!problem.isEmpty())
+        QMessageBox::warning(this, tr("Invalid name"), problem);
+    return problem.isEmpty();
 }
 
 void MainWindow::newNote(const QString &dir)
@@ -904,22 +1130,28 @@ void MainWindow::movePath(const QString &from, const QString &toDir)
 
 void MainWindow::deletePath(const QString &path)
 {
-    // Respect Obsidian's "Confirm file deletion" setting.
-    bool prompt = true;
-    QFile app(m_vault->absolutePath(u".obsidian/app.json"_s));
-    if (app.open(QIODevice::ReadOnly))
-        prompt = QJsonDocument::fromJson(app.readAll()).object().value(u"promptDelete").toBool(true);
-    if (prompt
-        && QMessageBox::question(this, tr("Delete"), tr("Move “%1” to the trash?").arg(path)) != QMessageBox::Yes)
-        return;
+    deletePaths({path});
+}
 
-    for (int i = m_tabs->count() - 1; i >= 0; --i) {
-        auto *v = qobject_cast<NoteView *>(m_tabs->widget(i));
-        if (v && (v->path() == path || v->path().startsWith(path + u'/')))
-            closeTab(i, false);
+void MainWindow::deletePaths(const QStringList &paths)
+{
+    if (paths.isEmpty())
+        return;
+    const QString what = paths.size() == 1 ? paths.first() : tr("%n items", nullptr, int(paths.size()));
+    if (confirmDeletion() && QMessageBox::question(this, tr("Delete"), tr("Move “%1” to the trash?").arg(what)) != QMessageBox::Yes)
+        return;
+    for (const QString &path : paths) {
+        for (NoteView *v : views())
+            if (v->path() == path || v->path().startsWith(path + u'/'))
+                closeView(v, false);
+        if (!m_vault->remove(path))
+            QMessageBox::warning(this, tr("Delete failed"), tr("Could not move “%1” to the trash.").arg(path));
     }
-    if (!m_vault->remove(path))
-        QMessageBox::warning(this, tr("Delete failed"), tr("Could not move “%1” to the trash.").arg(path));
+}
+
+bool MainWindow::confirmDeletion() const
+{
+    return Settings::confirmDelete(*m_vault);
 }
 
 void MainWindow::quickSwitcher(bool newTab)
@@ -969,8 +1201,9 @@ QWidget *MainWindow::buildFilesPage()
         barLayout->addWidget(b);
         return b;
     };
-    connect(button(u"file-plus"_s, tr("New note")), &QToolButton::clicked, this, [this] { newNote({}); });
+    connect(button(u"file-plus"_s, tr("New note")), &QToolButton::clicked, this, [this] { newNote(defaultNoteDir()); });
     connect(button(u"folder-plus"_s, tr("New folder")), &QToolButton::clicked, this, [this] { newFolder({}); });
+    connect(button(u"calendar"_s, tr("Open today's daily note")), &QToolButton::clicked, this, &MainWindow::openDailyNote);
 
     QToolButton *sort = button(u"sort"_s, tr("Change sort order"));
     auto *sortMenu = new QMenu(sort);
@@ -1039,10 +1272,10 @@ void MainWindow::searchVault(const QString &text)
     m_search->focusSearch();
 }
 
-void MainWindow::showTabMenu(const QPoint &pos)
+void MainWindow::showTabMenu(QTabWidget *pane, const QPoint &pos)
 {
-    QTabBar *bar = m_tabs->tabBar();
-    auto *v = qobject_cast<NoteView *>(m_tabs->widget(bar->tabAt(pos)));
+    QTabBar *bar = pane->tabBar();
+    auto *v = qobject_cast<NoteView *>(pane->widget(bar->tabAt(pos)));
     if (!v || !m_vault)
         return;
     QMenu menu(this);
@@ -1054,17 +1287,33 @@ void MainWindow::showTabMenu(const QPoint &pos)
 void MainWindow::fillNoteMenu(QMenu *menu, NoteView *v, bool tab)
 {
     const QString path = v->path();
-    if (tab) {
-        menu->addAction(tr("Close"), this, [this, v] { closeTab(m_tabs->indexOf(v)); });
-        menu->addAction(tr("Close others"), this, [this, v] {
-            for (int i = m_tabs->count() - 1; i >= 0; --i)
-                if (m_tabs->widget(i) != v)
-                    closeTab(i);
-        })->setEnabled(m_tabs->count() > 1);
-        menu->addAction(tr("Close tabs to the right"), this, [this, v] {
-            for (int i = m_tabs->count() - 1; i > m_tabs->indexOf(v); --i)
-                closeTab(i);
-        })->setEnabled(m_tabs->indexOf(v) < m_tabs->count() - 1);
+    if (QTabWidget *pane = paneOf(v); tab && pane) {
+        auto others = [pane, v](bool rightOnly) {
+            QList<NoteView *> out;
+            for (int i = rightOnly ? pane->indexOf(v) + 1 : 0; i < pane->count(); ++i)
+                if (auto *o = qobject_cast<NoteView *>(pane->widget(i)); o && o != v && !o->isPinned())
+                    out << o;
+            return out;
+        };
+        menu->addAction(tr("Close"), this, [this, v] { closeView(v); });
+        menu->addAction(tr("Close others"), this, [this, others] {
+            for (NoteView *o : others(false))
+                closeView(o);
+        })->setEnabled(!others(false).isEmpty());
+        menu->addAction(tr("Close tabs to the right"), this, [this, others] {
+            for (NoteView *o : others(true))
+                closeView(o);
+        })->setEnabled(!others(true).isEmpty());
+        menu->addSeparator();
+        menu->addAction(v->isPinned() ? tr("Unpin") : tr("Pin"), this, [this, v] {
+            v->setPinned(!v->isPinned());
+            updateTabButton(v);
+        });
+        menu->addAction(tr("Split right"), this, [this, pane, v] {
+            pane->setCurrentWidget(v);
+            setActivePane(pane);
+            splitRight();
+        });
         menu->addSeparator();
     }
     if (v->isNote()) {
@@ -1077,7 +1326,8 @@ void MainWindow::fillNoteMenu(QMenu *menu, NoteView *v, bool tab)
         menu->addSeparator();
     }
     menu->addAction(tr("Rename..."), this, [v] { v->focusTitle(); });
-    menu->addAction(tr("Move file to..."), this, [this, path] { chooseFolderAndMove(path); });
+    menu->addAction(tr("Move file to..."), this, [this, path] { chooseFolderAndMove({path}); });
+    menu->addAction(m_bookmarks->has(path) ? tr("Remove bookmark") : tr("Bookmark"), this, [this, path] { m_bookmarks->toggle(path); });
     if (v->isNote()) {
         menu->addAction(m_commands.value(u"insert.property"_s));
         menu->addSeparator();
@@ -1101,7 +1351,7 @@ void MainWindow::addFileActions(QMenu *menu, const QString &path, bool deletable
     PathActions::addCopyMenu(menu, *m_vault, path);
     menu->addSeparator();
     menu->addAction(tr("Rename..."), this, [this, path] { promptRename(path); });
-    menu->addAction(tr("Move file to..."), this, [this, path] { chooseFolderAndMove(path); });
+    menu->addAction(tr("Move file to..."), this, [this, path] { chooseFolderAndMove({path}); });
     menu->addSeparator();
     menu->addAction(tr("Open in default app"), this, [this, path] { QDesktopServices::openUrl(QUrl::fromLocalFile(m_vault->absolutePath(path))); });
     menu->addAction(tr("Show in system explorer"), this, [this, path] {
@@ -1150,9 +1400,11 @@ void MainWindow::duplicatePath(const QString &path)
         v->focusTitle();
 }
 
-void MainWindow::chooseFolderAndMove(const QString &path)
+void MainWindow::chooseFolderAndMove(const QStringList &paths)
 {
-    const QString from = dirOf(path);
+    if (paths.isEmpty())
+        return;
+    const QString from = paths.size() == 1 ? dirOf(paths.first()) : QString(u'\x01');
     const QString root = tr("(vault root)");
     QStringList folders;
     if (!from.isEmpty())
@@ -1161,19 +1413,23 @@ void MainWindow::chooseFolderAndMove(const QString &path)
     while (it.hasNext()) {
         const QString dir = m_vault->relativePath(it.next());
         const bool hidden = dir.startsWith(u'.') || dir.contains(u"/."_s);
-        if (!hidden && dir != from && dir != path && !dir.startsWith(path + u'/'))
+        const bool inside = std::any_of(paths.cbegin(), paths.cend(), [&](const QString &p) { return dir == p || dir.startsWith(p + u'/'); });
+        if (!hidden && dir != from && !inside)
             folders << dir;
     }
     std::sort(folders.begin() + (from.isEmpty() ? 0 : 1), folders.end());
+    const QString what = paths.size() == 1 ? paths.first().section(u'/', -1) : tr("%n items", nullptr, int(paths.size()));
     if (folders.isEmpty()) {
-        QMessageBox::information(this, tr("Move to"), tr("There is no other folder to move “%1” to.").arg(path));
+        QMessageBox::information(this, tr("Move to"), tr("There is no other folder to move “%1” to.").arg(what));
         return;
     }
     bool ok = false;
-    const QString to = QInputDialog::getItem(this, tr("Move to"), tr("Move “%1” to:").arg(path.section(u'/', -1)), folders,
-                                             0, false, &ok);
-    if (ok)
-        movePath(path, to == root ? QString() : to);
+    const QString to = QInputDialog::getItem(this, tr("Move to"), tr("Move “%1” to:").arg(what), folders, 0, false, &ok);
+    if (!ok)
+        return;
+    for (const QString &path : paths)
+        if (dirOf(path) != (to == root ? QString() : to))
+            movePath(path, to == root ? QString() : to);
 }
 
 QString MainWindow::findVault(const QString &name) const
@@ -1263,6 +1519,7 @@ void MainWindow::addRecent(const QString &path)
 
 void MainWindow::onCurrentChanged()
 {
+    m_center->setCurrentWidget(views().isEmpty() ? m_empty : static_cast<QWidget *>(m_panes));
     refreshPanels();
     updateStatus();
     updateTitle();
@@ -1274,10 +1531,16 @@ void MainWindow::onVaultChanged()
 {
     if (!m_vault)
         return;
-    for (int i = m_tabs->count() - 1; i >= 0; --i) {
-        auto *v = qobject_cast<NoteView *>(m_tabs->widget(i));
-        if (v && !m_vault->exists(v->path()))
-            closeTab(i, false);
+    for (NoteView *v : views()) {
+        if (m_vault->exists(v->path()) || v->path().isEmpty())
+            continue;
+        // Deleted outside Serat; unsaved words are written back rather than lost with the tab.
+        if (v->hasUnsavedChanges() && v->save()) {
+            statusBar()->showMessage(tr("“%1” was deleted outside Serat; it was saved again with your unsaved changes.")
+                                         .arg(Vault::baseName(v->path())), 15000);
+            continue;
+        }
+        closeView(v, false);
     }
     m_candidates.clear();
     for (const QString &f : m_vault->files())
@@ -1287,6 +1550,7 @@ void MainWindow::onVaultChanged()
         v->refreshRender();
     }
     m_search->rerun();
+    m_tags->showFor(m_vault);
     refreshPanels();
 }
 
@@ -1297,6 +1561,9 @@ void MainWindow::refreshPanels()
     m_backlinks->showFor(m_vault, path);
     m_outgoing->showFor(m_vault, path);
     m_outline->showFor(m_vault ? m_vault->note(path) : nullptr);
+    const int sources = m_backlinks->sourceCount();
+    m_backlinkCount->setText(sources == 1 ? tr("1 backlink") : tr("%1 backlinks").arg(sources));
+    m_backlinkCount->setVisible(m_vault && !path.isEmpty());
 }
 
 void MainWindow::updateStatus()
@@ -1315,4 +1582,136 @@ void MainWindow::updateTitle()
         parts << m_vault->name();
     parts << u"Serat"_s;
     setWindowTitle(parts.join(u" - "_s));
+}
+
+void MainWindow::previewLink(const QString &href, const QPoint &globalPos)
+{
+    m_previewHref = href;
+    m_previewPos = globalPos;
+    if (href.isEmpty()) {
+        m_previewTimer.stop();
+        if (!m_preview->underMouse())
+            m_preview->hide();
+        return;
+    }
+    m_previewTimer.start();
+}
+
+void MainWindow::showPreview()
+{
+    if (!m_vault || !m_previewHref.startsWith(u"wiki:"_s))
+        return;
+    const QString target = QUrl::fromPercentEncoding(m_previewHref.mid(5).toUtf8());
+    const QString name = target.section(u'#', 0, 0);
+    const QString heading = target.section(u'#', 1);
+    NoteView *v = currentView();
+    const QString path = name.isEmpty() && v ? v->path() : m_vault->resolve(name, v ? v->path() : QString());
+    const Note *note = m_vault->note(path);
+    if (!note)
+        return;
+    RenderOptions opt;
+    opt.vault = m_vault;
+    opt.notePath = path;
+    opt.contentWidth = 380;
+    opt.palette = palette();
+    opt.dark = palette().color(QPalette::Base).lightness() < 128;
+    opt.depth = 1;
+    const QString title = u"<p style=\"font-size:large;\"><b>%1</b></p>"_s.arg(Vault::baseName(path).toHtmlEscaped());
+    Reader *reader = m_preview->reader();
+    reader->document()->setDefaultFont(noteFont());
+    reader->document()->setDefaultStyleSheet(markdownStyleSheet(palette(), noteFont().pointSizeF()));
+    m_preview->popup(title + renderMarkdown(note->text, opt).html, heading.startsWith(u'^') ? QString() : headingAnchor(heading),
+                     m_previewPos);
+}
+
+QString MainWindow::defaultNoteDir() const
+{
+    NoteView *v = currentView();
+    return m_vault ? Settings::newNoteDir(*m_vault, v ? v->path() : QString()) : QString();
+}
+
+void MainWindow::openDailyNote()
+{
+    if (!m_vault)
+        return;
+    const QDateTime now = QDateTime::currentDateTime();
+    const Settings::Daily daily = Settings::daily(*m_vault);
+    QStringList parts = Settings::formatMoment(now, daily.format.isEmpty() ? u"YYYY-MM-DD"_s : daily.format).split(u'/', Qt::SkipEmptyParts);
+    for (QString &part : parts)
+        part = Vault::safeName(part); // a format may produce ':' and the like
+    const QString path = join(daily.folder, parts.join(u'/') + u".md"_s);
+    if (!m_vault->exists(path)) {
+        QString text;
+        if (!daily.templatePath.isEmpty()) {
+            const QString templ = m_vault->resolve(daily.templatePath, {});
+            if (m_vault->exists(templ))
+                text = Settings::applyTemplate(m_vault->readText(templ), Vault::baseName(path), Settings::templates(*m_vault), now);
+            else
+                statusBar()->showMessage(tr("Daily note template “%1” was not found.").arg(daily.templatePath), 5000);
+        }
+        if (m_vault->createNote(path, text).isEmpty()) {
+            QMessageBox::warning(this, tr("Daily note"), tr("Could not create “%1”.").arg(path));
+            return;
+        }
+    }
+    openPath(path, false);
+    if (NoteView *v = currentView())
+        v->focusContent();
+}
+
+void MainWindow::insertTemplate(Editor *editor)
+{
+    const Settings::Templates formats = Settings::templates(*m_vault);
+    if (formats.folder.isEmpty()) {
+        if (QMessageBox::question(this, tr("Insert template"), tr("Choose a template folder in Settings > Templates first. Open Settings now?"))
+            == QMessageBox::Yes)
+            openSettings();
+        return;
+    }
+    QStringList names;
+    QHash<QString, QString> paths;
+    for (const QString &f : m_vault->files()) {
+        if (!Vault::isNote(f) || !f.startsWith(formats.folder + u'/'))
+            continue;
+        const QString name = f.mid(formats.folder.size() + 1).chopped(3);
+        names << name;
+        paths.insert(name, f);
+    }
+    if (names.isEmpty()) {
+        QMessageBox::information(this, tr("Insert template"), tr("There are no notes in the template folder “%1”.").arg(formats.folder));
+        return;
+    }
+    names.sort(Qt::CaseInsensitive);
+    const QString chosen = pickItem(this, tr("Insert template"), tr("Find a template…"), names);
+    if (chosen.isEmpty())
+        return;
+    NoteView *v = currentView();
+    const QString title = v ? Vault::baseName(v->path()) : QString();
+    editor->insertPlainText(Settings::applyTemplate(m_vault->readText(paths.value(chosen)), title, formats, QDateTime::currentDateTime()));
+    editor->setFocus();
+}
+
+void MainWindow::openSettings()
+{
+    SettingsDialog dlg(m_vault, this);
+    connect(&dlg, &SettingsDialog::changed, this, qOverload<>(&MainWindow::applySettings));
+    dlg.exec();
+    applySettings();
+}
+
+void MainWindow::applySettings()
+{
+    const bool live = Settings::app(u"livePreview"_s, true).toBool();
+    if (live != m_livePreview)
+        m_commands.value(u"view.live"_s)->trigger();
+    setReadableLineLength(Settings::app(u"readableWidth"_s, true).toBool());
+    for (NoteView *v : views())
+        applySettings(v);
+}
+
+void MainWindow::applySettings(NoteView *v)
+{
+    v->editor()->setAutoPair(Settings::app(u"autoPairBrackets"_s, true).toBool(), Settings::app(u"autoPairMarkdown"_s, true).toBool());
+    v->editor()->setFoldingShown(Settings::app(u"foldGutter"_s, true).toBool(), Settings::app(u"indentGuides"_s, true).toBool());
+    v->relayout();
 }
