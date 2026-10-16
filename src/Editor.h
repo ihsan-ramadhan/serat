@@ -11,7 +11,7 @@
 #include <functional>
 
 class FoldGutter;
-class ImageBlock;
+class EmbedBlock;
 class MarkdownHighlighter;
 class PropertiesPanel;
 class QMenu;
@@ -85,6 +85,7 @@ protected:
     void paintEvent(QPaintEvent *e) override;
     void changeEvent(QEvent *e) override;
     void leaveEvent(QEvent *e) override;
+    void wheelEvent(QWheelEvent *e) override;
     void dragEnterEvent(QDragEnterEvent *e) override;
     void dragMoveEvent(QDragMoveEvent *e) override;
     void dropEvent(QDropEvent *e) override;
@@ -92,6 +93,7 @@ protected:
     void insertFromMimeData(const QMimeData *source) override;
 
 private:
+    void addSpellingActions(QMenu *menu, const QTextCursor &at);
     bool autoPair(QChar ch);
     void updateCompletion();
     void insertCompletion(const QString &name);
@@ -137,7 +139,7 @@ private:
     void editTableSource(TableOverlay *overlay);
     void deleteTable(TableOverlay *overlay);
     void showTableRow(TableOverlay *overlay, int row);
-    void setLineHeight(const QTextBlock &block, int height);
+    void setLineHeight(const QTextBlock &block, int height, int spread = 0);
     void flushTableWrites();
     void moveCursorQuietly(const QTextCursor &cursor);
 
@@ -146,12 +148,16 @@ private:
     void writeFrontmatter(const QStringList &lines);
     void leaveProperties();
     void showPropertiesSource();
-    struct Image {
-        QTextBlock block;
+    // Images, other notes, $$math$$ and diagrams drawn over their lines.
+    struct Embed {
+        QTextBlock head;
+        int lines = 1;
         int height = 0;
-        ImageBlock *widget = nullptr;
+        EmbedBlock *widget = nullptr;
     };
-    void scanImages(QSet<int> &covered);
+    void scanEmbeds(QSet<int> &covered);
+    int spreadHeight(const QTextBlock &first, int lines, int height);
+    void revealEmbed(EmbedBlock *widget);
     void showImageMenu(const QString &path, const QPoint &globalPos);
     QPair<QTextBlock, QTextBlock> calloutAt(const QTextBlock &block) const;
     void paintCalloutHead(QPainter &p, const QTextBlock &block);
@@ -202,8 +208,9 @@ private:
     int m_propLines = 0; // frontmatter lines under the panel, 0 while it is hidden
     int m_propsHeight = 0;
     bool m_rawProps = false;
-    QList<Image> m_images;
-    QTextBlock m_rawImage;
+    QList<Embed> m_embeds;
+    QTextBlock m_rawEmbed; // shown as Markdown because the cursor is in it
+    int m_rawEmbedLines = 0;
     QHash<QString, QImage> m_icons;
 
     bool m_pairBrackets = true;
@@ -219,5 +226,6 @@ private:
     QString m_blockPath;
     QHash<QString, int> m_blockLines;
     QString m_hoverHref;
+    int m_wheel = 0; // angle not yet turned into whole steps, for touchpads
     std::function<QTextDocument *(const QString &)> m_documentFor;
 };

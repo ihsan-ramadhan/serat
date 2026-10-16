@@ -6,6 +6,7 @@
 #include <QHash>
 #include <QList>
 #include <QObject>
+#include <QSet>
 #include <QTimer>
 
 struct Link {
@@ -33,6 +34,15 @@ struct Note {
     QStringList aliases;
     QHash<QString, int> blocks; // "^id" at the end of a line -> that line
     QStringList properties;    // frontmatter keys
+};
+
+// Where a note's name (or an alias) is written in another note without a link.
+struct Mention {
+    QString path;
+    int line = 0;
+    int start = 0;  // in the line
+    int length = 0;
+    QString text;   // the whole line
 };
 
 struct SearchHit {
@@ -63,6 +73,9 @@ public:
     // Shortest link text that resolves back to `path`.
     QString linkText(const QString &path) const;
     QList<QPair<QString, Link>> backlinks(const QString &path) const;
+    // The files `path` links to, resolved.
+    QSet<QString> linkTargets(const QString &path) const;
+    QList<Mention> unlinkedMentions(const QString &path) const;
     QList<SearchHit> search(const QString &query, int limit = 500, bool matchCase = false) const;
 
     QString uniquePath(const QString &wanted) const;
@@ -97,6 +110,8 @@ private:
     void rebuildNameIndex();
     QString linkTextIn(const QString &path, bool keepFullPath) const;
     qint64 fileStamp(const QString &path) const;
+    void buildLinkIndex() const;
+    void reindexLinks(const QString &source);
 
     QString m_root;
     Recovery m_recovery;
@@ -106,6 +121,10 @@ private:
     QStringList m_dirs;
     QHash<QString, QString> m_lowerPath;          // lowercase path -> path
     QHash<QString, QStringList> m_byFileName;     // lowercase file name -> paths
+    // Who links where, built on first use; a note's own entries are redone when only its text changed.
+    mutable QHash<QString, QList<QPair<QString, Link>>> m_incoming; // target -> (source, link)
+    mutable QHash<QString, QSet<QString>> m_outgoing;               // source -> targets
+    mutable bool m_linksIndexed = false;
     QFileSystemWatcher m_watcher;
     QTimer m_rescanTimer;
 };

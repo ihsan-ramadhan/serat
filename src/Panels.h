@@ -1,5 +1,7 @@
 #pragma once
 
+#include "Vault.h"
+
 #include <QPointer>
 #include <QTimer>
 #include <QTreeView>
@@ -13,8 +15,6 @@ class QLineEdit;
 class QMenu;
 class QSortFilterProxyModel;
 class QToolButton;
-class Vault;
-struct Note;
 
 class FileTree : public QTreeView
 {
@@ -146,9 +146,17 @@ public:
 
 Q_SIGNALS:
     void openRequested(const QString &path, int line, bool newTab);
+    void linkMentionRequested(const Mention &mention, const QString &target);
 
 private:
+    // Unlinked mentions read every note, so they are only looked for once their section is opened.
+    void fillMentions();
+
     const Vault *m_vault = nullptr;
+    QString m_path;
+    QTreeWidgetItem *m_mentions = nullptr;
+    QList<Mention> m_found;
+    bool m_showMentions = false;
     int m_sources = 0; // notes linking here
 };
 

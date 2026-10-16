@@ -37,7 +37,7 @@ private:
     QTextCharFormat m_heading[6];
     QTextCharFormat m_markup, m_code, m_fenced, m_link, m_quote, m_callout, m_list, m_done;
     QTextCharFormat m_bold, m_italic, m_strike, m_mark, m_table, m_html;
-    QTextCharFormat m_collapse, m_ghost;
+    QTextCharFormat m_collapse, m_ghost, m_misspelled;
     QFont m_font;
     double m_calloutPad = 0; // room for the icon the editor draws in front of a callout title
     bool m_live = false;

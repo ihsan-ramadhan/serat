@@ -1,10 +1,15 @@
 #include "Editor.h"
 
+#include "Diagrams.h"
+#include "EmbedBlocks.h"
 #include "Markdown.h"
+#include "MathRender.h"
 #include "MarkdownHighlighter.h"
 #include "PathActions.h"
 #include "Properties.h"
+#include "Reader.h"
 #include "Settings.h"
+#include "Spelling.h"
 #include "TableEditor.h"
 #include "Theme.h"
 #include "Vault.h"
@@ -36,6 +41,7 @@
 #include <QStringListModel>
 #include <QTextBlock>
 #include <QUrl>
+#include <QWheelEvent>
 
 using namespace Qt::StringLiterals;
 
@@ -65,84 +71,6 @@ const QRegularExpression &calloutHeadRe()
 }
 
 } // namespace
-
-// An image embed drawn over its line in live preview.
-class ImageBlock : public QWidget
-{
-public:
-    explicit ImageBlock(QWidget *parent)
-        : QWidget(parent)
-    {
-        setCursor(Qt::ArrowCursor);
-    }
-
-    QString path; // vault-relative
-    std::function<void(const QPoint &)> menu;
-    std::function<void()> clicked;
-
-    void setImage(const QString &file, const QSize &wanted)
-    {
-        m_wanted = wanted;
-        if (file == m_file)
-            return;
-        m_file = file;
-        QImageReader reader(file);
-        reader.setAutoTransform(true);
-        m_natural = reader.size();
-        // Keep big photos small in memory; the editor never shows them wider than this.
-        if (m_natural.width() > 2000)
-            reader.setScaledSize(m_natural.scaled(2000, m_natural.height(), Qt::KeepAspectRatio));
-        m_image = reader.read();
-        if (!m_natural.isValid())
-            m_natural = m_image.size();
-        m_scaled = {};
-    }
-
-    bool isNull() const { return m_image.isNull(); }
-
-    QSize sizeFor(int maxWidth) const
-    {
-        QSize s = m_natural;
-        if (s.isEmpty())
-            return {};
-        if (m_wanted.width() > 0 && m_wanted.height() > 0)
-            s = s.scaled(m_wanted, Qt::KeepAspectRatio);
-        else if (m_wanted.width() > 0)
-            s = QSize(m_wanted.width(), qMax(1, qRound(s.height() * double(m_wanted.width()) / s.width())));
-        if (s.width() > maxWidth)
-            s = QSize(maxWidth, qMax(1, qRound(s.height() * double(maxWidth) / s.width())));
-        return s;
-    }
-
-protected:
-    void paintEvent(QPaintEvent *) override
-    {
-        const qreal dpr = devicePixelRatioF();
-        const QSize px = size() * dpr;
-        if (m_scaled.size() != px) {
-            m_scaled = QPixmap::fromImage(m_image.scaled(px, Qt::IgnoreAspectRatio, Qt::SmoothTransformation));
-            m_scaled.setDevicePixelRatio(dpr);
-        }
-        QPainter(this).drawPixmap(0, 0, m_scaled);
-    }
-    void contextMenuEvent(QContextMenuEvent *e) override
-    {
-        if (menu)
-            menu(e->globalPos());
-    }
-    void mousePressEvent(QMouseEvent *e) override
-    {
-        if (e->button() == Qt::LeftButton && clicked)
-            clicked();
-        e->accept();
-    }
-
-private:
-    QString m_file;
-    QImage m_image;
-    QSize m_natural, m_wanted;
-    QPixmap m_scaled;
-};
 
 namespace {
 bool g_readable = true;
@@ -236,6 +164,7 @@ Editor::Editor(QWidget *parent)
     setBackgroundRole(QPalette::Base);
     setAutoFillBackground(true);
     setWordWrapMode(QTextOption::WrapAtWordBoundaryOrAnywhere);
+    connect(&Spelling::instance(), &Spelling::changed, this, [this] { m_highlighter->rehighlight(); });
     viewport()->setMouseTracking(true);
 
     m_completer->setModel(m_candidates);
@@ -257,6 +186,7 @@ Editor::Editor(QWidget *parent)
             m_tableTimer.start();
     });
     connect(this, &QPlainTextEdit::updateRequest, this, &Editor::positionTables);
+    connect(&Diagrams::instance(), &Diagrams::ready, &m_tableTimer, qOverload<>(&QTimer::start));
     connect(this, &QPlainTextEdit::updateRequest, m_gutter, [this] { m_gutter->update(); });
     connect(this, &QPlainTextEdit::cursorPositionChanged, this, &Editor::onCursorMoved);
     connect(this, &QPlainTextEdit::cursorPositionChanged, this, &Editor::updateRawBlocks);
@@ -1300,7 +1230,7 @@ void Editor::scanTables()
     scanProperties(covered);
     for (const int n : folded)
         covered.insert(n);
-    scanImages(covered);
+    scanEmbeds(covered);
 
     // One relayout for every line shown or hidden; one per line made typing in a long fold sluggish.
     int dirtyFrom = -1, dirtyTo = -1;
@@ -1332,7 +1262,7 @@ void Editor::scanTables()
     viewport()->update();
 }
 
-void Editor::setLineHeight(const QTextBlock &block, int height)
+void Editor::setLineHeight(const QTextBlock &block, int height, int spread)
 {
     QTextBlock b = block;
     auto *d = static_cast<TableLineData *>(b.userData());
@@ -1340,10 +1270,16 @@ void Editor::setLineHeight(const QTextBlock &block, int height)
         d = new TableLineData;
         b.setUserData(d);
     }
+    if (d->spread != spread) {
+        d->spread = spread;
+        d->pixelSize = 0;
+    }
     QFont f = font();
     f.setPixelSize(100);
     const double perPixel = QFontMetricsF(f).height() / 100.0;
-    int px = d->pixelSize ? d->pixelSize : qMax(1, int(height / perPixel));
+    // With `spread` the block wraps into one line per character; size each line for its share.
+    const int lines = spread > 0 ? qMax(1, int(b.text().size())) : 1;
+    int px = d->pixelSize ? d->pixelSize : qMax(1, int(height / (perPixel * lines)));
     // The text layout decides the real line height, so measure and adjust.
     for (int attempt = 0; attempt < 6; ++attempt) {
         if (d->pixelSize != px) {
@@ -1351,37 +1287,55 @@ void Editor::setLineHeight(const QTextBlock &block, int height)
             m_highlighter->rehighlightBlock(b);
         }
         const double actual = document()->documentLayout()->blockBoundingRect(b).height();
-        if (actual >= height && actual - height <= 2 * perPixel + 1)
+        const int count = b.layout() && b.layout()->lineCount() > 0 ? b.layout()->lineCount() : lines;
+        const double unit = perPixel * count;
+        if (actual >= height && actual - height <= 2 * unit + 1)
             break;
-        int step = int((height - actual) / perPixel);
+        int step = int((height - actual) / unit);
         if (step == 0)
             step = actual < height ? 1 : -1;
         px = qMax(1, px + step);
     }
 }
 
+// Shares `height` among `lines` blocks so a tall widget over them scrolls line by line; returns the height used.
+int Editor::spreadHeight(const QTextBlock &first, int lines, int height)
+{
+    QList<QTextBlock> blocks;
+    int chars = 0;
+    for (QTextBlock b = first; b.isValid() && blocks.size() < lines; b = b.next()) {
+        blocks << b;
+        chars += qMax(1, int(b.text().size()));
+    }
+    const int spread = int(viewport()->width() * 0.6); // wider than half a line: one character per line
+    auto *layout = document()->documentLayout();
+    int given = 0, total = 0;
+    for (qsizetype k = 0; k < blocks.size(); ++k) {
+        QTextBlock b = blocks[k];
+        if (!b.isVisible()) {
+            b.setVisible(true);
+            document()->markContentsDirty(b.position(), b.length());
+        }
+        const int share = k + 1 == blocks.size() ? height - given : height * qMax(1, int(b.text().size())) / qMax(1, chars);
+        given += share;
+        setLineHeight(b, qMax(1, share), spread);
+        total += int(layout->blockBoundingRect(b).height());
+    }
+    return total;
+}
+
 void Editor::layoutTables()
 {
-    if (m_tableBusy || (m_tables.isEmpty() && m_images.isEmpty() && !m_propLines))
+    if (m_tableBusy || (m_tables.isEmpty() && m_embeds.isEmpty() && !m_propLines))
         return;
     m_tableBusy = true;
     const int margin = int(document()->documentMargin());
     const int width = viewport()->width() - 2 * margin;
     auto *layout = document()->documentLayout();
-    if (m_propLines) {
-        for (QTextBlock b = document()->firstBlock().next(); b.isValid() && b.blockNumber() < m_propLines; b = b.next()) {
-            if (b.isVisible()) {
-                b.setVisible(false);
-                document()->markContentsDirty(b.position(), b.length());
-            }
-        }
-        setLineHeight(document()->firstBlock(), m_props->heightFor(width));
-        m_propsHeight = int(layout->blockBoundingRect(document()->firstBlock()).height());
-    }
-    for (Image &im : m_images) {
-        setLineHeight(im.block, im.widget->sizeFor(width).height() + 8);
-        im.height = int(layout->blockBoundingRect(im.block).height());
-    }
+    if (m_propLines)
+        m_propsHeight = spreadHeight(document()->firstBlock(), m_propLines, m_props->heightFor(width));
+    for (Embed &e : m_embeds)
+        e.height = spreadHeight(e.head, e.lines, e.widget->sizeFor(width).height() + 8);
     for (Table &t : m_tables) {
         const QList<int> want = t.overlay->layoutFor(width);
         const QTextBlock delimiter = t.head.next();
@@ -1415,11 +1369,12 @@ void Editor::positionTables()
         t.overlay->setGeometry(margin, int(r.top()), width, t.height);
         t.overlay->show();
     }
-    for (const Image &im : std::as_const(m_images)) {
-        const QRectF r = blockBoundingGeometry(im.block).translated(offset);
-        const QSize size = im.widget->sizeFor(width);
-        im.widget->setGeometry(margin, int(r.top()) + (im.height - size.height()) / 2, size.width(), size.height());
-        im.widget->show();
+    for (const Embed &e : std::as_const(m_embeds)) {
+        const QRectF r = blockBoundingGeometry(e.head).translated(offset);
+        const QSize size = e.widget->sizeFor(width);
+        const int x = e.widget->centered ? margin + (width - size.width()) / 2 : margin;
+        e.widget->setGeometry(x, int(r.top()) + (e.height - size.height()) / 2, size.width(), size.height());
+        e.widget->show();
     }
     if (m_props && m_propLines) {
         const QRectF r = blockBoundingGeometry(document()->firstBlock()).translated(offset);
@@ -1459,8 +1414,8 @@ void Editor::onCursorMoved()
         }
     }
     bool rescan = false;
-    if (m_rawImage.isValid() && c.block() != m_rawImage) {
-        m_rawImage = QTextBlock();
+    if (m_rawEmbed.isValid() && (n < m_rawEmbed.blockNumber() || n >= m_rawEmbed.blockNumber() + m_rawEmbedLines)) {
+        m_rawEmbed = QTextBlock();
         rescan = true;
     }
     if (m_rawProps && n > frontmatterEnd()) {
@@ -1478,9 +1433,10 @@ void Editor::onCursorMoved()
         }
         return;
     }
-    for (const Image &im : std::as_const(m_images)) {
-        if (im.block == c.block()) {
-            m_rawImage = im.block;
+    for (const Embed &e : std::as_const(m_embeds)) {
+        if (n >= e.head.blockNumber() && n < e.head.blockNumber() + e.lines) {
+            m_rawEmbed = e.head;
+            m_rawEmbedLines = e.lines;
             scanTables();
             ensureCursorVisible();
             return;
@@ -1736,6 +1692,34 @@ bool Editor::event(QEvent *e)
     return QPlainTextEdit::event(e);
 }
 
+// Suggestions for a word the highlighter underlined, at the top of the menu.
+void Editor::addSpellingActions(QMenu *menu, const QTextCursor &at)
+{
+    const QTextBlock block = at.block();
+    const int pos = at.positionInBlock();
+    for (const QTextLayout::FormatRange &r : block.layout()->formats()) {
+        if (r.format.underlineStyle() != QTextCharFormat::SpellCheckUnderline || pos < r.start || pos > r.start + r.length)
+            continue;
+        const QString word = block.text().mid(r.start, r.length);
+        const int from = block.position() + r.start;
+        const QStringList options = Spelling::instance().suggestions(word);
+        for (const QString &s : options) {
+            menu->addAction(s, this, [this, from, word, s] {
+                QTextCursor c(document());
+                c.setPosition(from);
+                c.setPosition(from + int(word.size()), QTextCursor::KeepAnchor);
+                if (c.selectedText() == word)
+                    c.insertText(s);
+            });
+        }
+        if (options.isEmpty())
+            menu->addAction(tr("No suggestions"))->setEnabled(false);
+        menu->addAction(tr("Add “%1” to dictionary").arg(word), this, [word] { Spelling::instance().addWord(word); });
+        menu->addSeparator();
+        return;
+    }
+}
+
 void Editor::contextMenuEvent(QContextMenuEvent *e)
 {
     if (!m_command) {
@@ -1747,6 +1731,7 @@ void Editor::contextMenuEvent(QContextMenuEvent *e)
         if (QAction *a = m_command(id))
             to->addAction(a);
     };
+    addSpellingActions(&menu, cursorForPosition(e->pos()));
     const QString href = linkAt(cursorForPosition(e->pos()));
     if (!href.isEmpty()) {
         menu.addAction(tr("Open in new tab"), this, [this, href] { Q_EMIT linkActivated(href, true); });
@@ -2215,21 +2200,132 @@ void Editor::showPropertiesSource()
     ensureCursorVisible();
 }
 
-void Editor::scanImages(QSet<int> &covered)
+void Editor::scanEmbeds(QSet<int> &covered)
 {
-    static const QRegularExpression wiki(u"^\\s*!\\[\\[([^\\[\\]|#\\n]+)(?:#[^\\[\\]|\\n]*)?(?:\\|([^\\[\\]\\n]*))?\\]\\]\\s*$"_s);
+    static const QRegularExpression wiki(u"^\\s*!\\[\\[([^\\[\\]|#\\n]+)(#[^\\[\\]|\\n]*)?(?:\\|([^\\[\\]\\n]*))?\\]\\]\\s*$"_s);
     static const QRegularExpression md(u"^\\s*!\\[([^\\]\\n]*)\\]\\(<?([^)<>\\n]+?)>?(?:\\s+\"[^\"]*\")?\\)\\s*$"_s);
     static const QRegularExpression size(u"^\\s*(\\d+)(?:x(\\d+))?\\s*$"_s);
-    QList<Image> old = std::exchange(m_images, {});
+    QList<Embed> old = std::exchange(m_embeds, {});
+    auto take = [&old](const QString &key) -> EmbedBlock * {
+        for (qsizetype i = 0; i < old.size(); ++i)
+            if (old[i].widget->key == key)
+                return old.takeAt(i).widget;
+        return nullptr;
+    };
+    auto image = [&](const QString &key) {
+        auto *w = dynamic_cast<ImageEmbed *>(take(key));
+        if (!w) {
+            w = new ImageEmbed(viewport());
+            w->clicked = [this, w] { revealEmbed(w); };
+            w->key = key;
+        }
+        return w;
+    };
+    const int raw = m_rawEmbed.isValid() ? m_rawEmbed.blockNumber() : -1;
+    const bool dark = palette().color(QPalette::Base).lightness() < 128;
+    const qreal dpr = devicePixelRatioF();
+    auto add = [&](const QTextBlock &head, int lines, EmbedBlock *w) {
+        m_embeds.append({head, lines, 0, w});
+        for (int n = head.blockNumber(); n < head.blockNumber() + lines; ++n)
+            covered.insert(n);
+    };
     for (QTextBlock b = m_live && m_vault ? document()->begin() : QTextBlock(); b.isValid(); b = b.next()) {
-        const QString text = b.text();
-        if (!text.contains(u"!["_s) || covered.contains(b.blockNumber()) || fencedOrFrontmatter(b) || b == m_rawImage)
+        const int n = b.blockNumber();
+        if (covered.contains(n))
             continue;
-        QString path, spec;
-        if (const auto m = wiki.match(text); m.hasMatch()) {
+        const QString trimmed = b.text().trimmed();
+        const int state = b.userState();
+
+        // ```mermaid fences, drawn by mermaid-cli.
+        if (state > 0 && (state & BlockState::InFence) && (state & BlockState::FenceLine)
+            && trimmed.mid(3).trimmed().startsWith(u"mermaid"_s, Qt::CaseInsensitive)) {
+            QStringList source;
+            int lines = 1;
+            QTextBlock e = b.next();
+            for (; e.isValid(); e = e.next(), ++lines) {
+                const int st = e.userState();
+                if (st > 0 && (st & BlockState::FenceLine) && !(st & BlockState::InFence))
+                    break;
+                source << e.text();
+            }
+            if (!e.isValid())
+                continue;
+            ++lines;
+            if (n != raw) {
+                const QImage drawn = Diagrams::instance().image(source.join(u'\n'), dark, dpr);
+                if (!drawn.isNull()) {
+                    ImageEmbed *w = image(u"diagram:"_s + source.join(u'\n') + (dark ? u"1"_s : u"0"_s));
+                    w->centered = true;
+                    w->setImage(drawn);
+                    w->menu = [this, w](const QPoint &pos) {
+                        QMenu menu(this);
+                        menu.addAction(tr("Edit diagram"), this, [this, w] { revealEmbed(w); });
+                        menu.exec(pos);
+                    };
+                    add(b, lines, w);
+                }
+            } else {
+                m_rawEmbedLines = lines;
+            }
+            b = e;
+            continue;
+        }
+        if (fencedOrFrontmatter(b))
+            continue;
+
+        // $$display math$$ on lines of its own.
+        if (trimmed.startsWith(u"$$"_s)) {
+            QString tex;
+            int lines = 1;
+            QTextBlock last = b;
+            if (trimmed.size() > 4 && trimmed.endsWith(u"$$"_s)) {
+                tex = trimmed.mid(2, trimmed.size() - 4);
+            } else {
+                QStringList body{trimmed.mid(2)};
+                for (QTextBlock e = b.next(); e.isValid() && lines < 300; e = e.next()) {
+                    ++lines;
+                    const QString t = e.text().trimmed();
+                    if (t.endsWith(u"$$"_s)) {
+                        body << t.chopped(2);
+                        last = e;
+                        break;
+                    }
+                    body << e.text();
+                }
+                if (last == b)
+                    continue; // never closed
+                tex = body.join(u'\n');
+            }
+            if (n == raw) {
+                m_rawEmbedLines = lines;
+            } else if (!tex.trimmed().isEmpty()) {
+                const QColor color = palette().color(QPalette::Text);
+                const double px = QFontMetricsF(font()).height() / 1.2;
+                const MathRender::Result r = MathRender::render(tex, px, color, true, dpr);
+                ImageEmbed *w = image(u"math:"_s + tex + color.name() + QString::number(px));
+                w->centered = true;
+                w->setImage(r.image);
+                w->setToolTip(r.errors.isEmpty() ? QString() : tr("Not understood: %1").arg(r.errors.join(u", "_s)));
+                w->menu = [this, w, tex](const QPoint &pos) {
+                    QMenu menu(this);
+                    menu.addAction(tr("Copy LaTeX"), this, [tex] { QApplication::clipboard()->setText(tex.trimmed()); });
+                    menu.addAction(tr("Edit formula"), this, [this, w] { revealEmbed(w); });
+                    menu.exec(pos);
+                };
+                add(b, lines, w);
+            }
+            b = last;
+            continue;
+        }
+
+        if (!trimmed.contains(u"!["_s) || n == raw)
+            continue;
+        QString path, spec, heading;
+        if (const auto m = wiki.match(b.text()); m.hasMatch()) {
             path = m_vault->resolve(m.captured(1).trimmed(), m_notePath);
-            spec = m.captured(2);
-        } else if (const auto m = md.match(text); m.hasMatch()) {
+            heading = m.captured(2).mid(1);
+            spec = m.captured(3);
+        } else if (const auto m = md.match(b.text()); m.hasMatch()) {
             const QString src = m.captured(2).trimmed();
             const QUrl url(src);
             if (!url.scheme().isEmpty() && !url.isLocalFile())
@@ -2243,45 +2339,84 @@ void Editor::scanImages(QSet<int> &covered)
             }
             spec = m.captured(1).section(u'|', -1);
         }
-        if (path.isEmpty() || !Vault::isImage(path))
+        if (path.isEmpty())
             continue;
-        const QString abs = m_vault->absolutePath(path);
-        if (!QFileInfo(abs).isFile())
-            continue;
-        ImageBlock *w = nullptr;
-        for (int i = 0; i < old.size() && !w; ++i)
-            if (old[i].widget->path == path)
-                w = old.takeAt(i).widget;
-        if (!w && !old.isEmpty())
-            w = old.takeFirst().widget;
-        if (!w) {
-            w = new ImageBlock(viewport());
+
+        if (Vault::isImage(path)) {
+            const QString abs = m_vault->absolutePath(path);
+            if (!QFileInfo(abs).isFile())
+                continue;
+            const auto sm = size.match(spec);
+            ImageEmbed *w = image(u"image:"_s + path);
+            w->path = path;
+            w->setFile(abs, sm.hasMatch() ? QSize(sm.captured(1).toInt(), sm.captured(2).toInt()) : QSize());
             w->menu = [this, w](const QPoint &pos) { showImageMenu(w->path, pos); };
-            w->clicked = [this, w] {
-                for (const Image &im : std::as_const(m_images)) {
-                    if (im.widget == w) {
-                        QTextCursor c(im.block);
-                        c.movePosition(QTextCursor::EndOfBlock);
-                        setTextCursor(c);
-                        setFocus();
-                        return;
-                    }
-                }
-            };
-        }
-        const auto sm = size.match(spec);
-        w->path = path;
-        w->setImage(abs, sm.hasMatch() ? QSize(sm.captured(1).toInt(), sm.captured(2).toInt()) : QSize());
-        if (w->isNull()) {
-            old << Image{{}, 0, w};
+            if (w->isNull()) {
+                old.append({{}, 0, 0, w});
+                continue;
+            }
+            add(b, 1, w);
             continue;
         }
-        m_images.append({b, 0, w});
-        covered.insert(b.blockNumber());
+
+        // ![[Another note]] or ![[Note#Heading]]: the note itself, read-only.
+        const Note *target = m_vault->note(path);
+        if (!target || path == m_notePath)
+            continue;
+        const QString key = u"note:"_s + path + u'#' + heading + u':' + QString::number(qHash(target->text));
+        auto *w = dynamic_cast<NoteEmbed *>(take(key));
+        if (!w) {
+            w = new NoteEmbed(viewport());
+            w->key = key;
+            RenderOptions opt;
+            opt.vault = m_vault;
+            opt.notePath = path;
+            opt.contentWidth = qMax(200, viewport()->width() - 80);
+            opt.palette = palette();
+            opt.dark = dark;
+            opt.depth = 1;
+            const QString text = heading.isEmpty() ? target->text : noteSection(target->text, heading);
+            w->setContent(heading.isEmpty() ? Vault::baseName(path) : Vault::baseName(path) + u" › "_s + heading,
+                          renderMarkdown(text, opt).html, font(), markdownStyleSheet(palette(), font().pointSizeF()));
+            const QString href = wikiHref(m_vault->linkText(path) + (heading.isEmpty() ? QString() : u'#' + heading));
+            w->open = [this, href](bool newTab) { Q_EMIT linkActivated(href, newTab); };
+            w->clicked = [this, w] { revealEmbed(w); };
+            w->menu = [this, w, href](const QPoint &pos) {
+                QMenu menu(this);
+                PathActions::addOpenActions(&menu, this, [this, href](bool newTab) { Q_EMIT linkActivated(href, newTab); });
+                menu.addAction(tr("Edit embed"), this, [this, w] { revealEmbed(w); });
+                if (m_fileActions) {
+                    menu.addSeparator();
+                    m_fileActions(&menu, w->path, false);
+                }
+                menu.exec(pos);
+            };
+            connect(w->reader(), &QTextBrowser::anchorClicked, this, [this](const QUrl &url) {
+                const QString href = url.toString(QUrl::FullyEncoded);
+                if (!href.startsWith(u"task:"_s) && !href.startsWith(u"copy:"_s) && !href.startsWith(u"callout:"_s))
+                    Q_EMIT linkActivated(href, QApplication::keyboardModifiers() & Qt::ControlModifier);
+            });
+        }
+        w->path = path;
+        add(b, 1, w);
     }
-    for (const Image &im : std::as_const(old)) {
-        im.widget->hide();
-        im.widget->deleteLater();
+    for (const Embed &e : std::as_const(old)) {
+        e.widget->hide();
+        e.widget->deleteLater();
+    }
+}
+
+// A click on an embed shows its Markdown, with the cursor at the end of its first line.
+void Editor::revealEmbed(EmbedBlock *widget)
+{
+    for (const Embed &e : std::as_const(m_embeds)) {
+        if (e.widget != widget)
+            continue;
+        QTextCursor c(e.head);
+        c.movePosition(QTextCursor::EndOfBlock);
+        setTextCursor(c);
+        setFocus();
+        return;
     }
 }
 
@@ -2563,4 +2698,25 @@ void Editor::paintGuides(QPainter &p, const QTextBlock &block)
         const double x = parent.left() + (line.cursorToX(at) + line.cursorToX(at + 1)) / 2;
         p.fillRect(QRectF(qRound(x), r.top(), 1, r.height()), color);
     }
+}
+
+// Over a tall image or panel a visual line is already tens of pixels, so a notch scrolls one of them, not three.
+void Editor::wheelEvent(QWheelEvent *e)
+{
+    auto tall = [](const QTextBlock &b) {
+        const auto *d = b.isValid() ? static_cast<TableLineData *>(b.userData()) : nullptr;
+        return d && d->spread > 0;
+    };
+    const QTextBlock top = firstVisibleBlock();
+    const bool near = tall(top) || tall(top.next()) || (e->angleDelta().y() > 0 && tall(top.previous()));
+    if (!near || (e->modifiers() & Qt::ControlModifier) || e->angleDelta().y() == 0) {
+        m_wheel = 0;
+        QPlainTextEdit::wheelEvent(e);
+        return;
+    }
+    m_wheel += e->angleDelta().y();
+    const int steps = m_wheel / 120;
+    m_wheel -= steps * 120;
+    verticalScrollBar()->setValue(verticalScrollBar()->value() - steps);
+    e->accept();
 }

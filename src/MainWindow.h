@@ -14,6 +14,7 @@ class OutlinePanel;
 class PreviewPopup;
 class QLabel;
 class QMenu;
+class GraphView;
 class QSplitter;
 class QStackedWidget;
 class QTabWidget;
@@ -23,6 +24,7 @@ class QVBoxLayout;
 class SearchPanel;
 class TagsPanel;
 class Vault;
+struct Mention;
 
 class MainWindow : public QMainWindow
 {
@@ -48,13 +50,24 @@ private:
     QList<NoteView *> views() const;
     NoteView *createTab();
     void closeView(NoteView *v, bool saveFirst = true);
-    void updateTabButton(NoteView *v);
+    // Notes and the graph: whatever a tab holds.
+    QList<QWidget *> tabPages() const;
+    void closeTab(QWidget *page);
+    void updateTabButton(QWidget *page);
     QTabWidget *createPane();
     QList<QTabWidget *> panes() const;
-    QTabWidget *paneOf(NoteView *v) const;
+    QTabWidget *paneOf(QWidget *page) const;
     void setActivePane(QTabWidget *pane);
-    void splitRight();
+    void split(Qt::Orientation orientation);
+    QTabWidget *insertPane(QTabWidget *beside, Qt::Orientation orientation, bool after);
+    void dropEmptyPane(QTabWidget *pane);
+    void tidyPanes(QSplitter *splitter);
+    void startTabDrag(QTabWidget *pane);
+    void moveTab(QWidget *page, QTabWidget *target, int zone);
     void saveAll();
+    void exportNote(NoteView *v, const QString &format);
+    void openGraph();
+    QWidget *createGraphTab();
 
     void openPath(const QString &path, bool newTab, const QString &heading = {}, int line = -1);
     void openLink(const QString &target, const QString &from, bool newTab);
@@ -73,6 +86,7 @@ private:
     void addFileActions(QMenu *menu, const QString &path, bool deletable = false);
     void searchVault(const QString &text = {});
     void showTabMenu(QTabWidget *pane, const QPoint &pos);
+    void addCloseActions(QMenu *menu, QTabWidget *pane, QWidget *page);
     void duplicatePath(const QString &path);
     void chooseFolderAndMove(const QStringList &paths);
     void previewLink(const QString &href, const QPoint &globalPos);
@@ -82,6 +96,7 @@ private:
     void insertTemplate(Editor *editor);
     void openSettings();
     void openRecovery(const QString &path = {});
+    void linkMention(const Mention &mention, const QString &target);
     void applySettings();
     void applySettings(NoteView *v);
     void revealInTree(const QString &path);
@@ -112,12 +127,14 @@ private:
     QWidget *m_empty = nullptr;
     QSplitter *m_panes = nullptr;
     QTabWidget *m_tabs = nullptr; // the active pane
+    QPoint m_tabPress;
     FileTree *m_tree = nullptr;
     SearchPanel *m_search = nullptr;
     BacklinksPanel *m_backlinks = nullptr;
     OutgoingPanel *m_outgoing = nullptr;
     OutlinePanel *m_outline = nullptr;
     TagsPanel *m_tags = nullptr;
+    GraphView *m_localGraph = nullptr;
     BookmarksPanel *m_bookmarks = nullptr;
     PreviewPopup *m_preview = nullptr;
     QTimer m_previewTimer;

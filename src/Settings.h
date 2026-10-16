@@ -1,8 +1,10 @@
 #pragma once
 
 #include <QDateTime>
+#include <QFont>
 #include <QVariant>
 
+class QAction;
 class Vault;
 
 // Per-vault values fall back to the vault's own .obsidian/*.json (read, never written).
@@ -10,6 +12,13 @@ namespace Settings {
 
 QVariant app(const QString &key, const QVariant &fallback = {});
 void setApp(const QString &key, const QVariant &value);
+
+// Settings > Appearance, plus the zoom from View > Zoom in.
+QFont textFont(double zoom = 0);
+double defaultTextSize();
+QString monoFamily();
+// Hotkeys set in Settings, stored by the action's object name, override the ones it was created with.
+void applyShortcuts(const QList<QAction *> &actions);
 
 QString vaultGroup(const Vault &vault);
 QVariant vault(const Vault &vault, const QString &key, const QString &jsonFile = {}, const QString &jsonKey = {},

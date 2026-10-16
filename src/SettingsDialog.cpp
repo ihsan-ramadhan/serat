@@ -1,6 +1,8 @@
 #include "SettingsDialog.h"
 
+#include "CommandPalette.h"
 #include "Settings.h"
+#include "Spelling.h"
 #include "Theme.h"
 #include "Vault.h"
 
@@ -8,15 +10,22 @@
 #include <QComboBox>
 #include <QCompleter>
 #include <QDialogButtonBox>
+#include <QDir>
+#include <QFontDatabase>
 #include <QFormLayout>
+#include <QHeaderView>
+#include <QKeySequenceEdit>
 #include <QHBoxLayout>
 #include <QLabel>
 #include <QLineEdit>
 #include <QListWidget>
 #include <QMessageBox>
 #include <QPushButton>
+#include <QScrollArea>
+#include <QSettings>
 #include <QSpinBox>
 #include <QStackedWidget>
+#include <QTreeWidget>
 
 using namespace Qt::StringLiterals;
 
@@ -32,14 +41,16 @@ QLabel *note(const QString &text)
 
 } // namespace
 
-SettingsDialog::SettingsDialog(Vault *vault, QWidget *parent)
+SettingsDialog::SettingsDialog(Vault *vault, QMenuBar *menus, QWidget *parent)
     : QDialog(parent)
     , m_vault(vault)
+    , m_menus(menus)
     , m_sections(new QListWidget(this))
     , m_pages(new QStackedWidget(this))
 {
     setWindowTitle(tr("Settings"));
     resize(760, 520);
+    setMinimumSize(520, 360);
     m_sections->setObjectName(u"settingsSections"_s);
     m_sections->setFixedWidth(180);
     auto *buttons = new QDialogButtonBox(QDialogButtonBox::Close, this);
@@ -58,6 +69,7 @@ SettingsDialog::SettingsDialog(Vault *vault, QWidget *parent)
     buildAppearance();
     buildDaily();
     buildTemplates();
+    buildHotkeys();
     m_sections->setCurrentRow(0);
 }
 
@@ -69,7 +81,13 @@ QFormLayout *SettingsDialog::addPage(const QString &name)
     form->setContentsMargins(16, 4, 8, 8);
     form->setVerticalSpacing(10);
     form->setRowWrapPolicy(QFormLayout::WrapLongRows);
-    m_pages->addWidget(page);
+    // Scrolls instead of squeezing rows over each other when the dialog is shorter than the page.
+    auto *scroll = new QScrollArea;
+    scroll->setWidget(page);
+    scroll->setWidgetResizable(true);
+    scroll->setFrameShape(QFrame::NoFrame);
+    scroll->setHorizontalScrollBarPolicy(Qt::ScrollBarAlwaysOff);
+    m_pages->addWidget(scroll);
     return form;
 }
 
@@ -94,6 +112,53 @@ void SettingsDialog::buildEditor()
         tr("With text selected, typing * _ ~ = or ` wraps it. A backtick on its own gets a closing one."));
     box(tr("Fold headings and lists"), u"foldGutter"_s, true, tr("Show the fold arrows beside headings, lists and callouts."));
     box(tr("Indentation guides"), u"indentGuides"_s, true, tr("Draw lines that connect nested list items."));
+
+    if (!Spelling::supported()) {
+        form->addRow(note(tr("This build of Serat has no spellchecker.")));
+        return;
+    }
+    box(tr("Spellcheck"), u"spellcheck"_s, true, tr("Underline words the dictionaries do not know. Right-click one for suggestions."));
+    auto *languages = new QListWidget;
+    languages->setObjectName(u"spellLanguages"_s);
+    const QStringList chosen = Spelling::instance().languages();
+    QStringList names = Spelling::instance().available();
+    std::stable_sort(names.begin(), names.end(), [&chosen](const QString &a, const QString &b) {
+        return chosen.contains(a) && !chosen.contains(b);
+    });
+    for (const QString &name : names) {
+        auto *item = new QListWidgetItem(u"%1  ·  %2"_s.arg(Spelling::displayName(name), name), languages);
+        item->setData(Qt::UserRole, name);
+        item->setCheckState(chosen.contains(name) ? Qt::Checked : Qt::Unchecked);
+    }
+    constexpr int visibleRows = 6;
+    languages->ensurePolished();
+    languages->setFixedHeight(languages->sizeHintForRow(0) * qBound(1, int(languages->count()), visibleRows) + 2 * languages->frameWidth());
+    auto *languageField = new QWidget;
+    auto *languageLayout = new QVBoxLayout(languageField);
+    languageLayout->setContentsMargins({});
+    if (languages->count() > visibleRows) {
+        auto *filter = new QLineEdit;
+        filter->setObjectName(u"spellLanguageFilter"_s);
+        filter->setPlaceholderText(tr("Filter languages"));
+        filter->setClearButtonEnabled(true);
+        connect(filter, &QLineEdit::textChanged, languages, [languages](const QString &text) {
+            for (int i = 0; i < languages->count(); ++i)
+                languages->item(i)->setHidden(!languages->item(i)->text().contains(text.trimmed(), Qt::CaseInsensitive));
+        });
+        languageLayout->addWidget(filter);
+    }
+    languageLayout->addWidget(languages);
+    connect(languages, &QListWidget::itemChanged, this, [this, languages] {
+        QStringList names;
+        for (int i = 0; i < languages->count(); ++i)
+            if (languages->item(i)->checkState() == Qt::Checked)
+                names << languages->item(i)->data(Qt::UserRole).toString();
+        Settings::setApp(u"spellLanguages"_s, names);
+        Q_EMIT changed();
+    });
+    form->addRow(tr("Languages"), languageField);
+    form->addRow(note(tr("More languages: put Hunspell .aff and .dic files in %1.")
+                          .arg(QDir::toNativeSeparators(Spelling::userDictionaryDir()))));
 }
 
 void SettingsDialog::buildFiles()
@@ -108,7 +173,7 @@ void SettingsDialog::buildFiles()
         if (const QString dir = f.section(u'/', 0, -2); !dir.isEmpty() && !folders.contains(dir))
             folders << dir;
     folders.sort(Qt::CaseInsensitive);
-    auto folderEdit = [this, folders](const QString &text) {
+    auto folderEdit = [folders](const QString &text) {
         auto *edit = new QLineEdit(text);
         auto *completer = new QCompleter(folders, edit);
         completer->setCaseSensitivity(Qt::CaseInsensitive);
@@ -198,7 +263,156 @@ void SettingsDialog::buildAppearance()
         Q_EMIT changed();
     });
     form->addRow(tr("Theme"), theme);
-    form->addRow(note(tr("Text size: View > Zoom in and Zoom out (Ctrl+= and Ctrl+-).")));
+
+    auto *language = new QComboBox;
+    language->addItem(tr("System default"), u"system"_s);
+    language->addItem(u"English"_s, u"en"_s);
+    language->addItem(u"Bahasa Indonesia"_s, u"id"_s);
+    language->setCurrentIndex(qMax(0, language->findData(Settings::app(u"language"_s, u"system"_s))));
+    connect(language, &QComboBox::currentIndexChanged, this, [language] { Settings::setApp(u"language"_s, language->currentData()); });
+    form->addRow(tr("Language"), language);
+    form->addRow(note(tr("A new language shows after Serat restarts.")));
+
+    auto fontChoice = [this](const QString &key, bool fixedPitch) {
+        auto *combo = new QComboBox;
+        combo->addItem(tr("Default"), QString());
+        for (const QString &family : QFontDatabase::families())
+            if (!QFontDatabase::isPrivateFamily(family) && (!fixedPitch || QFontDatabase::isFixedPitch(family)))
+                combo->addItem(family, family);
+        combo->setCurrentIndex(qMax(0, combo->findData(Settings::app(key).toString())));
+        connect(combo, &QComboBox::currentIndexChanged, this, [this, combo, key] {
+            Settings::setApp(key, combo->currentData());
+            Q_EMIT changed();
+        });
+        return combo;
+    };
+    form->addRow(tr("Text font"), fontChoice(u"textFont"_s, false));
+    form->addRow(tr("Monospace font"), fontChoice(u"monoFont"_s, true));
+    auto *size = new QSpinBox;
+    size->setRange(8, 36);
+    size->setSuffix(tr(" pt"));
+    size->setValue(qRound(Settings::app(u"textSize"_s, Settings::defaultTextSize()).toDouble()));
+    connect(size, &QSpinBox::valueChanged, this, [this](int pt) {
+        Settings::setApp(u"textSize"_s, pt);
+        Q_EMIT changed();
+    });
+    form->addRow(tr("Font size"), size);
+    form->addRow(note(tr("View > Zoom in and Zoom out (Ctrl+= and Ctrl+-) change the size on top of this.")));
+}
+
+void SettingsDialog::buildHotkeys()
+{
+    QFormLayout *form = addPage(tr("Hotkeys"));
+    if (!m_menus)
+        return;
+    auto *filter = new QLineEdit;
+    filter->setPlaceholderText(tr("Filter commands…"));
+    filter->setClearButtonEnabled(true);
+    auto *list = new QTreeWidget;
+    list->setObjectName(u"hotkeys"_s);
+    list->setHeaderLabels({tr("Command"), tr("Hotkey")});
+    list->setRootIsDecorated(false);
+    list->setUniformRowHeights(true);
+    list->setMinimumHeight(260);
+    list->header()->setSectionResizeMode(0, QHeaderView::Stretch);
+    list->header()->setSectionResizeMode(1, QHeaderView::ResizeToContents);
+    list->header()->setStretchLastSection(false);
+    auto *keys = new QKeySequenceEdit;
+    keys->setObjectName(u"hotkeyEdit"_s);
+    keys->setMaximumSequenceLength(1);
+    keys->setClearButtonEnabled(true);
+    auto *reset = new QPushButton(tr("Restore default"));
+    auto *row = new QHBoxLayout;
+    row->addWidget(keys, 1);
+    row->addWidget(reset);
+    form->addRow(filter);
+    form->addRow(list);
+    form->addRow(tr("Hotkey"), row);
+    form->addRow(note(tr("Select a command, then press the keys for it. The clear button removes its hotkey.")));
+
+    QList<QAction *> actions;
+    for (const auto &[name, action] : CommandPalette::commands(m_menus)) {
+        if (action->objectName().isEmpty())
+            continue;
+        auto *item = new QTreeWidgetItem(list, {name});
+        item->setData(0, Qt::UserRole, int(actions.size()));
+        actions << action;
+    }
+    auto actionOf = [actions](QTreeWidgetItem *item) {
+        return item ? actions.value(item->data(0, Qt::UserRole).toInt()) : nullptr;
+    };
+    auto refresh = [list, actions] {
+        for (int i = 0; i < list->topLevelItemCount(); ++i) {
+            QTreeWidgetItem *item = list->topLevelItem(i);
+            item->setText(1, QKeySequence::listToString(actions[item->data(0, Qt::UserRole).toInt()]->shortcuts(),
+                                                        QKeySequence::NativeText));
+        }
+    };
+    auto store = [](QAction *a, const QList<QKeySequence> &shortcuts) {
+        QSettings s;
+        const QString text = QKeySequence::listToString(shortcuts, QKeySequence::PortableText);
+        if (text == a->property("defaultKeys").toString())
+            s.remove(u"shortcuts/"_s + a->objectName());
+        else
+            s.setValue(u"shortcuts/"_s + a->objectName(), text);
+        a->setShortcuts(shortcuts);
+    };
+    auto showCurrent = [list, keys, reset, actionOf] {
+        QAction *a = actionOf(list->currentItem());
+        const QSignalBlocker block(keys);
+        keys->setKeySequence(a ? a->shortcut() : QKeySequence());
+        keys->setEnabled(a);
+        reset->setEnabled(a && QKeySequence::listToString(a->shortcuts(), QKeySequence::PortableText)
+                                   != a->property("defaultKeys").toString());
+    };
+    auto assign = [this, list, keys, actions, actionOf, store, refresh, showCurrent] {
+        QAction *a = actionOf(list->currentItem());
+        if (!a)
+            return;
+        const QKeySequence key = keys->keySequence();
+        if (!key.isEmpty() && a->shortcuts().contains(key))
+            return;
+        if (!key.isEmpty()) {
+            for (QAction *other : actions) {
+                if (other == a || !other->shortcuts().contains(key))
+                    continue;
+                const QString name = other->text().remove(u'&').remove(u'…');
+                if (QMessageBox::question(this, tr("Hotkey in use"),
+                                          tr("%1 is used by “%2”. Use it here instead?").arg(key.toString(QKeySequence::NativeText), name))
+                    != QMessageBox::Yes) {
+                    showCurrent();
+                    return;
+                }
+                QList<QKeySequence> rest = other->shortcuts();
+                rest.removeAll(key);
+                store(other, rest);
+            }
+        }
+        store(a, key.isEmpty() ? QList<QKeySequence>() : QList<QKeySequence>{key});
+        refresh();
+        showCurrent();
+    };
+    connect(keys, &QKeySequenceEdit::editingFinished, this, assign);
+    connect(keys, &QKeySequenceEdit::keySequenceChanged, this, [keys, assign](const QKeySequence &key) {
+        if (key.isEmpty() && keys->isEnabled())
+            assign();
+    });
+    connect(reset, &QPushButton::clicked, this, [list, actionOf, store, refresh, showCurrent] {
+        if (QAction *a = actionOf(list->currentItem())) {
+            store(a, QKeySequence::listFromString(a->property("defaultKeys").toString(), QKeySequence::PortableText));
+            refresh();
+            showCurrent();
+        }
+    });
+    connect(list, &QTreeWidget::currentItemChanged, this, showCurrent);
+    connect(filter, &QLineEdit::textChanged, this, [list](const QString &text) {
+        for (int i = 0; i < list->topLevelItemCount(); ++i) {
+            QTreeWidgetItem *item = list->topLevelItem(i);
+            item->setHidden(!item->text(0).contains(text, Qt::CaseInsensitive) && !item->text(1).contains(text, Qt::CaseInsensitive));
+        }
+    });
+    refresh();
+    showCurrent();
 }
 
 void SettingsDialog::buildDaily()

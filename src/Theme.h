@@ -3,6 +3,7 @@
 #include <QColor>
 #include <QIcon>
 #include <QImage>
+#include <QPalette>
 
 class QApplication;
 
@@ -28,6 +29,8 @@ void install(QApplication &app);
 QString preference();
 void setPreference(const QString &mode);
 const Colors &colors();
+// The light colours whatever the theme, for exported and printed notes.
+QPalette lightPalette();
 
 // :/icons/<name>.svg tinted to the theme; openName is drawn for the On state.
 QIcon icon(const QString &name, const QString &openName = {});

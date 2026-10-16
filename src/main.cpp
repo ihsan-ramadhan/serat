@@ -12,6 +12,7 @@
 #include <QLocalSocket>
 #include <QSettings>
 #include <QStandardPaths>
+#include <QTranslator>
 
 using namespace Qt::StringLiterals;
 
@@ -80,6 +81,15 @@ int main(int argc, char *argv[])
         running.waitForBytesWritten(1000);
         return 0;
     }
+
+    // The interface language: "system" follows the desktop, otherwise "en" or "id".
+    const QString language = QSettings().value(u"language"_s, u"system"_s).toString();
+    const QLocale locale = language == u"system" ? QLocale::system() : QLocale(language);
+    QTranslator serat, qt;
+    if (serat.load(locale, u"serat"_s, u"_"_s, u":/i18n"_s))
+        app.installTranslator(&serat);
+    if (qt.load(locale, u"qt"_s, u"_"_s, u":/i18n"_s))
+        app.installTranslator(&qt);
 
     Theme::install(app);
     registerUrlScheme();

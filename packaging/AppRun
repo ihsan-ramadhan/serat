@@ -1,0 +1,4 @@
+#!/bin/sh
+# Starts Serat by its real path: Qt finds qt.conf, plugins and dictionaries next to the binary, not next to AppRun.
+here="$(dirname "$(readlink -f "$0")")"
+exec "$here/usr/bin/serat" "$@"

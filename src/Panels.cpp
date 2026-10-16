@@ -787,12 +787,27 @@ BacklinksPanel::BacklinksPanel(QWidget *parent)
     : QTreeWidget(parent)
 {
     setupList(this);
+    setColumnCount(2);
+    header()->setStretchLastSection(false);
+    header()->setSectionResizeMode(0, QHeaderView::Stretch);
+    header()->setSectionResizeMode(1, QHeaderView::ResizeToContents);
     connect(this, &QTreeWidget::itemClicked, this, [this](QTreeWidgetItem *item) {
-        Q_EMIT openRequested(item->data(0, PathRole).toString(), item->data(0, LineRole).toInt(), ctrlHeld());
+        if (!item->data(0, PathRole).toString().isEmpty())
+            Q_EMIT openRequested(item->data(0, PathRole).toString(), item->data(0, LineRole).toInt(), ctrlHeld());
+    });
+    connect(this, &QTreeWidget::itemExpanded, this, [this](QTreeWidgetItem *item) {
+        if (item == m_mentions && !m_showMentions) {
+            m_showMentions = true;
+            fillMentions();
+        }
+    });
+    connect(this, &QTreeWidget::itemCollapsed, this, [this](QTreeWidgetItem *item) {
+        if (item == m_mentions)
+            m_showMentions = false;
     });
     connect(this, &QWidget::customContextMenuRequested, this, [this](const QPoint &pos) {
         const QTreeWidgetItem *item = itemAt(pos);
-        if (!item || !(item->flags() & Qt::ItemIsEnabled))
+        if (!item || !(item->flags() & Qt::ItemIsEnabled) || item->data(0, PathRole).toString().isEmpty())
             return;
         const QString path = item->data(0, PathRole).toString();
         const int line = item->data(0, LineRole).toInt();
@@ -804,6 +819,8 @@ void BacklinksPanel::showFor(const Vault *vault, const QString &path)
 {
     clear();
     m_vault = vault;
+    m_path = path;
+    m_mentions = nullptr;
     m_sources = 0;
     if (!vault || path.isEmpty()) {
         placeholder(this, tr("Open a note to see what links to it."));
@@ -814,28 +831,86 @@ void BacklinksPanel::showFor(const Vault *vault, const QString &path)
     for (const auto &link : links)
         sources.insert(link.first);
     m_sources = int(sources.size());
-    if (links.isEmpty()) {
-        placeholder(this, tr("No backlinks found."));
-        return;
-    }
+
+    auto section = [this](const QString &title) {
+        auto *item = new QTreeWidgetItem(this, {title});
+        QFont f = item->font(0);
+        f.setBold(true);
+        item->setFont(0, f);
+        item->setForeground(0, palette().color(QPalette::PlaceholderText));
+        item->setFirstColumnSpanned(true);
+        return item;
+    };
+    QTreeWidgetItem *linked = section(tr("Linked mentions"));
     QTreeWidgetItem *file = nullptr;
     QStringList lines;
     for (const auto &[source, link] : links) {
         if (!file || file->data(0, PathRole).toString() != source) {
-            file = new QTreeWidgetItem(this, {Vault::baseName(source)});
+            file = new QTreeWidgetItem(linked, {Vault::baseName(source)});
             file->setData(0, PathRole, source);
             file->setData(0, LineRole, -1);
             file->setToolTip(0, source);
-            QFont f = file->font(0);
-            f.setBold(true);
-            file->setFont(0, f);
+            file->setFirstColumnSpanned(true);
             lines = vault->note(source)->text.split(u'\n');
         }
         auto *ctx = new QTreeWidgetItem(file, {lines.value(link.line).trimmed().left(240)});
         ctx->setData(0, PathRole, source);
         ctx->setData(0, LineRole, link.line);
+        ctx->setFirstColumnSpanned(true);
     }
-    expandAll();
+    if (links.isEmpty())
+        (new QTreeWidgetItem(linked, {tr("No backlinks found.")}))->setFlags(Qt::NoItemFlags);
+    linked->setExpanded(true);
+    expandItem(linked);
+    for (int i = 0; i < linked->childCount(); ++i)
+        linked->child(i)->setExpanded(true);
+
+    m_mentions = section(tr("Unlinked mentions"));
+    m_mentions->setChildIndicatorPolicy(QTreeWidgetItem::ShowIndicator);
+    m_mentions->setToolTip(0, tr("Notes that name this one without linking to it"));
+    if (m_showMentions) {
+        m_mentions->setExpanded(true);
+        fillMentions();
+    }
+}
+
+void BacklinksPanel::fillMentions()
+{
+    if (!m_mentions || !m_vault)
+        return;
+    qDeleteAll(m_mentions->takeChildren());
+    m_found = m_vault->unlinkedMentions(m_path);
+    if (m_found.isEmpty()) {
+        (new QTreeWidgetItem(m_mentions, {tr("None found.")}))->setFlags(Qt::NoItemFlags);
+        m_mentions->setText(0, tr("Unlinked mentions"));
+        return;
+    }
+    QTreeWidgetItem *file = nullptr;
+    for (qsizetype i = 0; i < m_found.size(); ++i) {
+        const Mention &m = m_found[i];
+        if (!file || file->data(0, PathRole).toString() != m.path) {
+            file = new QTreeWidgetItem(m_mentions, {Vault::baseName(m.path)});
+            file->setData(0, PathRole, m.path);
+            file->setData(0, LineRole, -1);
+            file->setToolTip(0, m.path);
+            file->setFirstColumnSpanned(true);
+            file->setExpanded(true);
+        }
+        auto *item = new QTreeWidgetItem(file, {m.text.trimmed().left(240)});
+        item->setData(0, PathRole, m.path);
+        item->setData(0, LineRole, m.line);
+        auto *link = new QToolButton;
+        link->setText(tr("Link"));
+        link->setObjectName(u"mentionLink"_s);
+        link->setToolTip(tr("Turn “%1” into a link").arg(m.text.mid(m.start, m.length)));
+        connect(link, &QToolButton::clicked, this, [this, i] {
+            // Re-linking rewrites the note, which refreshes this panel; leave the click handler first.
+            const Mention mention = m_found.value(i);
+            QTimer::singleShot(0, this, [this, mention] { Q_EMIT linkMentionRequested(mention, m_path); });
+        });
+        setItemWidget(item, 1, link);
+    }
+    m_mentions->setText(0, tr("Unlinked mentions (%1)").arg(m_found.size()));
 }
 
 OutgoingPanel::OutgoingPanel(QWidget *parent)

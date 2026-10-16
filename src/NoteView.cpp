@@ -1,5 +1,6 @@
 #include "NoteView.h"
 
+#include "Diagrams.h"
 #include "Editor.h"
 #include "Markdown.h"
 #include "Reader.h"
@@ -176,6 +177,7 @@ NoteView::NoteView(Vault *vault, QWidget *parent)
             m_saveTimer.start();
     });
     connect(m_editor, &Editor::linkActivated, this, &NoteView::handleHref);
+    connect(&Diagrams::instance(), &Diagrams::ready, this, &NoteView::refreshRender);
     connect(m_editor, &Editor::hoverLink, this, &NoteView::hoverLink);
     connect(m_reader, &Reader::hoverLink, this, &NoteView::hoverLink);
     connect(m_editor, &Editor::foldsChanged, this, &NoteView::storeFolds);

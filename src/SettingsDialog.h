@@ -4,6 +4,7 @@
 
 class QFormLayout;
 class QListWidget;
+class QMenuBar;
 class QStackedWidget;
 class Vault;
 
@@ -12,7 +13,7 @@ class SettingsDialog : public QDialog
 {
     Q_OBJECT
 public:
-    SettingsDialog(Vault *vault, QWidget *parent = nullptr);
+    SettingsDialog(Vault *vault, QMenuBar *menus, QWidget *parent = nullptr);
 
 Q_SIGNALS:
     void changed();
@@ -24,8 +25,10 @@ private:
     void buildAppearance();
     void buildDaily();
     void buildTemplates();
+    void buildHotkeys();
 
     Vault *m_vault;
+    QMenuBar *m_menus;
     QListWidget *m_sections;
     QStackedWidget *m_pages;
 };

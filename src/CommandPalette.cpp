@@ -57,6 +57,15 @@ public:
 
 } // namespace
 
+QList<std::pair<QString, QAction *>> CommandPalette::commands(QMenuBar *menus)
+{
+    QList<std::pair<QString, QAction *>> out;
+    for (QAction *a : menus->actions())
+        if (QMenu *menu = a->menu())
+            collect(menu, QString(), out);
+    return out;
+}
+
 CommandPalette::CommandPalette(QMenuBar *menus, const QStringList &recent, QWidget *parent)
     : QDialog(parent)
     , m_recent(recent)
@@ -65,9 +74,7 @@ CommandPalette::CommandPalette(QMenuBar *menus, const QStringList &recent, QWidg
 {
     setWindowTitle(tr("Command palette"));
     resize(620, 440);
-    for (QAction *a : menus->actions())
-        if (QMenu *menu = a->menu())
-            collect(menu, QString(), m_commands);
+    m_commands = commands(menus);
     m_edit->setPlaceholderText(tr("Type a command…"));
     m_edit->installEventFilter(this);
     m_list->setObjectName(u"switcher"_s);

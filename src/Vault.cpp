@@ -138,10 +138,16 @@ void Vault::rescan()
         if (old != m_notes.constEnd())
             changedOnDisk << f;
     }
+    const bool sameFiles = files == m_files;
     m_files = files;
     m_dirs = dirs;
     m_notes = notes;
     rebuildNameIndex();
+    if (!sameFiles)
+        m_linksIndexed = false;
+    else
+        for (const QString &p : std::as_const(changedOnDisk))
+            reindexLinks(p);
 
     QStringList wanted{m_root};
     for (const QString &d : std::as_const(m_dirs))
@@ -414,16 +420,106 @@ QString Vault::linkTextIn(const QString &path, bool keepFullPath) const
     return stripMd(path);
 }
 
+void Vault::buildLinkIndex() const
+{
+    m_incoming.clear();
+    m_outgoing.clear();
+    for (auto it = m_notes.cbegin(); it != m_notes.cend(); ++it)
+        for (const Link &l : it->links)
+            if (const QString target = resolve(l.target, it.key()); !target.isEmpty() && target != it.key()) {
+                m_incoming[target].append({it.key(), l});
+                m_outgoing[it.key()].insert(target);
+            }
+    m_linksIndexed = true;
+}
+
+// Replaces `source`'s entries after its text changed while the set of files stayed the same.
+void Vault::reindexLinks(const QString &source)
+{
+    if (!m_linksIndexed)
+        return;
+    for (const QString &target : m_outgoing.take(source))
+        m_incoming[target].removeIf([&](const QPair<QString, Link> &e) { return e.first == source; });
+    if (const Note *n = note(source))
+        for (const Link &l : n->links)
+            if (const QString target = resolve(l.target, source); !target.isEmpty() && target != source) {
+                m_incoming[target].append({source, l});
+                m_outgoing[source].insert(target);
+            }
+}
+
+QSet<QString> Vault::linkTargets(const QString &path) const
+{
+    if (!m_linksIndexed)
+        buildLinkIndex();
+    return m_outgoing.value(path);
+}
+
 QList<QPair<QString, Link>> Vault::backlinks(const QString &path) const
 {
-    QList<QPair<QString, Link>> out;
+    if (!m_linksIndexed)
+        buildLinkIndex();
+    QList<QPair<QString, Link>> out = m_incoming.value(path);
+    std::sort(out.begin(), out.end(), [](const auto &a, const auto &b) {
+        return a.first != b.first ? lessPath(a.first, b.first) : a.second.start < b.second.start;
+    });
+    return out;
+}
+
+QList<Mention> Vault::unlinkedMentions(const QString &path) const
+{
+    const Note *self = note(path);
+    QStringList names{baseName(path)};
+    if (self)
+        for (const QString &a : self->aliases)
+            if (a.trimmed().size() > 1)
+                names << a.trimmed();
+    QList<QRegularExpression> patterns;
+    for (const QString &n : std::as_const(names))
+        patterns << QRegularExpression(u"(?<![\\w])"_s + QRegularExpression::escape(n) + u"(?![\\w])"_s,
+                                       QRegularExpression::CaseInsensitiveOption | QRegularExpression::UseUnicodePropertiesOption);
+    // Text already linked, code and URLs do not count as mentions.
+    static const QRegularExpression skip(u"!?\\[\\[[^\\]]*\\]\\]|\\[[^\\]]*\\]\\([^)]*\\)|(`+).*?\\1|https?://\\S+"_s);
+    QList<Mention> out;
     for (const QString &f : m_files) {
         const Note *n = note(f);
         if (!n || f == path)
             continue;
-        for (const Link &l : n->links)
-            if (resolve(l.target, f) == path)
-                out.append({f, l});
+        if (std::none_of(names.cbegin(), names.cend(), [&](const QString &name) { return n->text.contains(name, Qt::CaseInsensitive); }))
+            continue;
+        const QStringList lines = n->text.split(u'\n');
+        bool fence = false, front = lines.value(0) == u"---";
+        for (int i = front ? 1 : 0; i < lines.size(); ++i) {
+            const QString &l = lines[i];
+            if (front) {
+                front = l != u"---" && l != u"...";
+                continue;
+            }
+            if (l.trimmed().startsWith(u"```"_s) || l.trimmed().startsWith(u"~~~"_s)) {
+                fence = !fence;
+                continue;
+            }
+            if (fence)
+                continue;
+            QList<QPair<int, int>> skipped;
+            for (auto it = skip.globalMatch(l); it.hasNext();) {
+                const auto m = it.next();
+                skipped.append({int(m.capturedStart()), int(m.capturedEnd())});
+            }
+            QList<Mention> found;
+            for (const QRegularExpression &re : std::as_const(patterns)) {
+                for (auto it = re.globalMatch(l); it.hasNext();) {
+                    const auto m = it.next();
+                    const int s = int(m.capturedStart()), e = int(m.capturedEnd());
+                    const auto overlaps = [&](int a, int b) { return s < b && e > a; };
+                    if (std::none_of(skipped.cbegin(), skipped.cend(), [&](const auto &r) { return overlaps(r.first, r.second); })
+                        && std::none_of(found.cbegin(), found.cend(), [&](const Mention &x) { return overlaps(x.start, x.start + x.length); }))
+                        found.append({f, i, s, e - s, l});
+                }
+            }
+            std::sort(found.begin(), found.end(), [](const Mention &a, const Mention &b) { return a.start < b.start; });
+            out += found;
+        }
     }
     return out;
 }
@@ -499,6 +595,9 @@ bool Vault::writeNote(const QString &path, const QString &text)
         m_files.append(path);
         std::sort(m_files.begin(), m_files.end(), lessPath);
         rebuildNameIndex();
+        m_linksIndexed = false;
+    } else {
+        reindexLinks(path);
     }
     Q_EMIT changed();
     return true;

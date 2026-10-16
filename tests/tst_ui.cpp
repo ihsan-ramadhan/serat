@@ -1,6 +1,9 @@
 // Drives the real main window offscreen, the way a person would: keys, clicks, menus and dialogs.
 #include "CommandPalette.h"
+#include "EmbedBlocks.h"
 #include "Editor.h"
+#include "Export.h"
+#include "Graph.h"
 #include "MainWindow.h"
 #include "NoteView.h"
 #include "Panels.h"
@@ -9,6 +12,7 @@
 #include "RecoveryDialog.h"
 #include "Settings.h"
 #include "SettingsDialog.h"
+#include "Spelling.h"
 #include "TableEditor.h"
 #include "Theme.h"
 #include "Vault.h"
@@ -23,6 +27,7 @@
 #include <QFile>
 #include <QImage>
 #include <QInputDialog>
+#include <QKeySequenceEdit>
 #include <QLabel>
 #include <QLineEdit>
 #include <QListWidget>
@@ -32,6 +37,8 @@
 #include <QPlainTextEdit>
 #include <QPushButton>
 #include <QSettings>
+#include <QSpinBox>
+#include <QSplitter>
 #include <QStandardPaths>
 #include <QStatusBar>
 #include <QTabBar>
@@ -39,9 +46,11 @@
 #include <QTemporaryDir>
 #include <QTest>
 #include <QTextBlock>
+#include <QTextLayout>
 #include <QTimer>
 #include <QToolButton>
 #include <QTreeWidget>
+#include <QWheelEvent>
 
 using namespace Qt::StringLiterals;
 
@@ -489,6 +498,70 @@ private Q_SLOTS:
         QCOMPARE(imageBlocks().size(), 2);
     }
 
+    void scrollingPastTallImages()
+    {
+        makeVault(u"scroll"_s, {{u"a.md"_s, u"top\n![[tall.png]]\nbottom\nmore\nmore\nmore\nmore\nmore\nmore\nmore\nmore\nmore\n"_s}});
+        QImage img(300, 900, QImage::Format_RGB32);
+        img.fill(Qt::darkGreen);
+        QVERIFY(img.save(m_vault + u"/tall.png"_s));
+        QTest::qWait(600);
+        open(u"a.md"_s);
+        QTRY_COMPARE(imageBlocks().size(), 1);
+        QWidget *image = imageBlocks().first();
+        // One wheel notch should move the page a few lines' worth, not jump a whole image.
+        int worst = 0;
+        int lastY = image->y();
+        for (int step = 0; step < 6; ++step) {
+            QWheelEvent wheel(QPointF(50, 50), editor()->viewport()->mapToGlobal(QPointF(50, 50)), {}, QPoint(0, -120),
+                              Qt::NoButton, {}, Qt::NoScrollPhase, false);
+            QApplication::sendEvent(editor()->viewport(), &wheel);
+            QTest::qWait(30);
+            worst = qMax(worst, qAbs(image->y() - lastY));
+            lastY = image->y();
+        }
+        qInfo("largest jump for one wheel notch over a 900 px image: %d px", worst);
+        QVERIFY2(worst <= 120, qPrintable(QString::number(worst)));
+    }
+
+    void notesMathAndDiagramsInEditor()
+    {
+#ifdef Q_OS_WIN
+        QSKIP("the stand-in diagram tool is a shell script");
+#endif
+        // A stand-in for mermaid-cli that writes a fixed SVG where -o says.
+        const QString tool = m_dir.path() + u"/fake-mmdc"_s;
+        QFile script(tool);
+        QVERIFY(script.open(QIODevice::WriteOnly));
+        script.write("#!/bin/sh\nwhile [ $# -gt 0 ]; do [ \"$1\" = -o ] && out=$2; shift; done\n"
+                     "echo '<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"120\" height=\"60\"><rect width=\"120\" height=\"60\"/></svg>' > \"$out\"\n");
+        script.close();
+        script.setPermissions(QFile::ReadOwner | QFile::WriteOwner | QFile::ExeOwner);
+        QSettings().setValue(u"mermaidCommand"_s, tool);
+
+        makeVault(u"embeds"_s, {{u"a.md"_s, u"Intro\n![[b]]\n\n$$\n\\frac{1}{2}\n$$\n\n```mermaid\ngraph TD; A-->B\n```\nend\n"_s},
+                                {u"b.md"_s, u"# B\nBody of b\n"_s}});
+        open(u"a.md"_s);
+        QTRY_COMPARE_WITH_TIMEOUT(imageBlocks().size(), 3, 5000);
+        auto *note = static_cast<NoteEmbed *>(m_window->findChild<QWidget *>(u"noteEmbed"_s));
+        QVERIFY(note && note->isVisible());
+        QVERIFY(note->reader()->toPlainText().contains(u"Body of b"_s));
+
+        // The cursor inside the $$ lines shows them as text again.
+        editor()->setFocus();
+        editor()->setTextCursor(QTextCursor(editor()->document()->findBlockByNumber(4)));
+        QTest::qWait(150);
+        QCOMPARE(imageBlocks().size(), 2);
+        editor()->moveCursor(QTextCursor::End);
+        QTest::qWait(150);
+        QCOMPARE(imageBlocks().size(), 3);
+
+        view()->setMode(NoteView::Read);
+        QTest::qWait(250);
+        QVERIFY(view()->findChild<Reader *>()->toHtml().contains(u"diagram:"_s));
+        view()->setMode(NoteView::Edit);
+        QSettings().remove(u"mermaidCommand"_s);
+    }
+
     void keyboardThroughPanelsAndImages()
     {
         makeVault(u"keys"_s, {{u"a.md"_s, u"---\ntitle: T\n---\nIntro\n\n> [!tip] Tip\n> body\n\n![[logo.png|60]]\n\nafter\n"_s}});
@@ -629,6 +702,25 @@ private Q_SLOTS:
         view()->setMode(NoteView::Edit);
     }
 
+    void mathInReadingView()
+    {
+        makeVault(u"math"_s, {{u"m.md"_s, u"Euler: $e^{i\\pi} + 1 = 0$\n\n$$\\int_0^1 x\\,dx = \\frac{1}{2}$$\n"_s}});
+        open(u"m.md"_s);
+        view()->setMode(NoteView::Read);
+        QTest::qWait(250);
+        auto *reader = view()->findChild<Reader *>();
+        int images = 0;
+        for (QTextBlock b = reader->document()->begin(); b.isValid(); b = b.next())
+            for (auto it = b.begin(); !it.atEnd(); ++it)
+                if (const QTextImageFormat f = it.fragment().charFormat().toImageFormat(); f.isValid()) {
+                    const QImage img = reader->document()->resource(QTextDocument::ImageResource, QUrl(f.name())).value<QImage>();
+                    QVERIFY2(!img.isNull(), qPrintable(f.name()));
+                    ++images;
+                }
+        QCOMPARE(images, 2);
+        view()->setMode(NoteView::Edit);
+    }
+
     void searchTagsAndBookmarks()
     {
         makeVault(u"search"_s, {{u"work/plan.md"_s, u"---\ntags: [project/alpha]\n---\n# Goals\nShip the Editor [[list]]\n- [ ] write docs\n- [x] fix bug #urgent\n"_s},
@@ -697,6 +789,136 @@ private Q_SLOTS:
         QCOMPARE(tree->selectedPaths().size(), 2);
         const QStringList group = viaMenu([tree, planPos] { Q_EMIT tree->customContextMenuRequested(planPos); }, {});
         QCOMPARE(group, QStringList({u"Move 2 items to..."_s, u"Delete 2 items"_s}));
+    }
+
+    void unlinkedMentionsBecomeLinks()
+    {
+        makeVault(u"mentions"_s, {{u"Roadmap.md"_s, u"# Roadmap\n"_s}, {u"m.md"_s, u"About the roadmap today.\n"_s}, {u"l.md"_s, u"[[Roadmap]]\n"_s}});
+        open(u"Roadmap.md"_s);
+        auto *panel = m_window->findChild<BacklinksPanel *>();
+        QTRY_COMPARE(panel->topLevelItemCount(), 2);
+        QCOMPARE(panel->topLevelItem(0)->text(0), u"Linked mentions"_s);
+        QCOMPARE(panel->topLevelItem(0)->child(0)->text(0), u"l"_s);
+        QTreeWidgetItem *unlinked = panel->topLevelItem(1);
+        unlinked->setExpanded(true);
+        QTRY_COMPARE(unlinked->text(0), u"Unlinked mentions (1)"_s);
+        auto *link = qobject_cast<QToolButton *>(panel->itemWidget(unlinked->child(0)->child(0), 1));
+        QVERIFY(link);
+        link->click();
+        QTRY_COMPARE(read(u"m.md"_s), u"About the [[Roadmap|roadmap]] today.\n"_s);
+        QTRY_COMPARE(panel->topLevelItem(0)->childCount(), 2);
+    }
+
+    QList<QTabWidget *> panes() const
+    {
+        QList<QTabWidget *> out;
+        for (auto *tw : m_window->findChildren<QTabWidget *>())
+            if (tw->tabBar()->objectName() == u"notes" && tw->isVisible())
+                out << tw;
+        // In reading order: top to bottom, then left to right.
+        std::sort(out.begin(), out.end(), [this](QWidget *a, QWidget *b) {
+            const QPoint pa = a->mapTo(m_window, QPoint()), pb = b->mapTo(m_window, QPoint());
+            return std::pair(pa.y(), pa.x()) < std::pair(pb.y(), pb.x());
+        });
+        return out;
+    }
+    QSplitter *splitterOf(QWidget *w) const { return qobject_cast<QSplitter *>(w->parentWidget()); }
+    void dropTab(NoteView *v, QTabWidget *onto, QPointF at)
+    {
+        QWidget *zone = onto->findChild<QWidget *>(u"dropZone"_s, Qt::FindDirectChildrenOnly);
+        QVERIFY(zone);
+        zone->setGeometry(onto->rect());
+        QMimeData mime;
+        mime.setData(u"application/x-serat-tab"_s, QByteArray::number(quintptr(v)));
+        const QPointF pos(at.x() * zone->width(), at.y() * zone->height());
+        QDragEnterEvent enter(pos, Qt::MoveAction, &mime, Qt::LeftButton, {});
+        QApplication::sendEvent(zone, &enter);
+        QVERIFY(enter.isAccepted());
+        QDropEvent drop(pos, Qt::MoveAction, &mime, Qt::LeftButton, {});
+        QApplication::sendEvent(zone, &drop);
+        QTest::qWait(100);
+    }
+
+    void splitDownAndMoveTabs()
+    {
+        makeVault(u"panes"_s, {{u"a.md"_s, u"A\n"_s}, {u"b.md"_s, u"B\n"_s}});
+        open(u"a.md"_s);
+        action(u"Split down"_s)->trigger();
+        QTest::qWait(200);
+        QCOMPARE(panes().size(), 2);
+        QCOMPARE(splitterOf(panes()[0])->orientation(), Qt::Vertical);
+        QTabWidget *top = panes()[0];
+        open(u"b.md"_s);
+        action(u"Split right"_s)->trigger();
+        QTest::qWait(200);
+        QCOMPARE(panes().size(), 3);
+        QTabWidget *corner = panes()[2];
+        QCOMPARE(splitterOf(corner)->orientation(), Qt::Horizontal);
+        QCOMPARE(splitterOf(splitterOf(corner))->orientation(), Qt::Vertical);
+
+        // Dropped in the middle of another pane, the tab moves there and its emptied pane goes away.
+        auto *moved = qobject_cast<NoteView *>(corner->currentWidget());
+        dropTab(moved, top, {0.5, 0.5});
+        QCOMPARE(panes().size(), 2);
+        QCOMPARE(top->count(), 2);
+        QCOMPARE(top->currentWidget(), moved);
+        QCOMPARE(splitterOf(top)->orientation(), Qt::Vertical);
+        QCOMPARE(splitterOf(panes()[1])->orientation(), Qt::Vertical);
+
+        // Near an edge it splits that pane.
+        dropTab(moved, top, {0.95, 0.5});
+        QCOMPARE(panes().size(), 3);
+        QCOMPARE(top->count(), 1);
+        QTabWidget *right = panes()[1];
+        QCOMPARE(right->currentWidget(), moved);
+        QCOMPARE(splitterOf(right), splitterOf(top));
+        QCOMPARE(splitterOf(top)->orientation(), Qt::Horizontal);
+
+        // The layout comes back with the vault.
+        m_window->openVault(m_vault);
+        QTest::qWait(300);
+        QCOMPARE(panes().size(), 3);
+        QCOMPARE(splitterOf(panes()[0])->orientation(), Qt::Horizontal);
+        QCOMPARE(splitterOf(panes()[0]), splitterOf(panes()[1]));
+        QCOMPARE(splitterOf(splitterOf(panes()[0]))->orientation(), Qt::Vertical);
+        QCOMPARE(splitterOf(panes()[2])->orientation(), Qt::Vertical);
+
+        // Closing panes undoes the splits.
+        while (panes().size() > 1) {
+            auto *v = qobject_cast<NoteView *>(panes().last()->currentWidget());
+            v->editor()->setFocus();
+            QTest::qWait(50);
+            action(u"Close tab"_s)->trigger();
+            QTest::qWait(100);
+        }
+        QCOMPARE(splitterOf(panes()[0])->count(), 1);
+    }
+
+    void exportToHtmlAndPdf()
+    {
+        makeVault(u"export"_s, {{u"e.md"_s, u"# Export\nSee [[a]] and [the web](https://example.com).\n\n$$\\frac{a}{b}$$\n\n"
+                                              "![[red.png]]\n\n> [!tip] Tip\n> body\n"_s},
+                                {u"a.md"_s, u"x\n"_s}});
+        QImage img(40, 20, QImage::Format_RGB32);
+        img.fill(Qt::red);
+        QVERIFY(img.save(m_vault + u"/red.png"_s));
+        QTest::qWait(600);
+        const Vault &vault = *m_window->findChild<Vault *>();
+        const QString html = Export::html(vault, u"e.md"_s, QFont());
+        QVERIFY(html.startsWith(u"<!doctype html>"_s));
+        QVERIFY(html.contains(u"<title>e</title>"_s));
+        for (const QString &scheme : {u"math:"_s, u"file:"_s, u"icon:"_s})
+            QVERIFY2(!html.contains(u"src=\""_s + scheme), qPrintable(scheme));
+        QVERIFY(!html.contains(u"wiki:"_s));
+        QVERIFY(html.contains(u"href=\"https://example.com\""_s));
+        QCOMPARE(html.count(u"src=\"data:image/png;base64,"_s), 3); // the formula, the picture, the callout icon
+
+        const QString pdf = m_vault + u"/../e.pdf"_s;
+        QVERIFY(Export::writePdf(vault, u"e.md"_s, QFont(), pdf));
+        QFile f(pdf);
+        QVERIFY(f.open(QIODevice::ReadOnly));
+        QCOMPARE(f.read(5), QByteArray("%PDF-"));
+        f.remove();
     }
 
     void splitPinPreviewAndSync()
@@ -800,14 +1022,29 @@ private Q_SLOTS:
         QTest::qWait(300);
         QCOMPARE(view()->path(), u"Journal/%1.md"_s.arg(today.toString(u"yyyy-MM-dd"_s)));
 
-        QStringList sections;
-        QTimer::singleShot(250, this, [&sections] {
+        // Enough dictionaries that the language list gets a filter.
+        const QDir dictionaries(Spelling::userDictionaryDir());
+        QVERIFY(dictionaries.mkpath(u"."_s));
+        for (const char16_t *name : {u"de_DE", u"fr_FR", u"es_ES", u"it_IT", u"nl_NL", u"pt_BR"})
+            for (const char16_t *ext : {u".aff", u".dic"})
+                QVERIFY(QFile(dictionaries.filePath(QString::fromUtf16(name) + QString::fromUtf16(ext))).open(QIODevice::WriteOnly));
+        QStringList sections, filtered;
+        bool languagesFit = !Spelling::supported();
+        QTimer::singleShot(250, this, [&sections, &languagesFit, &filtered] {
             auto *d = qobject_cast<SettingsDialog *>(QApplication::activeModalWidget());
             if (!d)
                 return;
             auto *list = d->findChild<QListWidget *>();
             for (int i = 0; i < list->count(); ++i)
                 sections << list->item(i)->text();
+            if (auto *languages = d->findChild<QListWidget *>(u"spellLanguages"_s); languages && languages->count() > 1) {
+                languagesFit = languages->viewport()->rect().contains(languages->visualItemRect(languages->item(1)));
+                if (auto *filter = d->findChild<QLineEdit *>(u"spellLanguageFilter"_s))
+                    filter->setText(u"dutch"_s);
+                for (int i = 0; i < languages->count(); ++i)
+                    if (!languages->item(i)->isHidden())
+                        filtered << languages->item(i)->data(Qt::UserRole).toString();
+            }
             for (auto *box : d->findChildren<QCheckBox *>())
                 if (box->text() == u"Auto pair brackets")
                     box->setChecked(false);
@@ -815,13 +1052,145 @@ private Q_SLOTS:
         });
         action(u"Settings…"_s)->trigger();
         QTest::qWait(300);
-        QCOMPARE(sections, QStringList({u"Editor"_s, u"Files and links"_s, u"Appearance"_s, u"Daily notes"_s, u"Templates"_s}));
+        QCOMPARE(sections, QStringList({u"Editor"_s, u"Files and links"_s, u"Appearance"_s, u"Daily notes"_s, u"Templates"_s, u"Hotkeys"_s}));
+        QVERIFY(languagesFit);
+        if (Spelling::supported())
+            QCOMPARE(filtered, QStringList{u"nl_NL"_s});
+        QDir(Spelling::userDictionaryDir()).removeRecursively();
         open(u"a.md"_s);
         editor()->setFocus();
         editor()->moveCursor(QTextCursor::End);
         type(u"(z"_s);
         QCOMPARE(cursorLine(), u"(z"_s);
         QSettings().setValue(u"autoPairBrackets"_s, true);
+    }
+
+    void spellcheckInEditor()
+    {
+        if (!Spelling::supported())
+            QSKIP("built without Hunspell");
+        Settings::setApp(u"spellLanguages"_s, QStringList{u"en_US"_s, u"id_ID"_s});
+        Spelling::instance().reload();
+        makeVault(u"spell"_s, {{u"s.md"_s, u"A mispeled word, saya makan nasi, `codde` and [[Linkk]] #tagg\n"_s}});
+        open(u"s.md"_s);
+        auto underlined = [this] {
+            QStringList out;
+            const QTextBlock b = editor()->document()->firstBlock();
+            for (const QTextLayout::FormatRange &r : b.layout()->formats())
+                if (r.format.underlineStyle() == QTextCharFormat::SpellCheckUnderline)
+                    out << b.text().mid(r.start, r.length);
+            out.removeDuplicates();
+            return out;
+        };
+        QCOMPARE(underlined(), QStringList{u"mispeled"_s});
+
+        // Right-click it: a suggestion replaces the word.
+        QTextCursor at(editor()->document()->firstBlock());
+        at.setPosition(4);
+        const QPoint p = editor()->cursorRect(at).center();
+        const QStringList labels = viaMenu([this, p] {
+            QContextMenuEvent e(QContextMenuEvent::Mouse, p, editor()->viewport()->mapToGlobal(p));
+            QApplication::sendEvent(editor()->viewport(), &e);
+        }, {u"misspelled"_s});
+        QVERIFY(labels.contains(u"misspelled"_s));
+        QVERIFY(labels.contains(u"Add “mispeled” to dictionary"_s));
+        QVERIFY(line(0).startsWith(u"A misspelled word"_s));
+        QTest::qWait(100);
+        QVERIFY(underlined().isEmpty());
+        QSettings().remove(u"spellLanguages"_s);
+    }
+
+    void graphView()
+    {
+        makeVault(u"graph"_s, {{u"alpha.md"_s, u"to [[beta]]\n"_s}, {u"beta.md"_s, u"to [[gamma]]\n"_s},
+                               {u"gamma.md"_s, u"end\n"_s}, {u"delta.md"_s, u"alone\n"_s}});
+        open(u"beta.md"_s);
+        auto *local = m_window->findChild<GraphView *>(u"localGraph"_s);
+        QCOMPARE(local->nodeCount(), 3); // beta, what links to it and what it links to
+
+        action(u"Open graph view"_s)->trigger();
+        auto *page = m_window->findChild<QWidget *>(u"graphTab"_s);
+        QVERIFY(page && page->isVisible());
+        QCOMPARE(tabs(), QStringList({u"Graph view"_s, u"beta"_s}));
+        auto *graph = page->findChild<GraphView *>();
+        QCOMPARE(graph->nodeCount(), 4);
+        QTRY_VERIFY_WITH_TIMEOUT(graph->settled(), 8000);
+        const QPointF a = graph->nodePosition(u"alpha.md"_s), b = graph->nodePosition(u"beta.md"_s);
+        QVERIFY(QLineF(a, b).length() < QLineF(a, graph->nodePosition(u"delta.md"_s)).length());
+
+        page->findChild<QLineEdit *>()->setText(u"ta"_s);
+        QCOMPARE(graph->nodeCount(), 2); // beta and delta
+        page->findChild<QLineEdit *>()->clear();
+        QTRY_VERIFY_WITH_TIMEOUT(graph->settled(), 8000);
+
+        // A click opens the note in a tab beside the graph.
+        QTest::mouseClick(graph, Qt::LeftButton, {}, graph->nodePosition(u"gamma.md"_s).toPoint());
+        QTest::qWait(200);
+        QCOMPARE(view()->path(), u"gamma.md"_s);
+        QCOMPARE(tabs(), QStringList({u"Graph view"_s, u"beta"_s, u"gamma"_s}));
+
+        // Ctrl+G again goes back to the same tab, and the tab comes back with the vault.
+        action(u"Open graph view"_s)->trigger();
+        QVERIFY(page->isVisible());
+        m_window->openVault(m_vault);
+        QTest::qWait(300);
+        QCOMPARE(tabs(), QStringList({u"Graph view"_s, u"beta"_s, u"gamma"_s}));
+        page = m_window->findChild<QWidget *>(u"graphTab"_s);
+        auto *pane = qobject_cast<QTabWidget *>(page->parentWidget()->parentWidget());
+        pane->setCurrentWidget(page);
+        action(u"Close tab"_s)->trigger();
+        QTest::qWait(100);
+        QVERIFY(!m_window->findChild<QWidget *>(u"graphTab"_s) || !m_window->findChild<QWidget *>(u"graphTab"_s)->isVisible());
+        QCOMPARE(tabs(), QStringList({u"beta"_s, u"gamma"_s}));
+    }
+
+    void hotkeysAndFonts()
+    {
+        makeVault(u"hotkeys"_s, {{u"a.md"_s, u"x\n"_s}});
+        open(u"a.md"_s);
+        QAction *bold = action(u"Bold"_s), *italic = action(u"Italic"_s);
+        const QKeySequence chord(u"Ctrl+Alt+J"_s);
+        bool ran = false;
+        QTimer::singleShot(250, this, [&] {
+            auto *d = qobject_cast<SettingsDialog *>(QApplication::activeModalWidget());
+            if (!d)
+                return;
+            ran = true;
+            auto *list = d->findChild<QTreeWidget *>(u"hotkeys"_s);
+            auto *keys = d->findChild<QKeySequenceEdit *>(u"hotkeyEdit"_s);
+            auto give = [&](const QString &command) {
+                for (int i = 0; i < list->topLevelItemCount(); ++i)
+                    if (list->topLevelItem(i)->text(0) == command)
+                        list->setCurrentItem(list->topLevelItem(i));
+                keys->setKeySequence(chord);
+                Q_EMIT keys->editingFinished();
+            };
+            give(u"Bold"_s);
+            give(u"Italic"_s); // already Bold's: asks, and moves it
+            for (auto *spin : d->findChildren<QSpinBox *>())
+                if (spin->suffix() == u" pt")
+                    spin->setValue(21);
+            d->reject();
+        });
+        action(u"Settings…"_s)->trigger();
+        QTest::qWait(400);
+        QVERIFY(ran);
+        QCOMPARE(italic->shortcut(), chord);
+        QVERIFY(bold->shortcuts().isEmpty());
+        QVERIFY(m_dialogLog.value(0).contains(u"is used by"_s));
+        QCOMPARE(editor()->font().pointSizeF(), 21.0);
+
+        // The next start gives the commands the hotkeys chosen here.
+        QAction fresh;
+        fresh.setObjectName(u"format.italic"_s);
+        fresh.setShortcut(QKeySequence(u"Ctrl+I"_s));
+        Settings::applyShortcuts({&fresh});
+        QCOMPARE(fresh.shortcut(), chord);
+
+        QSettings().remove(u"shortcuts"_s);
+        QSettings().remove(u"textSize"_s);
+        Settings::applyShortcuts(m_window->actions());
+        QCOMPARE(bold->shortcut(), QKeySequence(QKeySequence::Bold));
     }
 
     void openFoldersComeBack()
@@ -858,6 +1227,20 @@ private Q_SLOTS:
         key(Qt::Key_W, Qt::ControlModifier);
         QTest::qWait(500);
         QCOMPARE(read(u"t.md"_s), u"x\n\n| A | B |\n| --- | --- |\n| satu | 2 |\n"_s);
+    }
+
+    void textMenusUseAppIcons()
+    {
+        QLineEdit edit(u"x"_s);
+        std::unique_ptr<QMenu> menu(edit.createStandardContextMenu());
+        menu->popup(QPoint(0, 0));
+        QVERIFY(QTest::qWaitForWindowExposed(menu.get()));
+        for (const auto &[action, icon] : {std::pair{u"edit-undo"_s, u"undo"_s}, {u"edit-copy"_s, u"copy"_s}, {u"select-all"_s, u"select-all"_s}}) {
+            QAction *a = menu->findChild<QAction *>(action);
+            QVERIFY2(a, qPrintable(action));
+            QCOMPARE(a->icon().pixmap(16).toImage(), Theme::icon(icon).pixmap(16).toImage());
+        }
+        menu->hide();
     }
 
     void namesThatCannotBeFiles()

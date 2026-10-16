@@ -1,6 +1,8 @@
 #include "Reader.h"
 
+#include "Diagrams.h"
 #include "Editor.h"
+#include "MathRender.h"
 #include "PathActions.h"
 #include "Theme.h"
 
@@ -62,10 +64,24 @@ void Reader::resizeEvent(QResizeEvent *e)
 
 QVariant Reader::loadResource(int type, const QUrl &name)
 {
+    const qreal dpr = m_scale > 0 ? m_scale : devicePixelRatioF();
     // "icon:<name>?color=%23rrggbb" from the renderer (callout icons).
     if (type == QTextDocument::ImageResource && name.scheme() == u"icon") {
         const QColor color(QUrlQuery(name).queryItemValue(u"color"_s, QUrl::FullyDecoded));
-        return Theme::image(name.path(), color, 18, devicePixelRatioF());
+        return Theme::image(name.path(), color, 18, dpr);
+    }
+    if (type == QTextDocument::ImageResource && name.scheme() == u"diagram") {
+        const QUrlQuery query(name);
+        return Diagrams::instance().image(query.queryItemValue(u"src"_s, QUrl::FullyDecoded), query.queryItemValue(u"dark"_s) == u"1",
+                                          dpr);
+    }
+    if (type == QTextDocument::ImageResource && name.scheme() == u"math") {
+        const QUrlQuery query(name);
+        const QFont font = document()->defaultFont();
+        const double px = font.pixelSize() > 0 ? font.pixelSize() : font.pointSizeF() * logicalDpiY() / 72.0;
+        return MathRender::render(query.queryItemValue(u"tex"_s, QUrl::FullyDecoded), px, palette().color(QPalette::Text),
+                                  query.queryItemValue(u"d"_s) == u"1", dpr)
+            .image;
     }
     return QTextBrowser::loadResource(type, name);
 }

@@ -1,12 +1,14 @@
 #include "Markdown.h"
 
 #include "CodeHighlight.h"
+#include "Diagrams.h"
 #include "Frontmatter.h"
+#include "Settings.h"
 #include "Vault.h"
 
+#include <QCoreApplication>
 #include <QDir>
 #include <QFileInfo>
-#include <QFontDatabase>
 #include <QImageReader>
 #include <QRegularExpression>
 #include <QUrl>
@@ -38,7 +40,7 @@ QString headingAnchor(const QString &heading)
 
 QString markdownStyleSheet(const QPalette &pal, double base)
 {
-    const QString fixed = QFontDatabase::systemFont(QFontDatabase::FixedFont).family();
+    const QString fixed = Settings::monoFamily();
     const QColor link = pal.color(QPalette::Link);
     return uR"(
 a { color: %1; text-decoration: none; }
@@ -68,6 +70,45 @@ constexpr char LoneTilde = '\x1a';
 constexpr char EmbedMark = '\x1e';
 // Bytes of %%comments%% and ^block-ids; dropped from the output so task offsets stay valid.
 constexpr char Hidden = '\x1d';
+
+// "[^id]: text" lines (and the indented lines under them) are taken out and blanked in place.
+QList<QPair<QString, QString>> takeFootnotes(QByteArray &utf8)
+{
+    static const QRegularExpression def(u"^\\[\\^([^\\]\\s]+)\\]:[ \\t]?(.*)$"_s);
+    static const QRegularExpression more(u"^(?:    |\\t)(.*)$"_s);
+    QList<QPair<QString, QString>> out;
+    bool fence = false;
+    qsizetype start = 0;
+    int open = -1; // index in `out` still taking indented lines
+    while (start <= utf8.size()) {
+        qsizetype end = utf8.indexOf('\n', start);
+        if (end < 0)
+            end = utf8.size();
+        const QString line = QString::fromUtf8(utf8.mid(start, end - start));
+        const QString trimmed = line.trimmed();
+        bool take = false;
+        if (trimmed.startsWith(u"```"_s) || trimmed.startsWith(u"~~~"_s)) {
+            fence = !fence;
+            open = -1;
+        } else if (!fence) {
+            if (const auto m = def.match(line); m.hasMatch()) {
+                out.append({m.captured(1), m.captured(2)});
+                open = int(out.size()) - 1;
+                take = true;
+            } else if (const auto c = more.match(line); open >= 0 && c.hasMatch() && !trimmed.isEmpty()) {
+                out[open].second += u'\n' + c.captured(1);
+                take = true;
+            } else if (!trimmed.isEmpty()) {
+                open = -1;
+            }
+        }
+        if (take)
+            for (qsizetype i = start; i < end; ++i)
+                utf8[i] = ' ';
+        start = end + 1;
+    }
+    return out;
+}
 
 // Marks %%comments%% and trailing ^block-ids outside code as Hidden; a line that is only hidden becomes blank.
 void hideComments(QByteArray &utf8)
@@ -173,10 +214,8 @@ CalloutStyle calloutStyle(const QString &type)
     return {u"#448aff"_s, u"pencil"_s};
 }
 
-namespace {
-
 // Up to the next heading of the same or higher level, or the block holding "^id"; all of it if missing.
-QString sectionOf(const QString &text, const QString &heading)
+QString noteSection(const QString &text, const QString &heading)
 {
     const QStringList lines = text.split(u'\n');
     if (heading.startsWith(u'^')) {
@@ -216,6 +255,8 @@ QString sectionOf(const QString &text, const QString &heading)
     return out.isEmpty() ? text : out.join(u'\n');
 }
 
+namespace {
+
 class Renderer
 {
 public:
@@ -247,6 +288,7 @@ public:
 
         QByteArray utf8 = text.toUtf8();
         hideComments(utf8);
+        m_footnoteDefs = takeFootnotes(utf8);
         for (qsizetype i = 0; i < utf8.size(); ++i) {
             if (utf8[i] == '~' && (i == 0 || utf8[i - 1] != '~') && (i + 1 == utf8.size() || utf8[i + 1] != '~'))
                 utf8[i] = LoneTilde;
@@ -254,7 +296,7 @@ public:
                 utf8[i] = EmbedMark;
         }
         MD_PARSER parser{};
-        parser.flags = MD_FLAG_TABLES | MD_FLAG_STRIKETHROUGH | MD_FLAG_TASKLISTS | MD_FLAG_WIKILINKS
+        parser.flags = MD_FLAG_TABLES | MD_FLAG_STRIKETHROUGH | MD_FLAG_TASKLISTS | MD_FLAG_WIKILINKS | MD_FLAG_LATEXMATHSPANS
                        | MD_FLAG_PERMISSIVEURLAUTOLINKS | MD_FLAG_PERMISSIVEWWWAUTOLINKS;
 #ifdef MD_FLAG_HIGHLIGHT
         parser.flags |= MD_FLAG_HIGHLIGHT;
@@ -267,7 +309,9 @@ public:
             return static_cast<Renderer *>(u)->onText(t, fromMd(s, n, t == MD_TEXT_NORMAL));
         };
         md_parse(utf8.constData(), MD_SIZE(utf8.size()), &parser, this);
-        return m_out.replace(QChar(EmbedMark), u'!').remove(QChar(Hidden));
+        m_out.replace(QChar(EmbedMark), u'!').remove(QChar(Hidden));
+        addFootnotes();
+        return m_out;
     }
 
 private:
@@ -351,6 +395,7 @@ private:
             m_codeBuf.clear();
             break;
         case MD_BLOCK_P:
+            m_paragraphStart = m_out.size();
             m_out += u"<p>"_s;
             break;
         case MD_BLOCK_TABLE:
@@ -394,7 +439,13 @@ private:
             m_inCode = false;
             finishCode();
             break;
-        case MD_BLOCK_P: m_out += u"</p>"_s; break;
+        case MD_BLOCK_P:
+            // A paragraph that is only $$display math$$ is centred, like a display block.
+            if (m_out.mid(m_paragraphStart + 3).startsWith(u"<img src=\"math:?d=1"_s) && m_out.endsWith(u"middle;\">"_s)
+                && m_out.indexOf(u"<img"_s, m_paragraphStart + 4) < 0)
+                m_out.replace(m_paragraphStart, 3, u"<p align=\"center\">"_s);
+            m_out += u"</p>"_s;
+            break;
         case MD_BLOCK_TABLE: m_out += u"</table>"_s; break;
         case MD_BLOCK_TR: m_out += u"</tr>"_s; break;
         case MD_BLOCK_TH: m_out += u"</th>"_s; --m_inCell; break;
@@ -417,6 +468,11 @@ private:
         case MD_SPAN_DEL: m_out += u"<s>"_s; break;
         case MD_SPAN_U: m_out += u"<u>"_s; break;
         case MD_SPAN_CODE: m_out += u"<code style=\"background-color:%1;\">"_s.arg(m_codeBg); break;
+        case MD_SPAN_LATEXMATH:
+        case MD_SPAN_LATEXMATH_DISPLAY:
+            m_mathBuf.clear();
+            m_inMath = true;
+            break;
 #ifdef MD_FLAG_HIGHLIGHT
         case MD_SPAN_MARK: m_out += u"<span style=\"background-color:%1;\">"_s.arg(m_mark); break;
 #endif
@@ -464,6 +520,14 @@ private:
         case MD_SPAN_DEL: m_out += u"</s>"_s; break;
         case MD_SPAN_U: m_out += u"</u>"_s; break;
         case MD_SPAN_CODE: m_out += u"</code>"_s; break;
+        case MD_SPAN_LATEXMATH:
+        case MD_SPAN_LATEXMATH_DISPLAY:
+            m_inMath = false;
+            // Drawn by the reader on demand, at its font size and colour.
+            m_out += u"<img src=\"math:?d=%3&amp;tex=%1\" title=\"%2\" style=\"vertical-align: middle;\">"_s.arg(
+                QString::fromLatin1(QUrl::toPercentEncoding(m_mathBuf)), m_mathBuf.toHtmlEscaped(),
+                type == MD_SPAN_LATEXMATH_DISPLAY ? u"1"_s : u"0"_s);
+            break;
 #ifdef MD_FLAG_HIGHLIGHT
         case MD_SPAN_MARK: m_out += u"</span>"_s; break;
 #endif
@@ -488,6 +552,10 @@ private:
 
     int onText(MD_TEXTTYPE type, const QString &s)
     {
+        if (m_inMath) {
+            m_mathBuf += s;
+            return 0;
+        }
         if (m_inCode) {
             m_codeBuf += s;
             return 0;
@@ -575,7 +643,7 @@ private:
         sub.depth = m_opt.depth + 1;
         sub.contentWidth = m_opt.contentWidth - 40;
         Renderer r(sub, m_code);
-        const QString inner = r.render(heading.isEmpty() ? note->text : sectionOf(note->text, heading));
+        const QString inner = r.render(heading.isEmpty() ? note->text : noteSection(note->text, heading));
         const QString title = u"<p><a href=\"wiki:%1\"><b>%2</b></a></p>"_s.arg(
             QString::fromUtf8(QUrl::toPercentEncoding(m_embedTarget)), Vault::baseName(path).toHtmlEscaped());
         m_out += box(m_border, m_opt.palette.color(QPalette::Base).name(), title + inner);
@@ -626,20 +694,94 @@ private:
         m_out += box(style.color, bg, u"<p style=\"color:%1;\">%2</p>"_s.arg(style.color, head) + rest);
     }
 
+    // "[^id]" and inline "^[text]" become numbered references, listed under a rule at the end.
+    void addFootnotes()
+    {
+        static const QRegularExpression code(u"<pre[\\s\\S]*?</pre>|<code[^>]*>[\\s\\S]*?</code>"_s);
+        static const QRegularExpression ref(u"\\[\\^([^\\]\\s]+)\\]|\\^\\[([^\\]]+)\\]"_s);
+        QHash<QString, QString> defined;
+        for (const auto &[id, text] : std::as_const(m_footnoteDefs))
+            defined.insert(id, text);
+        QList<QPair<QString, QString>> used; // anchor id, text
+        QHash<QString, int> numbers;
+        auto replaceIn = [&](const QString &html) {
+            QString out;
+            qsizetype last = 0;
+            for (auto it = ref.globalMatch(html); it.hasNext();) {
+                const auto m = it.next();
+                QString id, text;
+                if (m.capturedLength(1)) {
+                    if (!defined.contains(m.captured(1)))
+                        continue;
+                    id = m.captured(1);
+                    text = defined.value(id);
+                } else {
+                    id = u"inline-%1"_s.arg(used.size() + 1);
+                    text = m.captured(2);
+                }
+                if (!numbers.contains(id)) {
+                    numbers.insert(id, int(used.size()) + 1);
+                    used.append({id, text});
+                }
+                const QString anchor = QString::fromLatin1(QUrl::toPercentEncoding(id));
+                out += html.mid(last, m.capturedStart() - last);
+                out += u"<sup><a href=\"#fn-%1\" name=\"fnref-%1\" style=\"text-decoration:none;\">%2</a></sup>"_s.arg(anchor).arg(numbers.value(id));
+                last = m.capturedEnd();
+            }
+            return out + html.mid(last);
+        };
+        QString out;
+        qsizetype last = 0;
+        for (auto it = code.globalMatch(m_out); it.hasNext();) {
+            const auto m = it.next();
+            out += replaceIn(m_out.mid(last, m.capturedStart() - last)) + m.captured();
+            last = m.capturedEnd();
+        }
+        out += replaceIn(m_out.mid(last));
+        m_out = out;
+        if (used.isEmpty())
+            return;
+        m_out += u"<hr><ol style=\"color:%1;\">"_s.arg(m_muted);
+        for (const auto &[id, text] : std::as_const(used)) {
+            RenderOptions sub = m_opt;
+            sub.depth = qMax(1, m_opt.depth);
+            Renderer r(sub, m_code);
+            QString body = r.render(text);
+            static const QRegularExpression para(u"^<p>|</p>$"_s);
+            body = body.trimmed().remove(para);
+            const QString anchor = QString::fromLatin1(QUrl::toPercentEncoding(id));
+            m_out += u"<li><a name=\"fn-%1\"></a>%2 <a href=\"#fnref-%1\" style=\"text-decoration:none;\">\u21A9</a></li>"_s.arg(anchor, body);
+        }
+        m_out += u"</ol>"_s;
+    }
+
     void finishCode()
     {
         QString code = m_codeBuf;
         if (code.endsWith(u'\n'))
             code.chop(1);
+        if (m_codeLang.compare(u"mermaid"_s, Qt::CaseInsensitive) == 0) {
+            Diagrams &diagrams = Diagrams::instance();
+            if (!diagrams.image(code, m_opt.dark).isNull()) {
+                m_out += u"<p align=\"center\"><img src=\"diagram:?dark=%1&amp;src=%2\"></p>"_s.arg(
+                    m_opt.dark ? 1 : 0).arg(QString::fromLatin1(QUrl::toPercentEncoding(code)));
+                return;
+            }
+            const QString why = Diagrams::renderer().isEmpty() ? QCoreApplication::translate("Markdown", "Install mermaid-cli (the mmdc command) to see this diagram drawn.")
+                              : diagrams.pending(code, m_opt.dark) ? QCoreApplication::translate("Markdown", "Drawing the diagram…")
+                                                                    : diagrams.error(code, m_opt.dark);
+            if (!why.isEmpty())
+                m_out += u"<p style=\"color:%1;\"><small>%2</small></p>"_s.arg(m_muted, why.toHtmlEscaped());
+        }
         const qsizetype id = m_code->size();
         m_code->append(code);
         const QString label = m_codeLang.isEmpty() ? QString() : m_codeLang.toHtmlEscaped() + u"&nbsp;&nbsp;·&nbsp;&nbsp;"_s;
         m_out += u"<table width=\"100%\" cellspacing=\"0\" cellpadding=\"10\" bgcolor=\"%1\" style=\"margin-top:2px; margin-bottom:12px;\">"
                  "<tr><td><p align=\"right\" style=\"margin:0px;\"><a href=\"copy:%2\" style=\"color:%3; text-decoration:none;\">"
-                 "<small>%4Copy</small></a></p><pre style=\"margin:0px; white-space:pre-wrap;\">%5</pre></td></tr></table>"_s
+                 "<small>%4%6</small></a></p><pre style=\"margin:0px; white-space:pre-wrap;\">%5</pre></td></tr></table>"_s
                      .arg(m_codeBg)
                      .arg(id)
-                     .arg(m_muted, label, highlightCodeHtml(code, m_codeLang, m_opt.dark));
+                     .arg(m_muted, label, highlightCodeHtml(code, m_codeLang, m_opt.dark), QCoreApplication::translate("Markdown", "Copy"));
     }
 
     const RenderOptions &m_opt;
@@ -651,6 +793,10 @@ private:
     QString m_codeBg, m_border, m_muted, m_mark;
 
     int m_callouts = 0; // foldable ones seen so far
+    QList<QPair<QString, QString>> m_footnoteDefs;
+    bool m_inMath = false;
+    QString m_mathBuf;
+    qsizetype m_paragraphStart = 0;
     bool m_inCode = false;
     QString m_codeLang, m_codeBuf;
     int m_imgDepth = 0;

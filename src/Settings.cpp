@@ -2,8 +2,11 @@
 
 #include "Vault.h"
 
+#include <QAction>
 #include <QCryptographicHash>
 #include <QFile>
+#include <QFontDatabase>
+#include <QGuiApplication>
 #include <QJsonDocument>
 #include <QJsonObject>
 #include <QLocale>
@@ -42,6 +45,41 @@ QVariant app(const QString &key, const QVariant &fallback)
 void setApp(const QString &key, const QVariant &value)
 {
     QSettings().setValue(key, value);
+}
+
+double defaultTextSize()
+{
+    return qMax(12.0, QGuiApplication::font().pointSizeF() + 1.5);
+}
+
+QFont textFont(double zoom)
+{
+    QFont f = QGuiApplication::font();
+    if (const QString family = app(u"textFont"_s).toString(); !family.isEmpty())
+        f.setFamilies({family});
+    const double size = app(u"textSize"_s, 0.0).toDouble();
+    f.setPointSizeF((size > 0 ? size : defaultTextSize()) + zoom);
+    return f;
+}
+
+QString monoFamily()
+{
+    const QString family = app(u"monoFont"_s).toString();
+    return family.isEmpty() ? QFontDatabase::systemFont(QFontDatabase::FixedFont).family() : family;
+}
+
+void applyShortcuts(const QList<QAction *> &actions)
+{
+    QSettings s;
+    s.beginGroup(u"shortcuts"_s);
+    for (QAction *a : actions) {
+        if (a->objectName().isEmpty())
+            continue;
+        if (!a->property("defaultKeys").isValid())
+            a->setProperty("defaultKeys", QKeySequence::listToString(a->shortcuts(), QKeySequence::PortableText));
+        const QString keys = s.contains(a->objectName()) ? s.value(a->objectName()).toString() : a->property("defaultKeys").toString();
+        a->setShortcuts(QKeySequence::listFromString(keys, QKeySequence::PortableText));
+    }
 }
 
 QString vaultGroup(const Vault &vault)

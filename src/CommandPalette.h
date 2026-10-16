@@ -13,6 +13,8 @@ class CommandPalette : public QDialog
     Q_OBJECT
 public:
     CommandPalette(QMenuBar *menus, const QStringList &recent, QWidget *parent = nullptr);
+    // Every menu command, named with its submenu, in menu order.
+    static QList<std::pair<QString, QAction *>> commands(QMenuBar *menus);
     QAction *chosen() const { return m_chosen; }
     QString chosenName() const { return m_chosenName; }
 

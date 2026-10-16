@@ -29,9 +29,19 @@ Built with Qt 6 and C++20. Runs on Linux, Windows and macOS.
   pills, and Ctrl+; to add one. Unchanged lines are written back as they were, and YAML
   the panel cannot edit safely stays read-only; right-click > Edit source opens the text.
 - Callouts show as coloured boxes with their icon and title (`[!note]-` starts folded);
-  images (`![[x.png|200]]`,
-  `![](path)`) show in place. Moving the cursor into either reveals the Markdown.
-  Right-click an image to copy, open, rename, move or delete it.
+  images (`![[x.png|200]]`, `![](path)`), embedded notes (`![[note]]`, `![[note#Heading]]`),
+  `$$display math$$` and Mermaid diagrams show in place. Moving the cursor into one reveals
+  the Markdown. Right-click an image to copy, open, rename, move or delete it.
+- Math in LaTeX: `$inline$` and `$$display$$`, drawn by Serat itself (fractions, roots,
+  sums and integrals with limits, matrices, `cases`, `aligned`, accents, Greek and
+  `\mathbb`/`\mathcal` letters). Right-click a formula to copy its LaTeX.
+- Mermaid diagrams in ` ```mermaid ` blocks, drawn by [mermaid-cli](https://github.com/mermaid-js/mermaid-cli)
+  when its `mmdc` command is installed
+- Footnotes: `[^1]` with a `[^1]: text` line, or `^[inline text]`
+- Spellcheck in English and Indonesian: misspelled words get a wavy underline; right-click
+  one for suggestions or to add it to your dictionary. Settings > Editor picks the
+  languages, and any Hunspell `.aff`/`.dic` pair dropped into the folder it names adds
+  another.
 - Find and replace in the note
 - Paste a screenshot and it is saved as `Pasted image <timestamp>.png`, in the attachment
   folder chosen in Settings
@@ -49,13 +59,20 @@ Built with Qt 6 and C++20. Runs on Linux, Windows and macOS.
 
 **Reading**
 - Reading view with tables, nested and task lists, callouts, code blocks with a copy
-  button, properties, and embedded images and notes (`![[x.png]]`, `![[note#Heading]]`)
+  button, properties, math, diagrams, footnotes, and embedded images and notes
+  (`![[x.png]]`, `![[note#Heading]]`)
 - Click a checkbox in the reading view to tick it in the file; click a foldable callout's
   title to open or close it. `%%comments%%` and `^block-ids` are not shown.
 
 **Links and navigation**
 - Renaming or moving a note or folder rewrites every link that points into it
-- Backlinks, outgoing links, tags and outline panels; the status bar counts backlinks
+- Backlinks, outgoing links, tags and outline panels; the status bar counts backlinks.
+  The backlinks panel also lists unlinked mentions, notes that name this one without
+  linking to it, each with a Link button that turns the mention into a link.
+- Graph view (Ctrl+G) of every note and its links, in a tab like a note: drag to pan,
+  scroll to zoom, hover a note to light up its neighbours, click to open it beside the
+  graph, filter by path. The Local graph panel
+  shows the open note and the notes it touches. Stays smooth with 10,000 notes.
 - Hold Ctrl over a link to preview the note it points to
 - Bookmarks for notes, folders and searches
 - Command palette with every command and its shortcut
@@ -66,7 +83,8 @@ Built with Qt 6 and C++20. Runs on Linux, Windows and macOS.
   auto-reveal the open note, collapse or expand all; open folders stay open the next time
   the vault is opened
 - Tabs with their own back and forward history, restored on the next start; split the
-  view to the right, and pin a tab so links from it open in a new tab
+  view right or down, as often as you like, and pin a tab so links from it open in a new
+  tab. Drag a tab onto another pane to move it there, or near a pane's edge to split it.
 - Shift+click files in the tree to move or delete several at once
 - Right-click a file, folder, tab or panel entry to copy its path or a link to it, make a
   copy, move it, search inside a folder, or open it in another app; the ⋮ button on a
@@ -81,12 +99,17 @@ Built with Qt 6 and C++20. Runs on Linux, Windows and macOS.
   each note every few minutes and before it is deleted, kept for a week outside the vault.
   Restore an earlier version, or bring back a deleted note.
 
+**Export**
+- File > Export to PDF, Export to HTML and Print. The HTML is one file with its images,
+  math and diagrams inside, so it opens anywhere. Exports always use the light colours.
+
 **Look and settings**
 - Light and dark theme that follows the system, or set it under View > Theme
-- Settings (Ctrl+,) for the editor helpers, readable line length, where new notes and
-  attachments go, daily notes and templates
-
-Not yet: graph view.
+- Settings (Ctrl+,) for the editor helpers, spellcheck, readable line length, text and
+  monospace fonts and size, where new notes and attachments go, daily notes and templates
+- Hotkeys: every command's shortcut can be changed or removed in Settings > Hotkeys, which
+  warns when a key is already taken
+- The interface is in English or Bahasa Indonesia (Settings > Appearance > Language)
 
 ## Shortcuts
 
@@ -94,6 +117,7 @@ Not yet: graph view.
 |---|---|
 | Ctrl+P | Command palette |
 | Ctrl+O | Quick switcher (Ctrl+Enter opens in a new tab) |
+| Ctrl+G | Graph view |
 | Ctrl+N | New note |
 | Ctrl+E | Switch between editing and reading |
 | Ctrl+Shift+E | Live preview on / off |
@@ -129,13 +153,14 @@ back to the text below the table.
 Arch:
 
 ```sh
-sudo pacman -S --needed qt6-base qt6-svg md4c syntax-highlighting cmake ninja
+sudo pacman -S --needed qt6-base qt6-svg qt6-tools md4c syntax-highlighting hunspell cmake ninja
 ```
 
 Debian/Ubuntu:
 
 ```sh
-sudo apt install qt6-base-dev libqt6svg6-dev libmd4c-dev libkf6syntaxhighlighting-dev cmake ninja-build
+sudo apt install qt6-base-dev libqt6svg6-dev qt6-tools-dev qt6-l10n-tools libmd4c-dev \
+    libkf6syntaxhighlighting-dev libhunspell-dev pkg-config cmake ninja-build
 ```
 
 Then:
@@ -158,20 +183,39 @@ cmake --install build --prefix dist
 ```
 
 `dist` is a self-contained folder. md4c is downloaded and built automatically when it is
-not installed.
+not installed. Spellcheck needs Hunspell found through `pkg-config` (vcpkg has it); the
+Windows release is built without it for now.
 
 ### macOS
 
 ```sh
-brew install qt md4c cmake ninja
+brew install qt md4c hunspell pkg-config cmake ninja
 cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_PREFIX_PATH="$(brew --prefix qt)"
 cmake --build build
 cmake --install build --prefix dist   # produces Serat.app
 ```
 
-KSyntaxHighlighting is optional everywhere; without it code blocks are not coloured.
+KSyntaxHighlighting, Hunspell and the Qt Linguist tools are optional everywhere: without
+them code blocks are not coloured, there is no spellcheck, or the interface is English
+only. Mermaid diagrams need mermaid-cli at run time (`npm install -g @mermaid-js/mermaid-cli`).
 Run the tests with `ctest --test-dir build`: `tst_vault` covers parsing, search and merging,
 and `tst_ui` drives the real window offscreen (typing, menus, dialogs) without showing it.
+
+### Packages
+
+- AppImage: `packaging/appimage.sh` builds `Serat-<version>-x86_64.AppImage` with the Qt it
+  finds through `qmake6`
+- Flatpak: `flatpak-builder --user --install --force-clean build-flatpak packaging/flatpak/id.icqn.Serat.yml`
+- Windows installer and macOS disk image: after building, `cpack --config build/CPackConfig.cmake -G NSIS`
+  (or `-G DragNDrop` on macOS)
+- Pushing a `v*` tag runs `.github/workflows/release.yml`, which builds all three and
+  attaches them to a GitHub release
+
+### Translations
+
+`translations/serat_id.ts` holds the Indonesian interface. After changing texts in the
+code, `cmake --build build --target update_translations` adds the new ones to it; translate
+them with Qt Linguist or any text editor, and the next build includes them.
 
 ## Usage
 
@@ -200,6 +244,13 @@ Built on:
 - [md4c](https://github.com/mity/md4c) by Martin Mitáš (MIT), the Markdown parser
 - [KSyntaxHighlighting](https://invent.kde.org/frameworks/syntax-highlighting) from KDE
   Frameworks (MIT), colours code blocks
+- [Hunspell](https://hunspell.github.io) (LGPL-2.1 / GPL-2.0 / MPL-1.1), the spellchecker
+- The English dictionary from [SCOWL](http://wordlist.aspell.net) by Kevin Atkinson and the
+  Indonesian one from [hunspell-id](https://github.com/shuLhan/hunspell-id) (LGPL-3.0), both
+  through [LibreOffice's dictionaries](https://github.com/LibreOffice/dictionaries); their
+  licenses are in `data/dictionaries`
+- [mermaid-cli](https://github.com/mermaid-js/mermaid-cli) (MIT), when installed, draws
+  diagrams; it is not bundled
 
 ## License
 

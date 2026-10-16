@@ -2,6 +2,8 @@
 
 #include "CommandPalette.h"
 #include "Editor.h"
+#include "Export.h"
+#include "Graph.h"
 #include "Markdown.h"
 #include "NoteView.h"
 #include "Panels.h"
@@ -11,6 +13,7 @@
 #include "RecoveryDialog.h"
 #include "Settings.h"
 #include "SettingsDialog.h"
+#include "Spelling.h"
 #include "Theme.h"
 #include "Vault.h"
 
@@ -20,6 +23,7 @@
 #include <QCloseEvent>
 #include <QCryptographicHash>
 #include <QDesktopServices>
+#include <QDrag>
 #include <QDir>
 #include <QDirIterator>
 #include <QFileDialog>
@@ -29,9 +33,14 @@
 #include <QJsonDocument>
 #include <QJsonObject>
 #include <QLabel>
+#include <QLineEdit>
 #include <QMenu>
 #include <QMenuBar>
 #include <QMessageBox>
+#include <QMimeData>
+#include <QPainter>
+#include <QPrintDialog>
+#include <QPrinter>
 #include <QPushButton>
 #include <QSettings>
 #include <QSplitter>
@@ -45,6 +54,8 @@
 #include <QUrl>
 #include <QUrlQuery>
 #include <QVBoxLayout>
+
+#include <numeric>
 
 using namespace Qt::StringLiterals;
 
@@ -94,6 +105,11 @@ public:
     using QTabBar::QTabBar;
 
 protected:
+    // Narrow sidebars squeeze the icon tabs instead of scrolling them.
+    QSize minimumTabSizeHint(int index) const override
+    {
+        return QSize(iconSize().width() + 14, QTabBar::minimumTabSizeHint(index).height());
+    }
     void paintEvent(QPaintEvent *) override
     {
         QStylePainter p(this);
@@ -131,8 +147,155 @@ private:
 class PanelTabs : public QTabWidget
 {
 public:
-    PanelTabs() { setTabBar(new IconTabBar); }
+    PanelTabs()
+    {
+        setTabBar(new IconTabBar);
+        setUsesScrollButtons(false);
+    }
 };
+
+constexpr auto tabMime = "application/x-serat-tab";
+
+// Covers a pane while a tab is dragged: dropping in the middle moves the tab there, near an edge splits the pane.
+class DropZone : public QWidget
+{
+public:
+    enum Zone { None, Center, Left, Right, Top, Bottom };
+    std::function<void(const QByteArray &, Zone)> dropped;
+
+    explicit DropZone(QWidget *parent)
+        : QWidget(parent)
+    {
+        setObjectName(u"dropZone"_s);
+        setAcceptDrops(true);
+        hide();
+    }
+
+    Zone zoneAt(const QPointF &p) const
+    {
+        const double fx = p.x() / qMax(1, width()), fy = p.y() / qMax(1, height());
+        const std::pair<double, Zone> edges[] = {{fx, Left}, {1 - fx, Right}, {fy, Top}, {1 - fy, Bottom}};
+        const auto nearest = *std::min_element(std::begin(edges), std::end(edges));
+        return nearest.first < 0.25 ? nearest.second : Center;
+    }
+
+protected:
+    void dragEnterEvent(QDragEnterEvent *e) override
+    {
+        if (!e->mimeData()->hasFormat(QString::fromLatin1(tabMime)))
+            return e->ignore();
+        e->acceptProposedAction();
+        show(zoneAt(e->position()));
+    }
+    void dragMoveEvent(QDragMoveEvent *e) override
+    {
+        e->acceptProposedAction();
+        show(zoneAt(e->position()));
+    }
+    void dragLeaveEvent(QDragLeaveEvent *) override { show(None); }
+    void dropEvent(QDropEvent *e) override
+    {
+        const Zone z = zoneAt(e->position());
+        show(None);
+        e->acceptProposedAction();
+        if (dropped)
+            dropped(e->mimeData()->data(QString::fromLatin1(tabMime)), z);
+    }
+    void paintEvent(QPaintEvent *) override
+    {
+        if (m_zone == None)
+            return;
+        QRect r = rect();
+        if (m_zone == Left || m_zone == Right)
+            r.setWidth(width() / 2);
+        if (m_zone == Top || m_zone == Bottom)
+            r.setHeight(height() / 2);
+        if (m_zone == Right)
+            r.moveRight(rect().right());
+        if (m_zone == Bottom)
+            r.moveBottom(rect().bottom());
+        QPainter p(this);
+        QColor c = palette().color(QPalette::Highlight);
+        c.setAlpha(40);
+        p.fillRect(r.adjusted(4, 4, -4, -4), c);
+        c.setAlpha(160);
+        p.setPen(QPen(c, 2));
+        p.drawRect(r.adjusted(5, 5, -5, -5));
+    }
+
+private:
+    using QWidget::show;
+    void show(Zone z)
+    {
+        if (z != m_zone) {
+            m_zone = z;
+            update();
+        }
+    }
+    Zone m_zone = None;
+};
+
+QSplitter *newSplitter(Qt::Orientation orientation)
+{
+    auto *s = new QSplitter(orientation);
+    s->setChildrenCollapsible(false);
+    s->setHandleWidth(1);
+    return s;
+}
+
+// Moves the panes of `inner` into `outer` where `inner` was, keeping their share of the space.
+void splice(QSplitter *outer, QSplitter *inner)
+{
+    const int at = outer->indexOf(inner);
+    QList<int> sizes = outer->sizes();
+    const QList<int> innerSizes = inner->sizes();
+    const int total = qMax(1, std::accumulate(innerSizes.cbegin(), innerSizes.cend(), 0));
+    const int share = sizes.takeAt(at);
+    for (int k = 0; k < innerSizes.size(); ++k)
+        sizes.insert(at + k, share * innerSizes[k] / total);
+    for (int k = 0; inner->count(); ++k)
+        outer->insertWidget(at + k, inner->widget(0));
+    inner->setParent(nullptr);
+    inner->deleteLater();
+    outer->setSizes(sizes);
+}
+
+// The layout of the panes: a pane's index, or a splitter with its direction, sizes and children.
+QVariant paneLayout(QWidget *w, const QList<QTabWidget *> &panes)
+{
+    if (auto *pane = qobject_cast<QTabWidget *>(w))
+        return panes.indexOf(pane);
+    auto *s = qobject_cast<QSplitter *>(w);
+    QVariantList children, sizes;
+    for (int i = 0; i < s->count(); ++i) {
+        children << paneLayout(s->widget(i), panes);
+        sizes << s->sizes().value(i);
+    }
+    return QVariantMap{{u"vertical"_s, s->orientation() == Qt::Vertical}, {u"sizes"_s, sizes}, {u"children"_s, children}};
+}
+
+QWidget *buildLayout(const QVariant &node, const QList<QTabWidget *> &panes)
+{
+    if (node.typeId() != QMetaType::QVariantMap)
+        return panes.value(node.toInt(), nullptr);
+    const QVariantMap map = node.toMap();
+    QList<QWidget *> children;
+    QList<int> sizes;
+    const QVariantList saved = map.value(u"children"_s).toList(), savedSizes = map.value(u"sizes"_s).toList();
+    for (int i = 0; i < saved.size(); ++i) {
+        if (QWidget *w = buildLayout(saved[i], panes)) {
+            children << w;
+            sizes << qMax(50, savedSizes.value(i).toInt());
+        }
+    }
+    if (children.size() < 2)
+        return children.value(0);
+    QSplitter *s = newSplitter(map.value(u"vertical"_s).toBool() ? Qt::Vertical : Qt::Horizontal);
+    for (QWidget *w : children)
+        s->addWidget(w);
+    s->setSizes(sizes);
+    return s;
+}
 
 } // namespace
 
@@ -141,6 +304,9 @@ MainWindow::MainWindow(QWidget *parent)
 {
     buildUi();
     buildActions();
+    Settings::applyShortcuts(m_commands.values());
+    // Loading the dictionaries takes a moment; the window shows first.
+    QTimer::singleShot(0, this, [] { Spelling::instance().reload(); });
     setReadableLineLength(Settings::app(u"readableWidth"_s, true).toBool());
 
     QSettings s;
@@ -178,17 +344,20 @@ void MainWindow::buildUi()
                         {m_search, u"search", tr("Search (Ctrl+Shift+F)")},
                         {m_bookmarks, u"bookmark", tr("Bookmarks")}});
 
-    m_panes = new QSplitter;
-    m_panes->setChildrenCollapsible(false);
-    m_panes->setHandleWidth(1);
+    m_panes = newSplitter(Qt::Horizontal);
     m_tabs = createPane();
+    m_panes->addWidget(m_tabs);
 
     m_backlinks = new BacklinksPanel;
     m_outgoing = new OutgoingPanel;
     m_outline = new OutlinePanel;
     m_tags = new TagsPanel;
+    m_localGraph = new GraphView;
+    m_localGraph->setObjectName(u"localGraph"_s);
+    connect(m_localGraph, &GraphView::openRequested, this, [this](const QString &p, bool newTab) { openPath(p, newTab); });
     m_right = panelTabs({{m_backlinks, u"backlinks", tr("Backlinks")},
                          {m_outgoing, u"outgoing", tr("Outgoing links")},
+                         {m_localGraph, u"graph", tr("Local graph")},
                          {m_tags, u"tag", tr("Tags")},
                          {m_outline, u"outline", tr("Outline")}});
     m_preview = new PreviewPopup(this);
@@ -320,6 +489,7 @@ void MainWindow::buildUi()
     connect(m_tree, &FileTree::searchInFolderRequested, this, [this](const QString &dir) { searchVault(u"path:\""_s + dir + u"/\" "_s); });
     connect(m_search, &SearchPanel::openRequested, this,
             [this](const QString &p, int line, bool newTab) { openPath(p, newTab, {}, line); });
+    connect(m_backlinks, &BacklinksPanel::linkMentionRequested, this, &MainWindow::linkMention);
     connect(m_backlinks, &BacklinksPanel::openRequested, this,
             [this](const QString &p, int line, bool newTab) { openPath(p, newTab, {}, line); });
     connect(m_outgoing, &OutgoingPanel::linkRequested, this, [this](const QString &target, bool newTab) {
@@ -336,6 +506,7 @@ void MainWindow::buildActions()
     auto add = [this](QMenu *menu, const QString &id, const QString &text, const QKeySequence &key, auto fn,
                       bool needsVault = true) {
         QAction *a = menu->addAction(text);
+        a->setObjectName(id);
         if (!key.isEmpty())
             a->setShortcut(key);
         connect(a, &QAction::triggered, this, fn);
@@ -401,11 +572,15 @@ void MainWindow::buildActions()
     add(file, u"file.recovery"_s, tr("File recovery…"), {}, [this] { openRecovery(currentView() ? currentView()->path() : QString()); });
     add(file, u"file.delete"_s, tr("Delete current file"), {}, withView([this](NoteView *v) { deletePath(v->path()); }));
     file->addSeparator();
+    add(file, u"file.exportPdf"_s, tr("Export to PDF…"), {}, withView([this](NoteView *v) { exportNote(v, u"pdf"_s); }));
+    add(file, u"file.exportHtml"_s, tr("Export to HTML…"), {}, withView([this](NoteView *v) { exportNote(v, u"html"_s); }));
+    add(file, u"file.print"_s, tr("Print…"), {}, withView([this](NoteView *v) { exportNote(v, u"print"_s); }));
+    file->addSeparator();
     add(file, u"file.save"_s, tr("Save"), QKeySequence::Save, [this] { saveAll(); });
     add(file, u"app.settings"_s, tr("Settings…"), QKeySequence(u"Ctrl+,"_s), [this] { openSettings(); }, false);
     add(file, u"tab.close"_s, tr("Close tab"), QKeySequence(u"Ctrl+W"_s), [this] {
-        if (NoteView *v = currentView())
-            closeView(v);
+        if (QWidget *page = m_tabs->currentWidget())
+            closeTab(page);
     });
     file->addSeparator();
     add(file, u"app.quit"_s, tr("Quit"), QKeySequence::Quit, [this] { close(); }, false);
@@ -542,7 +717,9 @@ void MainWindow::buildActions()
     add(view, u"fold.all"_s, tr("Fold all headings and lists"), {}, withEditor([](Editor *e) { e->foldAll(true); }));
     add(view, u"fold.none"_s, tr("Unfold all headings and lists"), {}, withEditor([](Editor *e) { e->foldAll(false); }));
     view->addSeparator();
-    add(view, u"pane.splitRight"_s, tr("Split right"), {}, [this] { splitRight(); });
+    add(view, u"pane.splitRight"_s, tr("Split right"), {}, [this] { split(Qt::Horizontal); });
+    add(view, u"pane.splitDown"_s, tr("Split down"), {}, [this] { split(Qt::Vertical); });
+    add(view, u"view.graph"_s, tr("Open graph view"), QKeySequence(u"Ctrl+G"_s), [this] { openGraph(); });
     add(view, u"tab.pin"_s, tr("Pin or unpin tab"), {}, withView([this](NoteView *v) {
         v->setPinned(!v->isPinned());
         updateTabButton(v);
@@ -585,6 +762,8 @@ void MainWindow::showWelcome()
         saveSession();
         for (NoteView *v : views())
             closeView(v, false);
+        for (QWidget *page : tabPages())
+            closeTab(page);
         m_vault->deleteLater();
         m_vault = nullptr;
         QSettings().remove(u"lastVault"_s);
@@ -697,6 +876,11 @@ void MainWindow::saveSession()
         QStringList tabs, modes, pinned;
         for (int i = 0; i < pane->count(); ++i) {
             auto *v = qobject_cast<NoteView *>(pane->widget(i));
+            if (!v) {
+                tabs << QString();
+                modes << u"graph"_s;
+                continue;
+            }
             tabs << v->path();
             modes << QString::number(v->mode());
             if (v->isPinned())
@@ -709,6 +893,7 @@ void MainWindow::saveSession()
     s.remove(u"modes"_s);
     s.remove(u"current"_s);
     s.setValue(u"panes"_s, saved);
+    s.setValue(u"layout"_s, paneLayout(m_panes, panes()));
     s.setValue(u"activePane"_s, panes().indexOf(m_tabs));
     s.setValue(u"recent"_s, m_recent);
     s.setValue(u"leftVisible"_s, m_left->isVisible());
@@ -728,20 +913,30 @@ void MainWindow::restoreSession()
     if (saved.isEmpty() && s.contains(u"tabs"_s))
         saved << QVariantMap{{u"tabs"_s, s.value(u"tabs"_s)}, {u"modes"_s, s.value(u"modes"_s)}, {u"current"_s, s.value(u"current"_s)}};
     const int active = s.value(u"activePane"_s, 0).toInt();
+    const QVariant layout = s.value(u"layout"_s);
     m_tree->setExpandedFolders(s.value(u"expandedFolders"_s).toStringList());
     s.endGroup();
 
     QTabWidget *activePane = nullptr;
+    QList<QTabWidget *> made(saved.size(), nullptr);
     for (int p = 0; p < saved.size(); ++p) {
         const QVariantMap pane = saved[p].toMap();
         const QStringList tabs = pane.value(u"tabs"_s).toStringList();
         const QStringList modes = pane.value(u"modes"_s).toStringList();
         const QStringList pinned = pane.value(u"pinned"_s).toStringList();
-        if (std::none_of(tabs.cbegin(), tabs.cend(), [this](const QString &t) { return m_vault->exists(t); }))
+        if (std::none_of(tabs.cbegin(), tabs.cend(), [this](const QString &t) { return m_vault->exists(t); })
+            && !modes.contains(u"graph"_s))
             continue;
-        if (m_tabs->count())
+        if (m_tabs->count()) {
             m_tabs = createPane();
+            m_panes->addWidget(m_tabs);
+        }
+        made[p] = m_tabs;
         for (qsizetype i = 0; i < tabs.size(); ++i) {
+            if (modes.value(i) == u"graph") {
+                createGraphTab();
+                continue;
+            }
             if (!m_vault->exists(tabs[i]))
                 continue;
             NoteView *v = createTab();
@@ -755,6 +950,11 @@ void MainWindow::restoreSession()
         m_tabs->setCurrentIndex(qBound(0, pane.value(u"current"_s).toInt(), m_tabs->count() - 1));
         if (p == active)
             activePane = m_tabs;
+    }
+    if (auto *root = qobject_cast<QSplitter *>(buildLayout(layout, made))) {
+        m_panes->setOrientation(root->orientation());
+        m_panes->addWidget(root);
+        splice(m_panes, root);
     }
     m_tabs = activePane ? activePane : panes().first();
     onCurrentChanged();
@@ -773,13 +973,25 @@ bool MainWindow::eventFilter(QObject *obj, QEvent *e)
 {
     auto *bar = qobject_cast<QTabBar *>(obj);
     QTabWidget *pane = bar ? qobject_cast<QTabWidget *>(bar->parentWidget()) : nullptr;
-    if (pane && e->type() == QEvent::MouseButtonPress)
+    if (pane && e->type() == QEvent::MouseButtonPress) {
         setActivePane(pane);
+        m_tabPress = static_cast<QMouseEvent *>(e)->position().toPoint();
+    }
+    // A tab dragged off its bar can go to another pane.
+    if (pane && e->type() == QEvent::MouseMove) {
+        auto *me = static_cast<QMouseEvent *>(e);
+        const QPoint pos = me->position().toPoint();
+        if ((me->buttons() & Qt::LeftButton) && (pos - m_tabPress).manhattanLength() > QApplication::startDragDistance()
+            && !bar->rect().adjusted(0, -24, 0, 24).contains(pos)) {
+            startTabDrag(pane);
+            return true;
+        }
+    }
     if (pane && e->type() == QEvent::MouseButtonRelease) {
         auto *me = static_cast<QMouseEvent *>(e);
         if (me->button() == Qt::MiddleButton) {
-            if (auto *v = qobject_cast<NoteView *>(pane->widget(bar->tabAt(me->position().toPoint()))))
-                closeView(v);
+            if (QWidget *page = pane->widget(bar->tabAt(me->position().toPoint())))
+                closeTab(page);
             return true;
         }
     }
@@ -820,23 +1032,34 @@ QTabWidget *MainWindow::createPane()
         if (pane == m_tabs)
             onCurrentChanged();
     });
-    m_panes->addWidget(pane);
+    auto *zone = new DropZone(pane);
+    zone->dropped = [this, pane](const QByteArray &data, DropZone::Zone z) {
+        for (QWidget *page : tabPages())
+            if (QByteArray::number(quintptr(page)) == data)
+                return moveTab(page, pane, z);
+    };
     return pane;
 }
 
 QList<QTabWidget *> MainWindow::panes() const
 {
     QList<QTabWidget *> out;
-    for (int i = 0; i < m_panes->count(); ++i)
-        if (auto *pane = qobject_cast<QTabWidget *>(m_panes->widget(i)))
-            out << pane;
+    std::function<void(QSplitter *)> walk = [&](QSplitter *s) {
+        for (int i = 0; i < s->count(); ++i) {
+            if (auto *pane = qobject_cast<QTabWidget *>(s->widget(i)))
+                out << pane;
+            else if (auto *inner = qobject_cast<QSplitter *>(s->widget(i)))
+                walk(inner);
+        }
+    };
+    walk(m_panes);
     return out;
 }
 
-QTabWidget *MainWindow::paneOf(NoteView *v) const
+QTabWidget *MainWindow::paneOf(QWidget *page) const
 {
     for (QTabWidget *pane : panes())
-        if (pane->indexOf(v) >= 0)
+        if (pane->indexOf(page) >= 0)
             return pane;
     return nullptr;
 }
@@ -849,22 +1072,134 @@ void MainWindow::setActivePane(QTabWidget *pane)
     onCurrentChanged();
 }
 
-// Opens the current note again in a new pane to the right.
-void MainWindow::splitRight()
+// Opens the current note again in a new pane to the right or below.
+void MainWindow::split(Qt::Orientation orientation)
 {
     NoteView *from = currentView();
-    QTabWidget *pane = createPane();
-    m_panes->insertWidget(m_panes->indexOf(m_tabs) + 1, pane);
-    QList<int> sizes;
-    for (int i = 0; i < m_panes->count(); ++i)
-        sizes << 1000;
-    m_panes->setSizes(sizes);
-    m_tabs = pane;
+    m_tabs = insertPane(m_tabs, orientation, true);
     NoteView *v = createTab();
     if (from)
         v->open(from->path(), false);
     onCurrentChanged();
     v->focusContent();
+}
+
+// A new, empty pane next to `beside`, taking half of its space.
+QTabWidget *MainWindow::insertPane(QTabWidget *beside, Qt::Orientation orientation, bool after)
+{
+    auto *parent = qobject_cast<QSplitter *>(beside->parentWidget());
+    QTabWidget *pane = createPane();
+    if (parent->count() == 1)
+        parent->setOrientation(orientation);
+    const int at = parent->indexOf(beside);
+    QList<int> sizes = parent->sizes();
+    if (parent->orientation() == orientation) {
+        const int half = sizes[at] / 2;
+        sizes[at] -= half;
+        sizes.insert(after ? at + 1 : at, half);
+        parent->insertWidget(after ? at + 1 : at, pane);
+    } else {
+        QSplitter *inner = newSplitter(orientation);
+        parent->replaceWidget(at, inner);
+        inner->addWidget(after ? beside : pane);
+        inner->addWidget(after ? pane : beside);
+        beside->show();
+        inner->setSizes({1000, 1000});
+    }
+    parent->setSizes(sizes);
+    return pane;
+}
+
+void MainWindow::dropEmptyPane(QTabWidget *pane)
+{
+    if (pane->count() || panes().size() < 2)
+        return;
+    auto *parent = qobject_cast<QSplitter *>(pane->parentWidget());
+    pane->hide();
+    pane->setParent(nullptr);
+    pane->deleteLater();
+    tidyPanes(parent);
+    if (pane == m_tabs) {
+        m_tabs = panes().first();
+        onCurrentChanged();
+    }
+}
+
+// Splitters left with one pane give their place to it, so closing panes undoes the splits.
+void MainWindow::tidyPanes(QSplitter *s)
+{
+    while (s != m_panes && s->count() < 2) {
+        auto *parent = qobject_cast<QSplitter *>(s->parentWidget());
+        if (QWidget *only = s->widget(0)) {
+            const QList<int> sizes = parent->sizes();
+            parent->replaceWidget(parent->indexOf(s), only);
+            only->show();
+            parent->setSizes(sizes);
+            if (auto *inner = qobject_cast<QSplitter *>(only); inner && inner->orientation() == parent->orientation())
+                splice(parent, inner);
+        } else {
+            s->setParent(nullptr);
+        }
+        s->deleteLater();
+        s = parent;
+    }
+    if (s == m_panes && m_panes->count() == 1) {
+        if (auto *inner = qobject_cast<QSplitter *>(m_panes->widget(0))) {
+            m_panes->setOrientation(inner->orientation());
+            splice(m_panes, inner);
+        }
+    }
+}
+
+void MainWindow::startTabDrag(QTabWidget *pane)
+{
+    QWidget *v = pane->currentWidget();
+    if (!v)
+        return;
+    QTabBar *bar = pane->tabBar();
+    // Ends the tab bar's own reordering before the drag takes over the mouse.
+    QMouseEvent release(QEvent::MouseButtonRelease, m_tabPress, bar->mapToGlobal(m_tabPress), Qt::LeftButton,
+                        Qt::NoButton, Qt::NoModifier);
+    QApplication::sendEvent(bar, &release);
+    auto *mime = new QMimeData;
+    mime->setData(QString::fromLatin1(tabMime), QByteArray::number(quintptr(v)));
+    auto *drag = new QDrag(bar);
+    drag->setMimeData(mime);
+    drag->setPixmap(bar->grab(bar->tabRect(pane->indexOf(v))));
+    for (QTabWidget *p : panes()) {
+        QWidget *zone = p->findChild<QWidget *>(u"dropZone"_s, Qt::FindDirectChildrenOnly);
+        zone->setGeometry(p->rect());
+        zone->raise();
+        zone->show();
+    }
+    drag->exec(Qt::MoveAction);
+    for (QTabWidget *p : panes())
+        p->findChild<QWidget *>(u"dropZone"_s, Qt::FindDirectChildrenOnly)->hide();
+}
+
+void MainWindow::moveTab(QWidget *v, QTabWidget *target, int zone)
+{
+    QTabWidget *from = paneOf(v);
+    if (!from || (zone == DropZone::Center && from == target) || (from == target && from->count() == 1))
+        return;
+    if (zone != DropZone::Center) {
+        const bool across = zone == DropZone::Left || zone == DropZone::Right;
+        target = insertPane(target, across ? Qt::Horizontal : Qt::Vertical, zone == DropZone::Right || zone == DropZone::Bottom);
+    }
+    const int i = from->indexOf(v);
+    const QString text = from->tabText(i), tip = from->tabToolTip(i);
+    from->removeTab(i);
+    const int j = target->addTab(v, text);
+    target->setTabToolTip(j, tip);
+    updateTabButton(v);
+    target->setCurrentIndex(j);
+    dropEmptyPane(from);
+    m_tabs = target;
+    onCurrentChanged();
+    if (auto *note = qobject_cast<NoteView *>(v))
+        note->focusContent();
+    else
+        v->setFocus();
 }
 
 NoteView *MainWindow::currentView() const
@@ -954,26 +1289,50 @@ NoteView *MainWindow::createTab()
 }
 
 // A pinned tab shows a pin instead of the close button; clicking it unpins.
-void MainWindow::updateTabButton(NoteView *v)
+void MainWindow::updateTabButton(QWidget *page)
 {
-    QTabWidget *pane = paneOf(v);
+    QTabWidget *pane = paneOf(page);
     if (!pane)
         return;
+    auto *v = qobject_cast<NoteView *>(page);
+    const bool pinned = v && v->isPinned();
     auto *button = new QToolButton;
-    button->setIcon(Theme::icon(v->isPinned() ? u"pin"_s : u"close"_s));
+    button->setIcon(Theme::icon(pinned ? u"pin"_s : u"close"_s));
     button->setIconSize(QSize(14, 14));
     button->setAutoRaise(true);
     button->setFocusPolicy(Qt::NoFocus);
-    button->setToolTip(v->isPinned() ? tr("Unpin") : tr("Close tab (Ctrl+W)"));
-    connect(button, &QToolButton::clicked, this, [this, v] {
-        if (v->isPinned()) {
+    button->setToolTip(pinned ? tr("Unpin") : tr("Close tab (Ctrl+W)"));
+    connect(button, &QToolButton::clicked, this, [this, page, v] {
+        if (v && v->isPinned()) {
             v->setPinned(false);
             updateTabButton(v);
         } else {
-            closeView(v);
+            closeTab(page);
         }
     });
-    pane->tabBar()->setTabButton(pane->indexOf(v), QTabBar::RightSide, button);
+    pane->tabBar()->setTabButton(pane->indexOf(page), QTabBar::RightSide, button);
+}
+
+QList<QWidget *> MainWindow::tabPages() const
+{
+    QList<QWidget *> out;
+    for (QTabWidget *pane : panes())
+        for (int i = 0; i < pane->count(); ++i)
+            out << pane->widget(i);
+    return out;
+}
+
+void MainWindow::closeTab(QWidget *page)
+{
+    if (auto *v = qobject_cast<NoteView *>(page))
+        return closeView(v);
+    QTabWidget *pane = paneOf(page);
+    if (!pane)
+        return;
+    pane->removeTab(pane->indexOf(page));
+    page->deleteLater();
+    dropEmptyPane(pane);
+    onCurrentChanged();
 }
 
 void MainWindow::closeView(NoteView *v, bool saveFirst)
@@ -988,15 +1347,7 @@ void MainWindow::closeView(NoteView *v, bool saveFirst)
     }
     pane->removeTab(pane->indexOf(v));
     v->deleteLater();
-    if (pane->count() == 0 && panes().size() > 1) {
-        pane->hide();
-        pane->setParent(nullptr);
-        pane->deleteLater();
-        if (pane == m_tabs) {
-            m_tabs = panes().first();
-            onCurrentChanged();
-        }
-    }
+    dropEmptyPane(pane);
 }
 
 void MainWindow::saveAll()
@@ -1278,12 +1629,38 @@ void MainWindow::searchVault(const QString &text)
 void MainWindow::showTabMenu(QTabWidget *pane, const QPoint &pos)
 {
     QTabBar *bar = pane->tabBar();
-    auto *v = qobject_cast<NoteView *>(pane->widget(bar->tabAt(pos)));
-    if (!v || !m_vault)
+    QWidget *page = pane->widget(bar->tabAt(pos));
+    if (!page || !m_vault)
         return;
     QMenu menu(this);
-    fillNoteMenu(&menu, v, true);
+    if (auto *v = qobject_cast<NoteView *>(page))
+        fillNoteMenu(&menu, v, true);
+    else
+        addCloseActions(&menu, pane, page);
     menu.exec(bar->mapToGlobal(pos));
+}
+
+void MainWindow::addCloseActions(QMenu *menu, QTabWidget *pane, QWidget *page)
+{
+    auto others = [pane, page](bool rightOnly) {
+        QList<QWidget *> out;
+        for (int i = rightOnly ? pane->indexOf(page) + 1 : 0; i < pane->count(); ++i) {
+            auto *v = qobject_cast<NoteView *>(pane->widget(i));
+            if (pane->widget(i) != page && !(v && v->isPinned()))
+                out << pane->widget(i);
+        }
+        return out;
+    };
+    menu->addAction(tr("Close"), this, [this, page] { closeTab(page); });
+    menu->addAction(tr("Close others"), this, [this, others] {
+        for (QWidget *o : others(false))
+            closeTab(o);
+    })->setEnabled(!others(false).isEmpty());
+    menu->addAction(tr("Close tabs to the right"), this, [this, others] {
+        for (QWidget *o : others(true))
+            closeTab(o);
+    })->setEnabled(!others(true).isEmpty());
+    menu->addSeparator();
 }
 
 // The tab menu and the note's "More options" menu, in Obsidian's order.
@@ -1291,23 +1668,7 @@ void MainWindow::fillNoteMenu(QMenu *menu, NoteView *v, bool tab)
 {
     const QString path = v->path();
     if (QTabWidget *pane = paneOf(v); tab && pane) {
-        auto others = [pane, v](bool rightOnly) {
-            QList<NoteView *> out;
-            for (int i = rightOnly ? pane->indexOf(v) + 1 : 0; i < pane->count(); ++i)
-                if (auto *o = qobject_cast<NoteView *>(pane->widget(i)); o && o != v && !o->isPinned())
-                    out << o;
-            return out;
-        };
-        menu->addAction(tr("Close"), this, [this, v] { closeView(v); });
-        menu->addAction(tr("Close others"), this, [this, others] {
-            for (NoteView *o : others(false))
-                closeView(o);
-        })->setEnabled(!others(false).isEmpty());
-        menu->addAction(tr("Close tabs to the right"), this, [this, others] {
-            for (NoteView *o : others(true))
-                closeView(o);
-        })->setEnabled(!others(true).isEmpty());
-        menu->addSeparator();
+        addCloseActions(menu, pane, v);
         menu->addAction(v->isPinned() ? tr("Unpin") : tr("Pin"), this, [this, v] {
             v->setPinned(!v->isPinned());
             updateTabButton(v);
@@ -1315,7 +1676,12 @@ void MainWindow::fillNoteMenu(QMenu *menu, NoteView *v, bool tab)
         menu->addAction(tr("Split right"), this, [this, pane, v] {
             pane->setCurrentWidget(v);
             setActivePane(pane);
-            splitRight();
+            split(Qt::Horizontal);
+        });
+        menu->addAction(tr("Split down"), this, [this, pane, v] {
+            pane->setCurrentWidget(v);
+            setActivePane(pane);
+            split(Qt::Vertical);
         });
         menu->addSeparator();
     }
@@ -1345,8 +1711,10 @@ void MainWindow::fillNoteMenu(QMenu *menu, NoteView *v, bool tab)
         QDesktopServices::openUrl(QUrl::fromLocalFile(QFileInfo(m_vault->absolutePath(path)).absolutePath()));
     });
     menu->addAction(tr("Reveal file in navigation"), this, [this, path] { revealInTree(path); });
-    if (v->isNote())
+    if (v->isNote()) {
         menu->addAction(tr("Version history…"), this, [this, path] { openRecovery(path); });
+        menu->addAction(tr("Export to PDF…"), this, [this, v] { exportNote(v, u"pdf"_s); });
+    }
     menu->addSeparator();
     menu->addAction(tr("Delete file"), this, [this, path] { deletePath(path); });
 }
@@ -1507,11 +1875,42 @@ void MainWindow::zoom(double delta)
         v->applyFont(f);
 }
 
+// Saves the note first, so the export has what is on screen.
+void MainWindow::exportNote(NoteView *v, const QString &format)
+{
+    if (!v->isNote())
+        return;
+    v->save();
+    if (format == u"print") {
+        QPrinter printer(QPrinter::HighResolution);
+        QPrintDialog dialog(&printer, this);
+        dialog.setWindowTitle(tr("Print %1").arg(Vault::baseName(v->path())));
+        if (dialog.exec() == QDialog::Accepted)
+            Export::print(*m_vault, v->path(), Settings::textFont(), &printer);
+        return;
+    }
+    const bool pdf = format == u"pdf";
+    QSettings s;
+    const QString dir = s.value(u"exportDir"_s, QStandardPaths::writableLocation(QStandardPaths::DocumentsLocation)).toString();
+    QString file = QFileDialog::getSaveFileName(this, pdf ? tr("Export to PDF") : tr("Export to HTML"),
+                                                QDir(dir).filePath(Vault::baseName(v->path()) + u'.' + format),
+                                                pdf ? tr("PDF files (*.pdf)") : tr("HTML files (*.html *.htm)"));
+    if (file.isEmpty())
+        return;
+    if (QFileInfo(file).suffix().isEmpty())
+        file += u'.' + format;
+    s.setValue(u"exportDir"_s, QFileInfo(file).absolutePath());
+    const bool ok = pdf ? Export::writePdf(*m_vault, v->path(), Settings::textFont(), file)
+                    : Export::writeHtml(*m_vault, v->path(), Settings::textFont(), file);
+    if (ok)
+        statusBar()->showMessage(tr("Exported to %1").arg(QDir::toNativeSeparators(file)), 8000);
+    else
+        QMessageBox::warning(this, tr("Export failed"), tr("Could not write %1.").arg(QDir::toNativeSeparators(file)));
+}
+
 QFont MainWindow::noteFont() const
 {
-    QFont f = QApplication::font();
-    f.setPointSizeF(qMax(12.0, f.pointSizeF() + 1.5) + m_fontDelta);
-    return f;
+    return Settings::textFont(m_fontDelta);
 }
 
 void MainWindow::addRecent(const QString &path)
@@ -1524,7 +1923,7 @@ void MainWindow::addRecent(const QString &path)
 
 void MainWindow::onCurrentChanged()
 {
-    m_center->setCurrentWidget(views().isEmpty() ? m_empty : static_cast<QWidget *>(m_panes));
+    m_center->setCurrentWidget(tabPages().isEmpty() ? m_empty : static_cast<QWidget *>(m_panes));
     refreshPanels();
     updateStatus();
     updateTitle();
@@ -1556,7 +1955,59 @@ void MainWindow::onVaultChanged()
     }
     m_search->rerun();
     m_tags->showFor(m_vault);
+    for (QWidget *page : tabPages())
+        if (auto *graph = page->findChild<GraphView *>())
+            graph->refresh();
     refreshPanels();
+}
+
+// The whole vault's graph in a tab of its own; a second Ctrl+G goes back to it.
+void MainWindow::openGraph()
+{
+    for (QWidget *page : tabPages()) {
+        if (qobject_cast<NoteView *>(page))
+            continue;
+        QTabWidget *pane = paneOf(page);
+        pane->setCurrentWidget(page);
+        setActivePane(pane);
+        page->findChild<GraphView *>()->setFocus();
+        return;
+    }
+    QWidget *page = createGraphTab();
+    m_tabs->setCurrentWidget(page);
+    onCurrentChanged();
+    page->findChild<GraphView *>()->setFocus();
+}
+
+QWidget *MainWindow::createGraphTab()
+{
+    auto *page = new QWidget;
+    page->setObjectName(u"graphTab"_s);
+    auto *filter = new QLineEdit;
+    filter->setPlaceholderText(tr("Show notes whose path contains…"));
+    filter->setClearButtonEnabled(true);
+    auto *graph = new GraphView;
+    graph->setFocusPolicy(Qt::ClickFocus);
+    auto *bar = new QHBoxLayout;
+    bar->setContentsMargins(10, 8, 10, 8);
+    bar->addWidget(filter);
+    auto *layout = new QVBoxLayout(page);
+    layout->setContentsMargins(0, 0, 0, 0);
+    layout->setSpacing(0);
+    layout->addLayout(bar);
+    layout->addWidget(graph, 1);
+    connect(filter, &QLineEdit::textChanged, graph, &GraphView::setFilter);
+    // Notes open beside the graph, which stays in its tab.
+    connect(graph, &GraphView::openRequested, this, [this, page](const QString &p, bool) {
+        if (QTabWidget *pane = paneOf(page))
+            setActivePane(pane);
+        openPath(p, true);
+    });
+    graph->setScope(m_vault, {});
+    const int i = m_tabs->addTab(page, tr("Graph view"));
+    m_tabs->setTabToolTip(i, tr("Graph view"));
+    updateTabButton(page);
+    return page;
 }
 
 void MainWindow::refreshPanels()
@@ -1566,6 +2017,7 @@ void MainWindow::refreshPanels()
     m_backlinks->showFor(m_vault, path);
     m_outgoing->showFor(m_vault, path);
     m_outline->showFor(m_vault ? m_vault->note(path) : nullptr);
+    m_localGraph->setScope(m_vault, path, 1);
     const int sources = m_backlinks->sourceCount();
     m_backlinkCount->setText(sources == 1 ? tr("1 backlink") : tr("%1 backlinks").arg(sources));
     m_backlinkCount->setVisible(m_vault && !path.isEmpty());
@@ -1583,6 +2035,8 @@ void MainWindow::updateTitle()
     QStringList parts;
     if (v && !v->path().isEmpty())
         parts << Vault::baseName(v->path());
+    else if (!v && m_tabs->currentWidget())
+        parts << m_tabs->tabText(m_tabs->currentIndex());
     if (m_vault)
         parts << m_vault->name();
     parts << u"Serat"_s;
@@ -1698,7 +2152,7 @@ void MainWindow::insertTemplate(Editor *editor)
 
 void MainWindow::openSettings()
 {
-    SettingsDialog dlg(m_vault, this);
+    SettingsDialog dlg(m_vault, menuBar(), this);
     connect(&dlg, &SettingsDialog::changed, this, qOverload<>(&MainWindow::applySettings));
     dlg.exec();
     applySettings();
@@ -1710,6 +2164,8 @@ void MainWindow::applySettings()
     if (live != m_livePreview)
         m_commands.value(u"view.live"_s)->trigger();
     setReadableLineLength(Settings::app(u"readableWidth"_s, true).toBool());
+    zoom(0);
+    Spelling::instance().reload();
     for (NoteView *v : views())
         applySettings(v);
 }
@@ -1749,4 +2205,35 @@ void MainWindow::openRecovery(const QString &path)
     c.insertText(dlg.text());
     v->save();
     statusBar()->showMessage(tr("“%1” was restored to an earlier version.").arg(Vault::baseName(target)), 8000);
+}
+
+// Turns an unlinked mention into a link, keeping the words as written.
+void MainWindow::linkMention(const Mention &mention, const QString &target)
+{
+    const QString words = mention.text.mid(mention.start, mention.length);
+    const QString name = m_vault->linkText(target);
+    const QString link = u"[["_s + name + (words == name ? QString() : u'|' + words) + u"]]"_s;
+    for (NoteView *v : views()) {
+        if (v->path() != mention.path || !v->isNote())
+            continue;
+        const QTextBlock b = v->editor()->document()->findBlockByNumber(mention.line);
+        if (b.text() == mention.text) {
+            QTextCursor c(b);
+            c.setPosition(b.position() + mention.start);
+            c.setPosition(b.position() + mention.start + mention.length, QTextCursor::KeepAnchor);
+            c.insertText(link);
+            v->save();
+        }
+        refreshPanels();
+        return;
+    }
+    QString text = m_vault->readText(mention.path);
+    const bool crlf = text.contains(u"\r\n"_s);
+    QStringList lines = text.replace(u"\r\n"_s, u"\n"_s).split(u'\n');
+    if (lines.value(mention.line) == mention.text) {
+        lines[mention.line].replace(mention.start, mention.length, link);
+        text = lines.join(u'\n');
+        m_vault->writeNote(mention.path, crlf ? text.replace(u'\n', u"\r\n"_s) : text);
+    }
+    refreshPanels();
 }

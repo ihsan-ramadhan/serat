@@ -8,6 +8,8 @@ class Reader : public QTextBrowser
 public:
     explicit Reader(QWidget *parent = nullptr);
     int contentWidth() const;
+    // Draws math, diagrams and icons at this pixel ratio instead of the screen's, for print.
+    void setResourceScale(qreal scale) { m_scale = scale; }
 
 Q_SIGNALS:
     void contentWidthChanged();
@@ -23,6 +25,7 @@ protected:
 
 private:
     int m_lastWidth = 0;
+    qreal m_scale = 0;
     QString m_hover;
 };
 

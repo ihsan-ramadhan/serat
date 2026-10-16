@@ -26,6 +26,7 @@ RenderResult renderMarkdown(const QString &text, const RenderOptions &opt);
 QString renderTableCell(const QString &cell, const RenderOptions &opt);
 QString markdownStyleSheet(const QPalette &pal, double basePointSize);
 QString headingAnchor(const QString &heading);
+QString noteSection(const QString &text, const QString &heading);
 struct CalloutStyle {
     QString color;
     QString icon; // :/icons/<icon>.svg

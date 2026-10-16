@@ -1,15 +1,20 @@
 #include "Frontmatter.h"
 #include "Markdown.h"
+#include "MathRender.h"
 #include "SearchQuery.h"
 #include "Settings.h"
+#include "Spelling.h"
 #include "TextMerge.h"
 #include "Vault.h"
 
 #include <QDir>
+#include <QSettings>
 #include <QSignalSpy>
+#include <QStandardPaths>
 #include <QFile>
 #include <QTemporaryDir>
 #include <QTest>
+#include <QTranslator>
 
 using namespace Qt::StringLiterals;
 
@@ -36,6 +41,11 @@ class TestVault : public QObject
     }
 
 private Q_SLOTS:
+    void initTestCase()
+    {
+        QStandardPaths::setTestModeEnabled(true); // file recovery copies go to a test location
+    }
+
     void init()
     {
         QDir(m_dir.path()).removeRecursively();
@@ -102,6 +112,41 @@ private Q_SLOTS:
         QVERIFY(!v.rename(u"archive"_s, u"archive/sub"_s).isEmpty());
     }
 
+    void backlinkIndexStaysCurrent()
+    {
+        Vault v(m_dir.path());
+        auto sources = [&v](const QString &path) {
+            QStringList out;
+            for (const auto &[source, link] : v.backlinks(path))
+                out << source;
+            out.sort();
+            return out;
+        };
+        QCOMPARE(sources(u"notes.md"_s), QStringList{u"a/plan.md"_s});
+        QVERIFY(v.writeNote(u"b/plan.md"_s, u"# Plan B\nsee [[notes]]"_s));
+        QCOMPARE(sources(u"notes.md"_s), QStringList({u"a/plan.md"_s, u"b/plan.md"_s}));
+        QVERIFY(v.writeNote(u"a/plan.md"_s, u"# Plan A\nnothing"_s));
+        QCOMPARE(sources(u"notes.md"_s), QStringList{u"b/plan.md"_s});
+        QVERIFY(v.writeNote(u"c.md"_s, u"[[notes]]"_s));
+        QCOMPARE(sources(u"notes.md"_s), QStringList({u"b/plan.md"_s, u"c.md"_s}));
+        QVERIFY(v.rename(u"notes.md"_s, u"renamed.md"_s).isEmpty());
+        QCOMPARE(sources(u"renamed.md"_s), QStringList({u"b/plan.md"_s, u"c.md"_s}));
+        QVERIFY(sources(u"notes.md"_s).isEmpty());
+    }
+
+    void unlinkedMentions()
+    {
+        write(u"Roadmap.md"_s, u"---\naliases: [The Plan]\n---\n# Roadmap\n"_s);
+        write(u"m.md"_s, u"About the roadmap today.\nAlready [[Roadmap]] linked, `Roadmap` in code, https://x.io/Roadmap\n"
+                        "Roadmaps do not count, but The Plan does.\n```\nRoadmap in a fence\n```\n"_s);
+        Vault v(m_dir.path());
+        const QList<Mention> found = v.unlinkedMentions(u"Roadmap.md"_s);
+        QStringList seen;
+        for (const Mention &m : found)
+            seen << u"%1:%2:%3"_s.arg(m.path).arg(m.line).arg(m.text.mid(m.start, m.length));
+        QCOMPARE(seen, QStringList({u"m.md:0:roadmap"_s, u"m.md:2:The Plan"_s}));
+    }
+
     void search()
     {
         Vault v(m_dir.path());
@@ -160,6 +205,95 @@ private Q_SLOTS:
     void headingAnchorsIgnoreMarkup()
     {
         QCOMPARE(headingAnchor(u"**Sumber** per tabel (tahap lanjutan)"_s), headingAnchor(u"Sumber per tabel (tahap lanjutan)"_s));
+    }
+
+    void math()
+    {
+        RenderOptions opt;
+        const QString html = renderMarkdown(u"Inline $x^2$ costs $5 and $10.\n\n$$\\frac{a}{b}$$\n"_s, opt).html;
+        QVERIFY(html.contains(u"math:?d=0&amp;tex=x%5E2"_s));
+        QVERIFY(html.contains(u"<p align=\"center\"><img src=\"math:?d=1"_s));
+        QVERIFY(html.contains(u"costs $5 and $10"_s));
+
+        const auto small = MathRender::render(u"x^2"_s, 16, Qt::black, false);
+        const auto big = MathRender::render(u"\\sum_{i=1}^n x_i"_s, 16, Qt::black, true);
+        QVERIFY(!small.image.isNull());
+        QVERIFY(big.image.height() > small.image.height());
+        QVERIFY(small.errors.isEmpty());
+        QCOMPARE(MathRender::render(u"\\frac{1}{\\nosuch}"_s, 16, Qt::black, false).errors, QStringList{u"\\nosuch"_s});
+        QVERIFY(MathRender::render(u"   "_s, 16, Qt::black, false).image.isNull());
+        // Unbalanced input still draws something rather than hanging or crashing.
+        for (const QString &bad : {u"\\frac{"_s, u"x^"_s, u"\\left( x"_s, u"\\begin{matrix} 1 &"_s, u"}}}"_s, u"\\sqrt["_s})
+            QVERIFY(!MathRender::render(bad, 16, Qt::black, true).image.isNull());
+    }
+
+    void indonesianInterface()
+    {
+        QTranslator serat, qt;
+        if (!QFile::exists(u":/i18n/serat_id.qm"_s))
+            QSKIP("built without Qt Linguist tools");
+        QVERIFY(serat.load(QLocale(u"id"_s), u"serat"_s, u"_"_s, u":/i18n"_s));
+        QVERIFY(qt.load(QLocale(u"id"_s), u"qt"_s, u"_"_s, u":/i18n"_s));
+        QCoreApplication::installTranslator(&serat);
+        QCoreApplication::installTranslator(&qt);
+        QCOMPARE(QCoreApplication::translate("MainWindow", "Settings…"), u"Pengaturan…"_s);
+        QCOMPARE(QCoreApplication::translate("FileTree", "Delete %n items", nullptr, 3), u"Hapus 3 item"_s);
+        QCOMPARE(QCoreApplication::translate("QPlatformTheme", "Cancel"), u"Batal"_s);
+        QCOMPARE(Vault::nameProblem(QString()), u"Namanya kosong."_s);
+        QCoreApplication::removeTranslator(&serat);
+        QCoreApplication::removeTranslator(&qt);
+        QCOMPARE(Vault::nameProblem(QString()), u"The name is empty."_s);
+        // An English choice finds no file and leaves the source text.
+        QTranslator english;
+        QVERIFY(!english.load(QLocale(u"en"_s), u"serat"_s, u"_"_s, u":/i18n"_s));
+    }
+
+    void spelling()
+    {
+        if (!Spelling::supported())
+            QSKIP("built without Hunspell");
+        Spelling &s = Spelling::instance();
+        QVERIFY(s.available().contains(u"en_US"_s));
+        QVERIFY(s.available().contains(u"id_ID"_s));
+        Settings::setApp(u"spellLanguages"_s, QStringList{u"en_US"_s, u"id_ID"_s});
+        s.reload();
+        QVERIFY(s.active());
+        for (const QString &word : {u"hello"_s, u"Hello"_s, u"don't"_s, u"rumah"_s, u"berjalan"_s, u"mengerjakan"_s})
+            QVERIFY2(s.check(word), qPrintable(word));
+        QVERIFY(!s.check(u"helo"_s));
+        QVERIFY(!s.check(u"rumahh"_s));
+        QVERIFY(s.suggestions(u"helo"_s).contains(u"hello"_s));
+        QVERIFY(s.suggestions(u"rumahh"_s).contains(u"rumah"_s));
+        QVERIFY(!s.check(u"Zettelkasten"_s));
+        s.addWord(u"Zettelkasten"_s);
+        QVERIFY(s.check(u"Zettelkasten"_s));
+        QFile personal(QStandardPaths::writableLocation(QStandardPaths::AppDataLocation) + u"/dictionary.txt"_s);
+        QVERIFY(personal.open(QIODevice::ReadOnly));
+        QVERIFY(personal.readAll().contains("Zettelkasten"));
+        personal.remove();
+
+        Settings::setApp(u"spellcheck"_s, false);
+        s.reload();
+        QVERIFY(!s.active());
+        QVERIFY(s.check(u"helo"_s));
+        QSettings().remove(u"spellcheck"_s);
+        QSettings().remove(u"spellLanguages"_s);
+    }
+
+    void footnotes()
+    {
+        RenderOptions opt;
+        const QString text = u"- [ ] task\nText[^a] and ^[inline note] here, `[^a]` in code, [^missing].\n\n[^a]: The **first** note\n    goes on.\n"_s;
+        const RenderResult r = renderMarkdown(text, opt);
+        QVERIFY(r.html.contains(u"href=\"#fn-a\""_s));
+        QVERIFY(r.html.contains(u"name=\"fn-a\""_s));
+        QVERIFY(r.html.contains(u"<b>first</b> note"_s));
+        QVERIFY(r.html.contains(u"goes on."_s));
+        QVERIFY(r.html.contains(u"inline note"_s));
+        QVERIFY(r.html.contains(u"[^a]</code>"_s));
+        QVERIFY(r.html.contains(u"[^missing]"_s));
+        QVERIFY(!r.html.contains(u"[^a]:"_s));
+        QVERIFY(r.html.contains(u"href=\"task:3\""_s)); // task offsets still point at the box
     }
 
     void searchOperators()
@@ -318,5 +452,5 @@ private Q_SLOTS:
     }
 };
 
-QTEST_GUILESS_MAIN(TestVault)
+QTEST_MAIN(TestVault)
 #include "tst_vault.moc"

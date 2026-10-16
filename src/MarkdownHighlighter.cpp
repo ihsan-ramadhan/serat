@@ -1,9 +1,10 @@
 #include "MarkdownHighlighter.h"
 
 #include "Markdown.h"
+#include "Settings.h"
+#include "Spelling.h"
 #include "TableEditor.h"
 
-#include <QFontDatabase>
 #include <QFontMetricsF>
 #include <QPalette>
 #include <QRegularExpression>
@@ -35,7 +36,7 @@ void MarkdownHighlighter::setTheme(const QPalette &pal, const QFont &font)
     m_markup.setForeground(muted);
 
     QTextCharFormat fixed;
-    fixed.setFontFamilies({QFontDatabase::systemFont(QFontDatabase::FixedFont).family()});
+    fixed.setFontFamilies({Settings::monoFamily()});
     fixed.setFontPointSize(pt * 0.92);
 
     m_code = fixed;
@@ -65,6 +66,9 @@ void MarkdownHighlighter::setTheme(const QPalette &pal, const QFont &font)
     m_mark.setBackground(mix(base, QColor(u"#ffd400"_s), dark ? 0.35 : 0.45));
     m_html = {};
     m_html.setForeground(mix(text, QColor(u"#e06c75"_s), 0.6));
+    m_misspelled = {};
+    m_misspelled.setUnderlineStyle(QTextCharFormat::SpellCheckUnderline);
+    m_misspelled.setUnderlineColor(dark ? QColor(u"#e5786d"_s) : QColor(u"#c4372b"_s));
     m_ghost = {};
     m_ghost.setForeground(Qt::transparent);
     m_collapse = m_ghost;
@@ -123,6 +127,15 @@ void MarkdownHighlighter::highlightBlock(const QString &text)
     const int len = int(text.size());
     m_block = currentBlock().blockNumber();
     m_hide = hidesMarkup(m_block);
+    const auto fenceMatch = fence.match(text);
+    auto fenceState = [&] {
+        const bool tilde = fenceMatch.captured(1).startsWith(u'~');
+        if (!(prev & InFence))
+            return InFence | (tilde ? Tilde : 0) | FenceLine;
+        if (tilde == bool(prev & Tilde) && text.mid(fenceMatch.capturedEnd()).trimmed().isEmpty())
+            return FenceLine;
+        return prev;
+    };
 
     // A table line under the grid overlay: invisible, sized to the grid row.
     if (const auto *t = static_cast<const TableLineData *>(currentBlockUserData()); t && t->pixelSize > 0) {
@@ -130,13 +143,24 @@ void MarkdownHighlighter::highlightBlock(const QString &text)
         f.setPixelSize(t->pixelSize);
         QTextCharFormat slot;
         slot.setFont(f);
-        slot.setFontLetterSpacingType(QFont::PercentageSpacing);
-        slot.setFontLetterSpacing(1); // keeps the line from wrapping at this size
+        if (t->spread > 0) {
+            slot.setFontLetterSpacingType(QFont::AbsoluteSpacing);
+            slot.setFontLetterSpacing(t->spread);
+        } else {
+            slot.setFontLetterSpacingType(QFont::PercentageSpacing);
+            slot.setFontLetterSpacing(1); // keeps the line from wrapping at this size
+        }
         slot.setForeground(Qt::transparent);
         setFormat(0, len, slot);
-        // Keep fence/frontmatter state flowing so the table scan sees it.
-        const bool opensFrontmatter = currentBlock().blockNumber() == 0 && text == u"---";
-        setCurrentBlockState(opensFrontmatter ? Frontmatter : prev & (InFence | Tilde | Frontmatter));
+        // Keep fence/frontmatter state flowing so the scans for tables and embeds see it.
+        int state = prev & (InFence | Tilde | Frontmatter);
+        if (m_block == 0 && text == u"---")
+            state = Frontmatter;
+        else if (prev & Frontmatter)
+            state = text == u"---" || text == u"..." ? 0 : Frontmatter;
+        else if (fenceMatch.hasMatch())
+            state = fenceState();
+        setCurrentBlockState(state);
         return;
     }
 
@@ -151,13 +175,8 @@ void MarkdownHighlighter::highlightBlock(const QString &text)
         return;
     }
 
-    if (const auto m = fence.match(text); m.hasMatch()) {
-        const bool tilde = m.captured(1).startsWith(u'~');
-        int state = prev;
-        if (!(prev & InFence))
-            state = InFence | (tilde ? Tilde : 0) | FenceLine;
-        else if (tilde == bool(prev & Tilde) && text.mid(m.capturedEnd()).trimmed().isEmpty())
-            state = FenceLine;
+    if (const auto &m = fenceMatch; m.hasMatch()) {
+        const int state = fenceState();
         setFormat(0, len, m_fenced);
         apply(0, len, m_markup);
         // A bare fence keeps its width so the line keeps its height.
@@ -298,6 +317,8 @@ void MarkdownHighlighter::highlightInline(const QString &text, int from)
     each(html, [&](const QRegularExpressionMatch &m) { apply(int(m.capturedStart()), int(m.capturedLength()), m_html); });
     static const QRegularExpression comment(u"%%.*?%%"_s);
     static const QRegularExpression blockId(u"\\s\\^[A-Za-z0-9-]+\\s*$"_s);
+    static const QRegularExpression footnote(u"\\[\\^[^\\]\\s]+\\]|\\^\\[[^\\]]+\\]"_s);
+    each(footnote, [&](const QRegularExpressionMatch &m) { apply(int(m.capturedStart()), int(m.capturedLength()), m_link); });
     each(comment, [&](const QRegularExpressionMatch &m) { apply(int(m.capturedStart()), int(m.capturedLength()), m_markup); });
     each(blockId, [&](const QRegularExpressionMatch &m) { apply(int(m.capturedStart()), int(m.capturedLength()), m_markup); });
     each(url, [&](const QRegularExpressionMatch &m) { apply(int(m.capturedStart()), int(m.capturedLength()), m_link); });
@@ -320,4 +341,28 @@ void MarkdownHighlighter::highlightInline(const QString &text, int from)
         inlineMarkup(start, shown, start, int(m.capturedEnd()));
         inlineMarkup(int(m.capturedEnd()) - 2, 2, start, int(m.capturedEnd()));
     });
+
+    Spelling &spelling = Spelling::instance();
+    if (!spelling.active())
+        return;
+    static const QRegularExpression word(u"\\p{L}[\\p{L}\\p{M}'’]*"_s, QRegularExpression::UseUnicodePropertiesOption);
+    for (auto it = word.globalMatch(text, from); it.hasNext();) {
+        const auto m = it.next();
+        QString w = m.captured();
+        while (w.endsWith(u'\'') || w.endsWith(u'’'))
+            w.chop(1);
+        const int start = int(m.capturedStart()), length = int(w.size());
+        if (length < 2 || inCode(start))
+            continue;
+        // Tags, paths, identifiers and words glued to numbers are not prose.
+        const QChar before = start > 0 ? text[start - 1] : QChar(), after = start + length < text.size() ? text[start + length] : QChar();
+        if (before == u'#' || before == u'_' || before == u'/' || before == u'@' || before.isDigit() || after == u'_'
+            || after == u'/' || after.isDigit())
+            continue;
+        const QBrush fg = format(start).foreground();
+        if (fg == m_link.foreground() || fg == m_markup.foreground() || fg == m_html.foreground())
+            continue;
+        if (!spelling.check(w))
+            apply(start, length, m_misspelled);
+    }
 }

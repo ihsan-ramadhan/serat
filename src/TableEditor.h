@@ -18,9 +18,10 @@ bool isAligned(const QStringList &lines);
 QStringList alignedLines(const QList<QStringList> &models);
 }
 
-// The highlighter draws the line transparent at pixelSize so its height matches the grid row.
+// Drawn transparent at pixelSize to match the widget over it; `spread` gives each character its own line for scrolling.
 struct TableLineData : QTextBlockUserData {
     int pixelSize = 0;
+    int spread = 0; // letter spacing in pixels
 };
 
 class TableGrid : public QTableWidget

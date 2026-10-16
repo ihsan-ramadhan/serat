@@ -1,0 +1,34 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<component type="desktop-application">
+  <id>id.icqn.Serat</id>
+  <metadata_license>CC0-1.0</metadata_license>
+  <project_license>MIT</project_license>
+  <name>Serat</name>
+  <summary>Markdown notes in a plain folder</summary>
+  <description>
+    <p>
+      Serat is a native note-taking app for folders of Markdown files. It reads and writes the same vault layout as
+      other Markdown note apps, so notes stay plain text you can open anywhere.
+    </p>
+    <ul>
+      <li>Live preview editing with wikilinks, embeds, callouts, tables, math and diagrams</li>
+      <li>Backlinks, unlinked mentions, tags, bookmarks, outline and a graph of your notes</li>
+      <li>Fast search across thousands of notes</li>
+      <li>Spellcheck, file recovery, export to PDF and HTML</li>
+    </ul>
+  </description>
+  <launchable type="desktop-id">id.icqn.Serat.desktop</launchable>
+  <url type="homepage">https://github.com/ihsan-ramadhan/serat</url>
+  <url type="bugtracker">https://github.com/ihsan-ramadhan/serat/issues</url>
+  <developer id="id.icqn">
+    <name>Muhammad Ihsan Ramadhan</name>
+  </developer>
+  <content_rating type="oars-1.1"/>
+  <categories>
+    <category>Office</category>
+    <category>TextEditor</category>
+  </categories>
+  <releases>
+    <release version="0.1.0" date="2026-10-16"/>
+  </releases>
+</component>

@@ -5,6 +5,7 @@
 #include <QApplication>
 #include <QFile>
 #include <QIconEngine>
+#include <QMenu>
 #include <QPainter>
 #include <QPalette>
 #include <QSettings>
@@ -135,9 +136,9 @@ QLineEdit:focus { border: 1px solid %8; }
 QPlainTextEdit, QTextBrowser { selection-background-color: %9; selection-color: %6; }
 
 QCheckBox { spacing: 8px; }
-QCheckBox::indicator { width: 14px; height: 14px; border: 1px solid %7; border-radius: 4px; background: %2; }
-QCheckBox::indicator:hover { border: 1px solid %6; }
-QCheckBox::indicator:checked { background: %8; border: 1px solid %8; image: url(:/icons/%13.svg); }
+QCheckBox::indicator, QAbstractItemView::indicator { width: 14px; height: 14px; border: 1px solid %7; border-radius: 4px; background: %2; }
+QCheckBox::indicator:hover, QAbstractItemView::indicator:hover { border: 1px solid %6; }
+QCheckBox::indicator:checked, QAbstractItemView::indicator:checked { background: %8; border: 1px solid %8; image: url(:/icons/%13.svg); }
 
 QPushButton { background: %3; color: %6; border: 1px solid %4; border-radius: 6px; padding: 6px 14px; }
 QPushButton:hover { background: %5; }
@@ -277,6 +278,38 @@ public:
     }
 };
 
+// Qt's standard text menus take their icons from the desktop theme; swap in the app's own by action name.
+class MenuIcons : public QObject
+{
+public:
+    using QObject::QObject;
+
+    bool eventFilter(QObject *watched, QEvent *event) override
+    {
+        if (event->type() == QEvent::Show)
+            if (auto *menu = qobject_cast<QMenu *>(watched))
+                for (QAction *a : menu->actions())
+                    if (const QString name = iconFor(a->objectName()); !name.isEmpty())
+                        a->setIcon(Theme::icon(name));
+        return false;
+    }
+
+private:
+    static QString iconFor(const QString &action)
+    {
+        static const QHash<QString, QString> names{
+            {u"edit-undo"_s, u"undo"_s},
+            {u"edit-redo"_s, u"redo"_s},
+            {u"edit-cut"_s, u"cut"_s},
+            {u"edit-copy"_s, u"copy"_s},
+            {u"edit-paste"_s, u"paste"_s},
+            {u"edit-delete"_s, u"trash"_s},
+            {u"select-all"_s, u"select-all"_s},
+        };
+        return names.value(action);
+    }
+};
+
 void apply()
 {
     const QString pref = preference();
@@ -292,6 +325,7 @@ void install(QApplication &app)
 {
     g_systemPalette = app.palette();
     app.setStyle(new Style);
+    app.installEventFilter(new MenuIcons(&app));
     apply();
     QObject::connect(QGuiApplication::styleHints(), &QStyleHints::colorSchemeChanged, &app, [] { apply(); });
 }
@@ -310,6 +344,11 @@ void setPreference(const QString &mode)
 const Colors &colors()
 {
     return g_colors;
+}
+
+QPalette lightPalette()
+{
+    return makePalette(makeColors(false));
 }
 
 QIcon icon(const QString &name, const QString &openName)

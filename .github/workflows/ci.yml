@@ -23,7 +23,11 @@ jobs:
 
       - name: Install Linux packages
         if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install -y ninja-build libgl1-mesa-dev libegl1 libxkbcommon0 libfontconfig1
+        run: sudo apt-get update && sudo apt-get install -y ninja-build libgl1-mesa-dev libegl1 libxkbcommon0 libfontconfig1 libhunspell-dev pkg-config
+
+      - name: Install macOS packages
+        if: runner.os == 'macOS'
+        run: brew install ninja hunspell pkg-config
 
       - name: Set up MSVC
         if: runner.os == 'Windows'
