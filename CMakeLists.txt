@@ -25,9 +25,10 @@ endif()
 # Optional: syntax highlighting for fenced code blocks.
 find_package(KF6SyntaxHighlighting QUIET)
 
-qt_add_executable(serat
-    src/main.cpp
+# Everything but main(), shared by the app and the tests.
+add_library(serat_core STATIC
     src/Vault.cpp src/Vault.h
+    src/Recovery.cpp src/Recovery.h
     src/Markdown.cpp src/Markdown.h
     src/CodeHighlight.cpp src/CodeHighlight.h
     src/MarkdownHighlighter.cpp src/MarkdownHighlighter.h
@@ -38,6 +39,7 @@ qt_add_executable(serat
     src/SearchQuery.cpp src/SearchQuery.h
     src/Settings.cpp src/Settings.h
     src/SettingsDialog.cpp src/SettingsDialog.h
+    src/RecoveryDialog.cpp src/RecoveryDialog.h
     src/TextMerge.cpp src/TextMerge.h
     src/Properties.cpp src/Properties.h
     src/Editor.cpp src/Editor.h
@@ -48,15 +50,19 @@ qt_add_executable(serat
     src/CommandPalette.cpp src/CommandPalette.h
     src/MainWindow.cpp src/MainWindow.h
 )
-file(GLOB serat_icons RELATIVE ${CMAKE_CURRENT_SOURCE_DIR} CONFIGURE_DEPENDS data/icons/*.svg)
-qt_add_resources(serat "icons" PREFIX "/" BASE data FILES data/serat.svg ${serat_icons})
-
-target_link_libraries(serat PRIVATE Qt6::Widgets Qt6::Svg Qt6::Network md4c::md4c)
-target_compile_definitions(serat PRIVATE QT_NO_KEYWORDS SERAT_VERSION="${PROJECT_VERSION}")
+target_include_directories(serat_core PUBLIC src)
+target_link_libraries(serat_core PUBLIC Qt6::Widgets Qt6::Svg Qt6::Network md4c::md4c)
+target_compile_definitions(serat_core PUBLIC QT_NO_KEYWORDS SERAT_VERSION="${PROJECT_VERSION}")
 if(KF6SyntaxHighlighting_FOUND)
-    target_link_libraries(serat PRIVATE KF6::SyntaxHighlighting)
-    target_compile_definitions(serat PRIVATE SERAT_HAVE_KSH)
+    target_link_libraries(serat_core PUBLIC KF6::SyntaxHighlighting)
+    target_compile_definitions(serat_core PUBLIC SERAT_HAVE_KSH)
 endif()
+
+file(GLOB serat_icons RELATIVE ${CMAKE_CURRENT_SOURCE_DIR} CONFIGURE_DEPENDS data/icons/*.svg)
+
+qt_add_executable(serat src/main.cpp)
+qt_add_resources(serat "icons" PREFIX "/" BASE data FILES data/serat.svg ${serat_icons})
+target_link_libraries(serat PRIVATE serat_core)
 
 set_target_properties(serat PROPERTIES
     WIN32_EXECUTABLE ON
@@ -69,15 +75,16 @@ set_target_properties(serat PROPERTIES
 include(CTest)
 if(BUILD_TESTING)
     find_package(Qt6 REQUIRED COMPONENTS Test)
-    qt_add_executable(tst_vault tests/tst_vault.cpp src/Vault.cpp src/Markdown.cpp src/CodeHighlight.cpp src/Frontmatter.cpp src/SearchQuery.cpp src/Settings.cpp src/TextMerge.cpp)
-    target_include_directories(tst_vault PRIVATE src)
-    target_link_libraries(tst_vault PRIVATE Qt6::Widgets Qt6::Test md4c::md4c)
-    target_compile_definitions(tst_vault PRIVATE QT_NO_KEYWORDS)
-    if(KF6SyntaxHighlighting_FOUND)
-        target_link_libraries(tst_vault PRIVATE KF6::SyntaxHighlighting)
-        target_compile_definitions(tst_vault PRIVATE SERAT_HAVE_KSH)
-    endif()
+    qt_add_executable(tst_vault tests/tst_vault.cpp)
+    target_link_libraries(tst_vault PRIVATE serat_core Qt6::Test)
     add_test(NAME tst_vault COMMAND tst_vault)
+
+    # Drives the real windows offscreen: typing, clicks, menus and dialogs.
+    qt_add_executable(tst_ui tests/tst_ui.cpp)
+    qt_add_resources(tst_ui "icons" PREFIX "/" BASE data FILES data/serat.svg ${serat_icons})
+    target_link_libraries(tst_ui PRIVATE serat_core Qt6::Test)
+    add_test(NAME tst_ui COMMAND tst_ui)
+    set_tests_properties(tst_ui PROPERTIES ENVIRONMENT "QT_QPA_PLATFORM=offscreen" TIMEOUT 300)
 endif()
 
 include(GNUInstallDirs)

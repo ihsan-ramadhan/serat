@@ -230,6 +230,22 @@ private Q_SLOTS:
         QVERIFY(TextMerge::merge(base, u"one\nTWO\nthree\n"_s, base, &out));
         QCOMPARE(out, u"one\nTWO\nthree\n"_s);
         QVERIFY(!TextMerge::merge(base, u"one\nmine\nthree\n"_s, u"one\ntheirs\nthree\n"_s, &out));
+        // Edits far apart on our side, another between them on theirs.
+        const QString ten = u"1\n2\n3\n4\n5\n6\n7\n8\n9\n10\n"_s;
+        QVERIFY(TextMerge::merge(ten, u"1\n2 ours\n3\n4\n5\n6\n7\n8\n9 ours\n10\n"_s, u"1\n2\n3\n4\n5 theirs\n6\n7\n8\n9\n10\n"_s, &out));
+        QCOMPARE(out, u"1\n2 ours\n3\n4\n5 theirs\n6\n7\n8\n9 ours\n10\n"_s);
+        // Lines added and removed in different places.
+        QVERIFY(TextMerge::merge(ten, u"0\n1\n2\n3\n4\n5\n6\n7\n8\n9\n10\n"_s, u"1\n2\n3\n4\n5\n6\n7\n8\n10\n"_s, &out));
+        QCOMPARE(out, u"0\n1\n2\n3\n4\n5\n6\n7\n8\n10\n"_s);
+        // Same line, different words: merged within the line.
+        QVERIFY(TextMerge::merge(u"the quick fox\n"_s, u"the very quick fox\n"_s, u"the quick brown fox\n"_s, &out));
+        QCOMPARE(out, u"the very quick brown fox\n"_s);
+        // Both added a line at the end.
+        QVERIFY(TextMerge::merge(u"a\n"_s, u"a\nmine\n"_s, u"a\ntheirs\n"_s, &out));
+        QCOMPARE(out, u"a\ntheirs\nmine\n"_s);
+        // Identical changes on both sides are taken once.
+        QVERIFY(TextMerge::merge(ten, ten + u"11\n"_s, ten + u"11\n"_s, &out));
+        QCOMPARE(out, ten + u"11\n"_s);
     }
 
     void fileNames()

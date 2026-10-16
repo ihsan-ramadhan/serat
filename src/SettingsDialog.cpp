@@ -13,7 +13,9 @@
 #include <QLabel>
 #include <QLineEdit>
 #include <QListWidget>
+#include <QMessageBox>
 #include <QPushButton>
+#include <QSpinBox>
 #include <QStackedWidget>
 
 using namespace Qt::StringLiterals;
@@ -156,6 +158,26 @@ void SettingsDialog::buildFiles()
     };
     connect(attach, &QComboBox::currentIndexChanged, this, saveAttach);
     connect(attachFolder, &QLineEdit::editingFinished, this, saveAttach);
+
+    auto *interval = new QSpinBox;
+    interval->setRange(1, 120);
+    interval->setSuffix(tr(" min"));
+    interval->setValue(Recovery::intervalMinutes());
+    auto *keep = new QSpinBox;
+    keep->setRange(1, 365);
+    keep->setSuffix(tr(" days"));
+    keep->setValue(Recovery::keepDays());
+    auto *clear = new QPushButton(tr("Clear history"));
+    form->addRow(tr("Save a version every"), interval);
+    form->addRow(tr("Keep versions for"), keep);
+    form->addRow(note(tr("Earlier versions of notes, for File > File recovery. They are kept outside the vault.")));
+    form->addRow(QString(), clear);
+    connect(interval, &QSpinBox::valueChanged, this, [](int v) { Settings::setApp(u"recoveryInterval"_s, v); });
+    connect(keep, &QSpinBox::valueChanged, this, [](int v) { Settings::setApp(u"recoveryDays"_s, v); });
+    connect(clear, &QPushButton::clicked, this, [this] {
+        if (QMessageBox::question(this, tr("Clear history"), tr("Delete every saved version of the notes in this vault?")) == QMessageBox::Yes)
+            m_vault->recovery().clear();
+    });
 
     auto *confirm = new QCheckBox(tr("Confirm file deletion"));
     confirm->setChecked(Settings::confirmDelete(*m_vault));

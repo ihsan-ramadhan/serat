@@ -259,6 +259,7 @@ void NoteView::load(const QString &path)
         m_loading = true;
         m_editor->setPlainText(m_crlf ? QString(m_diskText).replace(u"\r\n"_s, u"\n"_s) : m_diskText);
         m_editor->setFoldedLines(savedFolds());
+        m_vault->recovery().snapshot(path, m_diskText);
         m_openCallouts.clear();
         m_loading = false;
         m_title->setReadOnly(false);

@@ -8,6 +8,7 @@
 #include "PathActions.h"
 #include "QuickSwitcher.h"
 #include "Reader.h"
+#include "RecoveryDialog.h"
 #include "Settings.h"
 #include "SettingsDialog.h"
 #include "Theme.h"
@@ -397,6 +398,7 @@ void MainWindow::buildActions()
     }));
     add(file, u"file.reveal"_s, tr("Reveal current file in navigation"), {}, withView([this](NoteView *v) { revealInTree(v->path()); }));
     add(file, u"file.bookmark"_s, tr("Bookmark current file"), {}, withView([this](NoteView *v) { m_bookmarks->toggle(v->path()); }));
+    add(file, u"file.recovery"_s, tr("File recovery…"), {}, [this] { openRecovery(currentView() ? currentView()->path() : QString()); });
     add(file, u"file.delete"_s, tr("Delete current file"), {}, withView([this](NoteView *v) { deletePath(v->path()); }));
     file->addSeparator();
     add(file, u"file.save"_s, tr("Save"), QKeySequence::Save, [this] { saveAll(); });
@@ -669,6 +671,7 @@ void MainWindow::openVault(const QString &path)
     recentVaults.prepend(m_vault->root());
     s.setValue(u"recentVaults"_s, recentVaults.mid(0, 10));
 
+    m_vault->recovery().prune();
     restoreSession();
     if (Settings::vault(*m_vault, u"dailyOnStartup"_s, {}, {}, false).toBool())
         openDailyNote();
@@ -1342,6 +1345,8 @@ void MainWindow::fillNoteMenu(QMenu *menu, NoteView *v, bool tab)
         QDesktopServices::openUrl(QUrl::fromLocalFile(QFileInfo(m_vault->absolutePath(path)).absolutePath()));
     });
     menu->addAction(tr("Reveal file in navigation"), this, [this, path] { revealInTree(path); });
+    if (v->isNote())
+        menu->addAction(tr("Version history…"), this, [this, path] { openRecovery(path); });
     menu->addSeparator();
     menu->addAction(tr("Delete file"), this, [this, path] { deletePath(path); });
 }
@@ -1714,4 +1719,34 @@ void MainWindow::applySettings(NoteView *v)
     v->editor()->setAutoPair(Settings::app(u"autoPairBrackets"_s, true).toBool(), Settings::app(u"autoPairMarkdown"_s, true).toBool());
     v->editor()->setFoldingShown(Settings::app(u"foldGutter"_s, true).toBool(), Settings::app(u"indentGuides"_s, true).toBool());
     v->relayout();
+}
+
+void MainWindow::openRecovery(const QString &path)
+{
+    if (!m_vault)
+        return;
+    RecoveryDialog dlg(m_vault, path, this);
+    if (dlg.exec() != QDialog::Accepted || dlg.path().isEmpty())
+        return;
+    const QString target = dlg.path();
+    if (!m_vault->exists(target)) {
+        if (m_vault->createNote(target, dlg.text()).isEmpty()) {
+            QMessageBox::warning(this, tr("File recovery"), tr("Could not recreate “%1”.").arg(target));
+            return;
+        }
+        openPath(target, false);
+        statusBar()->showMessage(tr("“%1” was restored.").arg(Vault::baseName(target)), 8000);
+        return;
+    }
+    openPath(target, false);
+    NoteView *v = currentView();
+    if (!v || v->path() != target)
+        return;
+    // Through the editor, so Ctrl+Z takes the restore back; the text it replaces becomes a version.
+    m_vault->recovery().snapshot(target, v->editor()->toPlainText(), true);
+    QTextCursor c(v->editor()->document());
+    c.select(QTextCursor::Document);
+    c.insertText(dlg.text());
+    v->save();
+    statusBar()->showMessage(tr("“%1” was restored to an earlier version.").arg(Vault::baseName(target)), 8000);
 }

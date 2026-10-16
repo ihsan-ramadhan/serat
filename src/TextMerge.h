@@ -13,7 +13,7 @@ struct Change {
 };
 Change between(const QString &base, const QString &other);
 
-// Both sides' changes applied to `base`, or false when they touch the same text.
+// Both sides' line changes applied to `base`, or false when both changed the same text differently.
 bool merge(const QString &base, const QString &ours, const QString &theirs, QString *merged);
 
 }

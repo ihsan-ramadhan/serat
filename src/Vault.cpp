@@ -39,6 +39,7 @@ bool lessPath(const QString &a, const QString &b)
 Vault::Vault(const QString &root, QObject *parent)
     : QObject(parent)
     , m_root(QDir(root).absolutePath())
+    , m_recovery(m_root)
 {
     m_rescanTimer.setSingleShot(true);
     m_rescanTimer.setInterval(250);
@@ -493,6 +494,7 @@ bool Vault::writeNote(const QString &path, const QString &text)
         return false;
     m_notes.insert(path, parse(path, text));
     m_stamps.insert(path, fileStamp(path));
+    m_recovery.snapshot(path, text);
     if (!m_lowerPath.contains(path.toLower())) {
         m_files.append(path);
         std::sort(m_files.begin(), m_files.end(), lessPath);
@@ -560,14 +562,19 @@ QString Vault::rename(const QString &from, const QString &to)
         writeNote(notePath, text);
     }
 
-    for (auto it = moved.cbegin(); it != moved.cend(); ++it)
+    for (auto it = moved.cbegin(); it != moved.cend(); ++it) {
+        m_recovery.moved(it.key(), it.value());
         Q_EMIT renamed(it.key(), it.value());
+    }
     Q_EMIT changed();
     return {};
 }
 
 bool Vault::remove(const QString &path)
 {
+    for (auto it = m_notes.cbegin(); it != m_notes.cend(); ++it)
+        if (it.key() == path || it.key().startsWith(path + u'/'))
+            m_recovery.snapshot(it.key(), it->text, true);
     const bool ok = QFile::moveToTrash(absolutePath(path));
     rescan();
     return ok;

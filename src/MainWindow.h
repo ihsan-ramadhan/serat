@@ -81,6 +81,7 @@ private:
     void openDailyNote();
     void insertTemplate(Editor *editor);
     void openSettings();
+    void openRecovery(const QString &path = {});
     void applySettings();
     void applySettings(NoteView *v);
     void revealInTree(const QString &path);

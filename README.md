@@ -74,9 +74,12 @@ Built with Qt 6 and C++20. Runs on Linux, Windows and macOS.
 - `serat://open?vault=<name>&file=<path>` links open the note in Serat; clicking one while
   Serat runs reuses the open window
 - Edits made outside the app (sync, git, another editor) show up immediately and are merged
-  with what you are typing; if both change the same text, yours stays and the other version
-  is kept next to it as `<note> (conflict <date>).md`. A note deleted outside the app while
-  it has unsaved changes is written back instead of closed.
+  line by line with what you are typing; if both change the same text, yours stays and the
+  other version is kept next to it as `<note> (conflict <date>).md`. A note deleted outside
+  the app while it has unsaved changes is written back instead of closed.
+- File recovery (File > File recovery, or Version history in a note's ⋮ menu): a copy of
+  each note every few minutes and before it is deleted, kept for a week outside the vault.
+  Restore an earlier version, or bring back a deleted note.
 
 **Look and settings**
 - Light and dark theme that follows the system, or set it under View > Theme
@@ -167,7 +170,8 @@ cmake --install build --prefix dist   # produces Serat.app
 ```
 
 KSyntaxHighlighting is optional everywhere; without it code blocks are not coloured.
-Run the tests with `ctest --test-dir build`.
+Run the tests with `ctest --test-dir build`: `tst_vault` covers parsing, search and merging,
+and `tst_ui` drives the real window offscreen (typing, menus, dialogs) without showing it.
 
 ## Usage
 

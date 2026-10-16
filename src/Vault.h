@@ -1,5 +1,7 @@
 #pragma once
 
+#include "Recovery.h"
+
 #include <QFileSystemWatcher>
 #include <QHash>
 #include <QList>
@@ -71,6 +73,7 @@ public:
     // Also rewrites links pointing into it; returns an error message, empty on success.
     QString rename(const QString &from, const QString &to);
     bool remove(const QString &path);
+    Recovery &recovery() { return m_recovery; }
 
     static Note parse(const QString &path, const QString &text);
     static bool isNote(const QString &path) { return path.endsWith(QLatin1String(".md"), Qt::CaseInsensitive); }
@@ -96,6 +99,7 @@ private:
     qint64 fileStamp(const QString &path) const;
 
     QString m_root;
+    Recovery m_recovery;
     QHash<QString, Note> m_notes;
     QHash<QString, qint64> m_stamps;              // mtime/size, skips re-reading unchanged notes
     QStringList m_files;
